@@ -10,7 +10,7 @@ import (
 // Store holds the short-lived state of in-flight enrollments: auth sessions
 // between /authorize and /callback, authorization codes between /callback and
 // /token, and pending provisions between a provisioner redirect and
-// /provision/complete. By default ZDAS keeps this state in memory; an
+// CompleteProvision. By default ZDAS keeps this state in memory; an
 // embedder running several replicas supplies a shared Store with WithStore.
 //
 // ZDAS generates every ID itself and never passes one to a Store. Each entry

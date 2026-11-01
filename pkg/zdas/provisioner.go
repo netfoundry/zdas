@@ -95,8 +95,9 @@ type ProvisionResult struct {
 	Claims map[string]interface{}
 
 	// RedirectURL, when non-empty and Claims is nil, redirects the browser
-	// to an application-hosted page for interactive selection. The page must
-	// call POST /provision/complete to finish the flow.
+	// to an application-hosted page for interactive selection. ZDAS adds a
+	// pending_id query parameter, and the application's handler for the
+	// page finishes the flow by passing it to Handler.CompleteProvision.
 	RedirectURL string
 }
 

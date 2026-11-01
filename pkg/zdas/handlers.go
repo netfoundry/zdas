@@ -94,7 +94,6 @@ func (h *Handlers) Mux() *http.ServeMux {
 	mux.HandleFunc("GET /authorize", h.handleAuthorize)
 	mux.HandleFunc("GET /callback", h.handleCallback)
 	mux.HandleFunc("POST /token", h.handleToken)
-	mux.HandleFunc("POST /provision/complete", h.handleProvisionComplete)
 	return mux
 }
 
@@ -388,7 +387,7 @@ func (h *Handlers) handleCallback(w http.ResponseWriter, r *http.Request) {
 		req.OSVersion = sess.DeviceInfo.OSVersion
 		result, err := h.provisioner.Provision(r.Context(), req)
 		if err != nil {
-			h.handleProvisionerError(w, r, err, sess.TunnelerRedirectURI, sess.TunnelerState, sess.UpstreamProviderName)
+			h.handleProvisionerError(w, r, err, sess.TunnelerRedirectURI, sess.TunnelerState, "provider", sess.UpstreamProviderName)
 			return
 		}
 		if result.RedirectURL != "" && result.Claims == nil {
@@ -544,90 +543,46 @@ func truncateParam(s string, maxLen int) string {
 // handleProvisionerError translates an error from the EnrollmentProvisioner
 // into an OIDC error redirect. A *ProvisionError with a valid OIDC code is
 // passed through to the tunneler. Anything else (plain error or invalid code)
-// becomes server_error with a generic description.
-func (h *Handlers) handleProvisionerError(w http.ResponseWriter, r *http.Request, err error, redirectURI, state, providerName string) {
+// becomes server_error with a generic description. logArgs are added to
+// the log entry.
+func (h *Handlers) handleProvisionerError(w http.ResponseWriter, r *http.Request, err error, redirectURI, state string, logArgs ...any) {
+	logger := h.logger.With(logArgs...)
 	var pe *ProvisionError
 	if errors.As(err, &pe) {
 		if !isValidProvisionErrorCode(pe.Code) {
-			h.logger.Warn("provisioner returned invalid error code, falling back to server_error",
-				"code", pe.Code, "provider", providerName)
+			logger.Warn("provisioner returned invalid error code, falling back to server_error",
+				"code", pe.Code)
 			oidcErrorRedirect(w, r, redirectURI, state, "server_error", "provisioning failed")
 			return
 		}
-		h.logger.Info("provisioner rejected request",
+		logger.Info("provisioner rejected request",
 			"code", pe.Code,
 			"description", pe.Description,
-			"provider", providerName,
 		)
 		oidcErrorRedirect(w, r, redirectURI, state, pe.Code, sanitizeErrorDescription(pe.Description))
 		return
 	}
-	h.logger.Error("provisioner failed", "error", err, "provider", providerName)
+	logger.Error("provisioner failed", "error", err)
 	oidcErrorRedirect(w, r, redirectURI, state, "server_error", "provisioning failed")
 }
 
-// provisionCompleteError mirrors ProvisionError as a JSON-tagged value type
-// for the /provision/complete request body.
-type provisionCompleteError struct {
-	Code        string `json:"code"`
-	Description string `json:"description"`
-}
-
-// provisionCompleteBody is the JSON body accepted by /provision/complete.
-// Exactly one of Claims or Error must be set. Setting Claims completes the
-// flow successfully and mints an enrollment code. Setting Error performs an
-// OIDC error redirect to the tunneler instead.
+// CompleteProvision finishes an enrollment that the provisioner sent to an
+// interactive page with ProvisionResult.RedirectURL. The embedding
+// application calls it from its own handler for that page, with the
+// pending_id ZDAS added to the redirect URL and the outcome of its
+// provisioning: the claims to mint, or an error, which follows the same
+// rules as an error from Provision and takes precedence over claims. It
+// consumes the pending provision and redirects the browser back to the
+// tunneler, or responds 400 when the pending provision is missing or
+// expired.
 //
-// PendingID may optionally be included in the body instead of the query
-// string. Body takes precedence over query. Embedding apps that want to
-// avoid leaking the pending_id in Referer headers and logs should prefer
-// the body field.
-type provisionCompleteBody struct {
-	PendingID string                  `json:"pending_id,omitempty"`
-	Claims    map[string]any          `json:"claims,omitempty"`
-	Error     *provisionCompleteError `json:"error,omitempty"`
-}
-
-// handleProvisionComplete resumes the flow after an interactive provisioning
-// detour. The embedding application's picker page calls this with the pending
-// ID and either the final claims (success) or a structured error (rejection).
-// Either way, the pending provision is consumed and the browser is redirected
-// back to the tunneler.
-func (h *Handlers) handleProvisionComplete(w http.ResponseWriter, r *http.Request) {
-	// Decode and validate the body BEFORE consuming the pending provision,
-	// so a malformed request doesn't burn the pending state and force the
-	// user to restart the entire enrollment flow.
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	var body provisionCompleteBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, "invalid JSON body", http.StatusBadRequest)
-		return
-	}
-
-	// pending_id may come from the body (preferred, avoids Referer/log
-	// leakage) or the query string (backward compatible).
-	pendingID := body.PendingID
-	if pendingID == "" {
-		pendingID = r.URL.Query().Get("pending_id")
-	}
-	if pendingID == "" {
-		http.Error(w, "pending_id is required (in body or query)", http.StatusBadRequest)
-		return
-	}
-
-	if body.Claims == nil && body.Error == nil {
-		http.Error(w, `provision complete body must contain either "claims" or "error"`, http.StatusBadRequest)
-		return
-	}
-	if body.Claims != nil && body.Error != nil {
-		h.logger.Warn("provision complete: both claims and error set, preferring error",
-			"pending_id", pendingID)
-		body.Claims = nil
-	}
-
-	pp, err := h.consumePendingProvision(r.Context(), pendingID)
-	if err != nil {
-		h.logger.Error("consume pending provision", "error", err)
+// The claims must come from the application's own state, never from the
+// request: the user enrolling holds the pending ID, so claims taken from
+// the browser would let that user enroll as any identity.
+func (h *Handlers) CompleteProvision(w http.ResponseWriter, r *http.Request, pendingID string, claims map[string]any, err error) {
+	pp, cerr := h.consumePendingProvision(r.Context(), pendingID)
+	if cerr != nil {
+		h.logger.Error("consume pending provision", "error", cerr)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -635,25 +590,16 @@ func (h *Handlers) handleProvisionComplete(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "pending provision not found or expired", http.StatusBadRequest)
 		return
 	}
-
-	if body.Error != nil {
-		code := body.Error.Code
-		desc := body.Error.Description
-		if !isValidProvisionErrorCode(code) {
-			h.logger.Warn("provision complete: invalid error code from embedding app, falling back to server_error",
-				"code", code)
-			code = "server_error"
-			desc = "provisioning failed"
-		}
-		h.logger.Info("provision complete: provisioner rejected after picker",
-			"code", code,
-			"description", desc)
-		oidcErrorRedirect(w, r, pp.TunnelerRedirectURI, pp.TunnelerState, code, sanitizeErrorDescription(desc))
+	if err == nil && len(claims) == 0 {
+		err = errors.New("CompleteProvision called with neither claims nor an error")
+	}
+	if err != nil {
+		h.handleProvisionerError(w, r, err, pp.TunnelerRedirectURI, pp.TunnelerState)
 		return
 	}
 
 	ac := &AuthCode{
-		Claims:              body.Claims,
+		Claims:              claims,
 		RedirectURI:         pp.TunnelerRedirectURI,
 		CodeChallenge:       pp.TunnelerCodeChallenge,
 		CodeChallengeMethod: pp.TunnelerCodeChallengeMethod,
