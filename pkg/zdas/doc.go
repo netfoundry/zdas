@@ -11,7 +11,9 @@
 // The full service: [NewHandler] (or [NewServer]) with a [Config] mounts
 // the /authorize, /callback, /token, and discovery endpoints on the
 // embedder's mux. [WithProvisioner] and [EnrollmentProvisioner] let the
-// embedder own user lookup and identity creation. [WithKeySet] and
+// embedder own user lookup and identity creation, and
+// [Handler.CompleteProvision] finishes an enrollment the provisioner sent
+// to one of the embedder's pages. [WithKeySet] and
 // [WithStore] let several replicas behind a load balancer share signing
 // keys and in-flight enrollment state, with the per-replica exceptions
 // listed on WithStore; package zdastest provides a conformance suite for

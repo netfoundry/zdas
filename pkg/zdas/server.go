@@ -161,6 +161,12 @@ func (h *Handler) Stop() {
 	h.srv.stopStore()
 }
 
+// CompleteProvision finishes an enrollment that the provisioner sent to an
+// interactive page. See [Handlers.CompleteProvision].
+func (h *Handler) CompleteProvision(w http.ResponseWriter, r *http.Request, pendingID string, claims map[string]any, err error) {
+	h.srv.handlers.CompleteProvision(w, r, pendingID, claims, err)
+}
+
 // NewHandler returns a Handler for embedding ZDAS in another application.
 // It performs initial discovery but does not start an HTTP server. The caller
 // is responsible for serving the returned handler and calling Stop on shutdown.

@@ -662,3 +662,83 @@ func TestIntegrationMultiReplicaRotationOverlap(t *testing.T) {
 	verifyWithJWKSFrom(t, lagging, enrollAcross(t, rotated, rotated, rotated))
 	verifyWithJWKSFrom(t, rotated, enrollAcross(t, lagging, lagging, lagging))
 }
+
+// TestIntegrationProvisionCompleteAcrossReplicas runs an interactive
+// provisioning detour across two replicas sharing a store: the picker
+// redirect comes from one, and the embedder's handler finishes the flow
+// through the other's Handler. The token carries the embedder's claims.
+func TestIntegrationProvisionCompleteAcrossReplicas(t *testing.T) {
+	ks, err := GenerateKeySet()
+	if err != nil {
+		t.Fatalf("GenerateKeySet: %v", err)
+	}
+	store := newJSONStore()
+	cfg := replicaConfig(t)
+	picker := WithProvisioner(&interactiveProvisioner{redirectURL: "https://embedder.example.com/pick?enroll_id=e1"})
+	_, a := newReplica(t, cfg, WithKeySet(ks), WithStore(store), picker)
+	srvB, b := newReplica(t, cfg, WithKeySet(ks), WithStore(store), picker)
+	handlerB := &Handler{Handler: b, srv: srvB}
+
+	verifier, challenge := generateTestPKCE(t)
+	redirectURI := "http://localhost:20314/auth/callback"
+	w := httptest.NewRecorder()
+	a.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/authorize?"+url.Values{
+		"redirect_uri":          {redirectURI},
+		"state":                 {"tstate"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"device_name":           {"laptop"},
+	}.Encode(), nil))
+	upstream, err := url.Parse(w.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse upstream redirect: %v", err)
+	}
+	cb := httptest.NewRecorder()
+	a.ServeHTTP(cb, browserRequest(w, "/callback?code=x&state="+upstream.Query().Get("state")))
+	pick, err := url.Parse(cb.Header().Get("Location"))
+	if err != nil || pick.Host != "embedder.example.com" {
+		t.Fatalf("callback: status = %d, Location = %q; want picker redirect", cb.Code, cb.Header().Get("Location"))
+	}
+	if pick.Query().Get("enroll_id") != "e1" {
+		t.Errorf("picker redirect lost the provisioner's query: %s", pick)
+	}
+
+	claims := map[string]any{
+		"sub":                  "ext-from-embedder",
+		"device_external_id":   "ext-from-embedder",
+		"device_identity_name": "alice-laptop",
+	}
+	done := httptest.NewRecorder()
+	handlerB.CompleteProvision(done, httptest.NewRequest(http.MethodPost, "/pick", nil), pick.Query().Get("pending_id"), claims, nil)
+	tunneler, err := url.Parse(done.Header().Get("Location"))
+	if err != nil || done.Code != http.StatusFound {
+		t.Fatalf("CompleteProvision: status = %d, body = %s", done.Code, done.Body.String())
+	}
+	if tunneler.Query().Get("state") != "tstate" {
+		t.Errorf("state = %q, want tstate", tunneler.Query().Get("state"))
+	}
+
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {tunneler.Query().Get("code")},
+		"redirect_uri":  {redirectURI},
+		"code_verifier": {verifier},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tw := httptest.NewRecorder()
+	a.ServeHTTP(tw, req)
+	if tw.Code != http.StatusOK {
+		t.Fatalf("token: status = %d, body = %s", tw.Code, tw.Body.String())
+	}
+	var resp struct {
+		IDToken string `json:"id_token"`
+	}
+	if err := json.Unmarshal(tw.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal token response: %v", err)
+	}
+	tok := verifyWithJWKSFrom(t, b, resp.IDToken)
+	if ext, _ := tok.Get("device_external_id"); ext != "ext-from-embedder" {
+		t.Errorf("device_external_id = %v, want ext-from-embedder", ext)
+	}
+}

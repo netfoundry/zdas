@@ -68,7 +68,7 @@ func MintToken(cfg TokenConfig, claims map[string]interface{}, ks *KeySet) (stri
 	tok := jwt.New()
 
 	// Set custom claims first, then override with standard claims so that
-	// neither the provisioner hook nor /provision/complete can tamper with
+	// neither the provisioner hook nor CompleteProvision can tamper with
 	// iss, aud, iat, or exp.
 	for k, v := range claims {
 		_ = tok.Set(k, v)

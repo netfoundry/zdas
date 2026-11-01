@@ -214,9 +214,8 @@ func TestStoreStaleEntriesAreMisses(t *testing.T) {
 			if err := store.CreatePendingProvision(ctx, h.storeKey(kindProvision, pid), &PendingProvision{CreatedAt: createdAt}); err != nil {
 				t.Fatal(err)
 			}
-			body := `{"pending_id":"` + pid + `","claims":{"sub":"x"}}`
 			w = httptest.NewRecorder()
-			mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/provision/complete", strings.NewReader(body)))
+			h.CompleteProvision(w, httptest.NewRequest(http.MethodPost, "/pick", nil), pid, map[string]any{"sub": "x"}, nil)
 			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "pending provision not found or expired") {
 				t.Errorf("provision: status = %d, body = %s; want 400 not found", w.Code, w.Body.String())
 			}
@@ -250,8 +249,7 @@ func TestStoreFailureIsServerError(t *testing.T) {
 	}
 
 	w = httptest.NewRecorder()
-	body := `{"pending_id":"` + id + `","claims":{"sub":"x"}}`
-	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/provision/complete", strings.NewReader(body)))
+	h.CompleteProvision(w, httptest.NewRequest(http.MethodPost, "/pick", nil), id, map[string]any{"sub": "x"}, nil)
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("provision complete: status = %d, want 500", w.Code)
 	}

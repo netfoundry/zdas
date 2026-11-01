@@ -43,7 +43,7 @@ type AuthCode struct {
 
 // PendingProvision holds state for an interactive provisioning detour.
 // Created when a provisioner returns a RedirectURL, consumed by
-// POST /provision/complete.
+// CompleteProvision.
 type PendingProvision struct {
 	TunnelerRedirectURI         string
 	TunnelerState               string
