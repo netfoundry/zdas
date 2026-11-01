@@ -240,13 +240,11 @@ func (p *GitHubProvider) getJSON(ctx context.Context, apiURL, accessToken string
 }
 
 // extractField extracts a string value from a JSON-decoded map. Numeric values
-// (like GitHub's user ID) are converted to string.
+// (like GitHub's user ID) are converted to string. A missing field, null,
+// or any other type gives "", so that a field that is null for some users
+// cannot give them all one shared value.
 func extractField(data map[string]any, field string) string {
-	v, ok := data[field]
-	if !ok {
-		return ""
-	}
-	switch val := v.(type) {
+	switch val := data[field].(type) {
 	case string:
 		return val
 	case float64:
@@ -254,6 +252,6 @@ func extractField(data map[string]any, field string) string {
 	case json.Number:
 		return val.String()
 	default:
-		return fmt.Sprintf("%v", val)
+		return ""
 	}
 }

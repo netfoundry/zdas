@@ -1,6 +1,7 @@
 package zdas
 
 import (
+	"errors"
 	"net/http"
 
 	"golang.org/x/crypto/acme/autocert"
@@ -31,7 +32,7 @@ func (s *Server) listenACME(srv *http.Server) error {
 		s.chalSrv = chalSrv
 		s.mu.Unlock()
 		go func() {
-			if err := chalSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			if err := chalSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				s.logger.Error("acme challenge listener failed", "error", err)
 			}
 		}()

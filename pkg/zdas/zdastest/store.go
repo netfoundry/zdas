@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -42,6 +43,7 @@ func TestStore(t *testing.T, newStore func(t *testing.T) zdas.Store) {
 			UpstreamProviderName: "keycloak",
 			CreatedAt:            time.Now(),
 		}
+		requireAllSet(t, want)
 		key := newKey(t)
 		if err := s.CreateSession(t.Context(), key, clone(t, want)); err != nil {
 			t.Fatalf("CreateSession: %v", err)
@@ -74,6 +76,7 @@ func TestStore(t *testing.T, newStore func(t *testing.T) zdas.Store) {
 			IsFallback:          true,
 			CreatedAt:           time.Now(),
 		}
+		requireAllSet(t, want)
 		key := newKey(t)
 		if err := s.CreateCode(t.Context(), key, clone(t, want)); err != nil {
 			t.Fatalf("CreateCode: %v", err)
@@ -98,8 +101,10 @@ func TestStore(t *testing.T, newStore func(t *testing.T) zdas.Store) {
 			TunnelerCodeChallenge:       "challenge",
 			TunnelerCodeChallengeMethod: "S256",
 			IsFallback:                  true,
+			FallbackNonce:               "0123456789abcdef",
 			CreatedAt:                   time.Now(),
 		}
+		requireAllSet(t, want)
 		key := newKey(t)
 		if err := s.CreatePendingProvision(t.Context(), key, clone(t, want)); err != nil {
 			t.Fatalf("CreatePendingProvision: %v", err)
@@ -287,6 +292,33 @@ func clone[T any](t *testing.T, v *T) *T {
 
 // checkCreatedAt allows for a store that truncates timestamps to its own
 // precision.
+// requireAllSet fails the test if any exported field of the struct v points
+// to, or of a struct it points to in turn, is zero. The round-trip subtests
+// call it on the value they store, so a field added to an entry type
+// without a value here fails the suite instead of going unchecked.
+func requireAllSet(t *testing.T, v any) {
+	t.Helper()
+	var walk func(path string, rv reflect.Value)
+	walk = func(path string, rv reflect.Value) {
+		if rv.Kind() == reflect.Pointer && !rv.IsNil() {
+			rv = rv.Elem()
+		}
+		if rv.Kind() != reflect.Struct || rv.Type() == reflect.TypeFor[time.Time]() {
+			if rv.IsZero() {
+				t.Fatalf("zdastest: %s is not set in the suite's test value; set it so the round trip covers it", path)
+			}
+			return
+		}
+		for i := range rv.NumField() {
+			if f := rv.Type().Field(i); f.IsExported() {
+				walk(path+"."+f.Name, rv.Field(i))
+			}
+		}
+	}
+	rv := reflect.ValueOf(v)
+	walk(rv.Type().Elem().Name(), rv)
+}
+
 func checkCreatedAt(t *testing.T, got, want time.Time) {
 	t.Helper()
 	if d := got.Sub(want); d < -time.Second || d > time.Second {

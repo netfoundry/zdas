@@ -58,8 +58,8 @@ func newEndpoints(cfg Config, keys *KeySet, verifyKeys []*KeySet, registry *Prov
 	return h
 }
 
-// Mux returns an http.ServeMux wired to all ZDAS endpoints.
-func (h *endpoints) Mux() *http.ServeMux {
+// mux returns an http.ServeMux wired to all ZDAS endpoints.
+func (h *endpoints) mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /.well-known/openid-configuration", h.handleDiscovery)
 	mux.HandleFunc("GET /.well-known/jwks.json", h.handleJWKS)
@@ -93,7 +93,7 @@ func (h *endpoints) handleNetworkJWTs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	body := h.discovery.NetworkJWTsBody()
+	body := h.discovery.cachedNetworkJWTs()
 	if body == nil {
 		http.Error(w, "network JWTs not yet available", http.StatusServiceUnavailable)
 		return
@@ -107,7 +107,7 @@ func (h *endpoints) handleExtJWTSigners(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	body := h.discovery.ExtJWTSignersBody()
+	body := h.discovery.cachedExtJWTSigners()
 	if body == nil {
 		http.Error(w, "external JWT signers not yet available", http.StatusServiceUnavailable)
 		return
@@ -243,32 +243,29 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		UpstreamProviderName:        provider.Name(),
 	}
 
-	var upstreamURL string
-	if oidcProv, ok := provider.(*OIDCProvider); ok {
-		// OIDC: generate our own PKCE pair for the upstream, then store the
-		// verifier in the session so /callback can use it.
-		verifier, challenge, err := generatePKCE()
-		if err != nil {
+	// For OIDC, use our own PKCE pair toward the upstream, keeping the
+	// verifier in the session for /callback. Other providers (GitHub) get
+	// none.
+	oidcProv, usePKCE := provider.(*OIDCProvider)
+	var challenge string
+	if usePKCE {
+		var err error
+		if sess.ZDASCodeVerifier, challenge, err = generatePKCE(); err != nil {
 			h.logger.Error("generate pkce", "error", err)
 			oidcErrorRedirect(w, r, redirectURI, state, "server_error", "internal error")
 			return
 		}
-		sess.ZDASCodeVerifier = verifier
-		sessionState, err := h.startSession(w, r, sess)
-		if err != nil {
-			h.logger.Error("create session", "error", err)
-			oidcErrorRedirect(w, r, redirectURI, state, "server_error", "internal error")
-			return
-		}
+	}
+	sessionState, err := h.startSession(w, r, sess)
+	if err != nil {
+		h.logger.Error("create session", "error", err)
+		oidcErrorRedirect(w, r, redirectURI, state, "server_error", "internal error")
+		return
+	}
+	var upstreamURL string
+	if usePKCE {
 		upstreamURL = oidcProv.authorizeURL(sessionState, callbackURL, challenge)
 	} else {
-		// Non-OIDC (e.g. GitHub): no upstream PKCE.
-		sessionState, err := h.startSession(w, r, sess)
-		if err != nil {
-			h.logger.Error("create session", "error", err)
-			oidcErrorRedirect(w, r, redirectURI, state, "server_error", "internal error")
-			return
-		}
 		upstreamURL = provider.AuthorizeURL(sessionState, callbackURL)
 	}
 
@@ -290,24 +287,8 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 	code := q.Get("code")
 	sessionState := q.Get("state")
 
-	if errParam := q.Get("error"); errParam != "" {
-		desc := q.Get("error_description")
-		h.logger.Warn("upstream returned error", "error", errParam, "description", desc)
-		// We need the session to know the tunneler's redirect_uri.
-		sess, err := h.consumeBoundSession(w, r, sessionState)
-		if err != nil {
-			h.logger.Error("consume session", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-		if sess == nil {
-			http.Error(w, sessionMissing, http.StatusBadRequest)
-			return
-		}
-		oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, upstreamErrorCode(errParam), sanitizeErrorDescription(desc))
-		return
-	}
-
+	// The session holds the tunneler's redirect_uri, which every outcome
+	// below needs, including an upstream error.
 	sess, err := h.consumeBoundSession(w, r, sessionState)
 	if err != nil {
 		h.logger.Error("consume session", "error", err)
@@ -316,6 +297,13 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	if sess == nil {
 		http.Error(w, sessionMissing, http.StatusBadRequest)
+		return
+	}
+
+	if errParam := q.Get("error"); errParam != "" {
+		desc := q.Get("error_description")
+		h.logger.Warn("upstream returned error", "error", errParam, "description", desc)
+		oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, upstreamErrorCode(errParam), sanitizeErrorDescription(desc))
 		return
 	}
 	if code == "" {
@@ -398,7 +386,11 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 		claims = ComposeClaims(h.cfg.Claims, h.cfg.Fallback, identity, sess.DeviceInfo, sess.FallbackNonce)
 	}
 
-	h.trackFallback(claims, sess.FallbackNonce)
+	if err := checkClaims(claims); err != nil {
+		h.handleProvisionerError(w, r, fmt.Errorf("provisioner returned claims that cannot be signed: %w", err),
+			sess.TunnelerRedirectURI, sess.TunnelerState, "provider", sess.UpstreamProviderName)
+		return
+	}
 
 	ac := &AuthCode{
 		Claims:              claims,
@@ -413,6 +405,7 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 		oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, "server_error", "internal error")
 		return
 	}
+	h.trackFallback(claims, sess.FallbackNonce)
 
 	redir := withQuery(sess.TunnelerRedirectURI, url.Values{
 		"code":  {zdasCode},
@@ -572,6 +565,11 @@ func (h *endpoints) completeProvision(w http.ResponseWriter, r *http.Request, pe
 	if err == nil && len(claims) == 0 {
 		err = errors.New("CompleteProvision called with neither claims nor an error")
 	}
+	if err == nil {
+		if cerr := checkClaims(claims); cerr != nil {
+			err = fmt.Errorf("CompleteProvision called with claims that cannot be signed: %w", cerr)
+		}
+	}
 	if err != nil {
 		h.handleProvisionerError(w, r, err, pp.TunnelerRedirectURI, pp.TunnelerState)
 		return
@@ -587,7 +585,7 @@ func (h *endpoints) completeProvision(w http.ResponseWriter, r *http.Request, pe
 	zdasCode, err := h.createCode(r.Context(), ac)
 	if err != nil {
 		h.logger.Error("create auth code from provision", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		oidcErrorRedirect(w, r, pp.TunnelerRedirectURI, pp.TunnelerState, "server_error", "internal error")
 		return
 	}
 
@@ -608,7 +606,7 @@ func (h *endpoints) trackFallback(claims map[string]any, nonce string) {
 	}
 	if extID, ok := claims[h.cfg.Claims.ExternalIDClaim].(string); ok {
 		username, _ := claims[preferredUsernameClaim].(string)
-		h.reconciler.Track(extID, username, nonce)
+		h.reconciler.track(extID, username, nonce)
 	}
 }
 

@@ -77,14 +77,14 @@ func TestIntegrationOIDCFlow(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	// Run initial discovery (discovers the OIDC provider).
-	if err := srv.discovery.runOnce(t.Context()); err != nil {
+	if err := srv.discovery.poll(t.Context()); err != nil {
 		t.Fatalf("discovery: %v", err)
 	}
 	t.Cleanup(func() {
-		srv.store.Stop()
+		srv.store.stop()
 	})
 
-	mux := srv.handlers.Mux()
+	mux := srv.handlers.mux()
 
 	// 4. Tunneler sends /authorize.
 	verifier, challenge := generateTestPKCE(t)
@@ -254,10 +254,10 @@ func TestIntegrationGitHubFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	if err := srv.discovery.runOnce(t.Context()); err != nil {
+	if err := srv.discovery.poll(t.Context()); err != nil {
 		t.Fatalf("discovery: %v", err)
 	}
-	t.Cleanup(func() { srv.store.Stop() })
+	t.Cleanup(func() { srv.store.stop() })
 
 	// Point the GitHub provider at our mock server.
 	ghProv, err := srv.registry.Resolve("github")
@@ -269,7 +269,7 @@ func TestIntegrationGitHubFlow(t *testing.T) {
 	ghp.tokenBaseURL = ghServer.URL + "/login/oauth/access_token"
 	ghp.userURL = ghServer.URL + "/user"
 
-	mux := srv.handlers.Mux()
+	mux := srv.handlers.mux()
 
 	// Tunneler sends /authorize.
 	verifier, challenge := generateTestPKCE(t)
@@ -399,17 +399,17 @@ func TestIntegrationFallbackFlow(t *testing.T) {
 	// Build server components manually (no identity file needed for this test).
 	keys, _ := GenerateKeySet()
 	registry := NewProviderRegistry()
-	store := newSessionStore(cfg.Session.Timeout, cfg.Session.CodeExpiry)
-	t.Cleanup(store.Stop)
+	store := newMemStore(cfg.Session.Timeout, cfg.Session.CodeExpiry, storeSweepInterval)
+	t.Cleanup(store.stop)
 
-	disc := newSignerDiscovery(cfg.Controller, http.DefaultClient, registry, nil, slog.Default())
-	if err := disc.runOnce(t.Context()); err != nil {
+	disc := newSignerDiscovery(cfg.Controller, http.DefaultClient, nil, registry, nil, slog.Default())
+	if err := disc.poll(t.Context()); err != nil {
 		t.Fatalf("discovery: %v", err)
 	}
 
 	// No reconciler in this test (no identity file), but fallback is enabled.
 	h := newTestEndpoints(cfg, keys, registry, store, nil)
-	mux := h.Mux()
+	mux := h.mux()
 
 	// Tunneler sends /authorize WITHOUT device_name.
 	verifier, challenge := generateTestPKCE(t)
@@ -538,7 +538,7 @@ func newReplica(t *testing.T, cfg Config, opts ...Option) (*Server, http.Handler
 	}); err != nil {
 		t.Fatal(err)
 	}
-	return srv, srv.handlers.Mux()
+	return srv, srv.handlers.mux()
 }
 
 // enrollAcross runs /authorize on start, /callback on callback, and /token on

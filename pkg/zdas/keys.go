@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwk"
@@ -101,13 +102,20 @@ func (ks *KeySet) KID() string { return ks.kid }
 // Private returns the raw ECDSA private key for signing operations.
 func (ks *KeySet) Private() *ecdsa.PrivateKey { return ks.private }
 
-// JWKS returns the marshaled JWKS JSON publishing the public key of each set,
-// in order, with kid, alg and use set as the ZDAS JWKS endpoint sets them.
-// An embedder that serves keys on its own, for example to a controller that
-// cannot reach ZDAS, passes the active key and every verify-only key, as the
-// ZDAS endpoint does.
+// JWKS returns the marshaled JWKS JSON publishing the public key of each set
+// once, in order, with kid, alg and use set: the document ZDAS's own JWKS
+// endpoint serves for WithKeySet(sets[0], sets[1:]...). An embedder that
+// serves keys on its own, for example to a controller that cannot reach
+// ZDAS, passes the active key first, then every verify-only key. It fails
+// on no sets or a nil one.
 func JWKS(sets ...*KeySet) ([]byte, error) {
-	return publicJWKS(sets)
+	if len(sets) == 0 {
+		return nil, errors.New("JWKS: no key sets")
+	}
+	if slices.Contains(sets, nil) {
+		return nil, errors.New("JWKS: nil key set")
+	}
+	return publicJWKS(uniqueKeySets(sets[0], sets[1:]))
 }
 
 // publicJWKS returns the marshaled JWKS JSON containing the public key of

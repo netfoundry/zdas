@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -156,6 +158,7 @@ func TestNewServerRejectsNilOptions(t *testing.T) {
 		"nil verify-only": WithKeySet(ks, nil),
 		"nil store":       WithStore(nil),
 		"nil client":      WithUpstreamHTTPClient(nil),
+		"nil provisioner": WithProvisioner(nil),
 	} {
 		if srv, err := NewServer(cfg, slog.Default(), opt); err == nil {
 			srv.Shutdown(context.Background())
@@ -165,7 +168,7 @@ func TestNewServerRejectsNilOptions(t *testing.T) {
 }
 
 // TestNewServerInjectedStoreNotOwned verifies that a server given a Store
-// does not create, and so never stops, a sessionStore of its own.
+// does not create, and so never stops, an in-memory store of its own.
 func TestNewServerInjectedStoreNotOwned(t *testing.T) {
 	cfg := replicaConfig(t)
 	srv, err := NewServer(cfg, slog.Default(), WithStore(newJSONStore()))
@@ -173,7 +176,7 @@ func TestNewServerInjectedStoreNotOwned(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	if srv.store != nil {
-		t.Error("server created a sessionStore despite WithStore")
+		t.Error("server created an in-memory store despite WithStore")
 	}
 	if err := srv.Shutdown(context.Background()); err != nil {
 		t.Errorf("Shutdown: %v", err)
@@ -267,4 +270,41 @@ func TestHandlerStopTwice(t *testing.T) {
 	}
 	h.Stop()
 	h.Stop()
+}
+
+// TestServerShutdownCancelsInitialPoll verifies that Shutdown during the
+// initial discovery poll ends it, rather than waiting for the controller.
+func TestServerShutdownCancelsInitialPoll(t *testing.T) {
+	requested := make(chan struct{})
+	release := make(chan struct{})
+	ctrl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requested)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(ctrl.Close)
+	t.Cleanup(func() { close(release) })
+	cfg := replicaConfig(t)
+	cfg.Controller.APIURL = ctrl.URL
+
+	srv, err := NewServer(cfg, slog.Default())
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Start(context.Background()) }()
+	<-requested
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Start = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start still in its initial poll after Shutdown")
+	}
 }

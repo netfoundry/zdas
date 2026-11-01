@@ -74,20 +74,16 @@ func MintToken(cfg TokenConfig, claims map[string]any, ks *KeySet) (string, erro
 	// Set custom claims first, then override with standard claims so that
 	// neither the provisioner hook nor CompleteProvision can tamper with
 	// iss, aud, iat, or exp.
-	for k, v := range claims {
-		if err := tok.Set(k, v); err != nil {
-			return "", fmt.Errorf("set claim %q: %w", k, err)
-		}
+	if err := setClaims(tok, claims); err != nil {
+		return "", err
 	}
-	for k, v := range map[string]any{
+	if err := setClaims(tok, map[string]any{
 		jwt.IssuerKey:     cfg.Issuer,
 		jwt.AudienceKey:   cfg.Audience,
 		jwt.IssuedAtKey:   now,
 		jwt.ExpirationKey: now.Add(cfg.Expiry),
-	} {
-		if err := tok.Set(k, v); err != nil {
-			return "", fmt.Errorf("set claim %q: %w", k, err)
-		}
+	}); err != nil {
+		return "", err
 	}
 
 	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256, ks.privateJWK))
@@ -95,6 +91,24 @@ func MintToken(cfg TokenConfig, claims map[string]any, ks *KeySet) (string, erro
 		return "", fmt.Errorf("sign jwt: %w", err)
 	}
 	return string(signed), nil
+}
+
+// setClaims sets each claim on tok, failing on a value its registered
+// claim does not allow, such as a non-string sub.
+func setClaims(tok jwt.Token, claims map[string]any) error {
+	for k, v := range claims {
+		if err := tok.Set(k, v); err != nil {
+			return fmt.Errorf("set claim %q: %w", k, err)
+		}
+	}
+	return nil
+}
+
+// checkClaims reports whether MintToken can sign claims. ZDAS checks a
+// provisioner's claims when it creates the code, so that a bad claim fails
+// the flow with an error the tunneler sees rather than at /token.
+func checkClaims(claims map[string]any) error {
+	return setClaims(jwt.New(), claims)
 }
 
 // resolveUsername picks the best username from the upstream identity. It checks

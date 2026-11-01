@@ -9,8 +9,8 @@ import "time"
 // NewMemoryStoreForTest returns the in-memory default Store, as NewServer
 // builds it, along with a func that stops its cleanup goroutine.
 func NewMemoryStoreForTest(sessionTTL, codeTTL time.Duration) (Store, func()) {
-	s := newSessionStore(sessionTTL, codeTTL)
-	return sessionStoreAdapter{s}, s.Stop
+	s := newMemStore(sessionTTL, codeTTL, storeSweepInterval)
+	return s, s.stop
 }
 
 // NewJSONStoreForTest returns the JSON-serializing test Store from

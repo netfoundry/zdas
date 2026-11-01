@@ -575,3 +575,16 @@ func TestGeneratePKCE(t *testing.T) {
 		t.Errorf("verifier too short: %d chars", len(v1))
 	}
 }
+
+// TestOIDCProviderRejectsMissingSub verifies that an ID token without a sub
+// is rejected, since every such user would otherwise share one external ID.
+func TestOIDCProviderRejectsMissingSub(t *testing.T) {
+	server, _ := mockOIDCServer(t, map[string]any{"preferred_username": "nobody"})
+	p, err := NewOIDCProvider(context.Background(), OIDCProviderConfig{Name: "idp", Issuer: server.URL, ClientID: "test-client"})
+	if err != nil {
+		t.Fatalf("NewOIDCProvider: %v", err)
+	}
+	if id, err := p.ExchangeAndIdentify(context.Background(), "code", server.URL+"/callback"); err == nil {
+		t.Errorf("accepted an id_token without sub, subject %q", id.Subject)
+	}
+}

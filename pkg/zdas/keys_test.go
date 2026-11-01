@@ -281,3 +281,33 @@ func TestUniqueKeySetsDropsDuplicateKIDs(t *testing.T) {
 		t.Errorf("uniqueKeySets = %v, want [%s %s]", kids, a.KID(), b.KID())
 	}
 }
+
+// TestJWKSDeduplicatesAndRejectsNil verifies that JWKS publishes a key once
+// however often it is passed, as the ZDAS endpoint does, and fails rather
+// than panicking on a nil set.
+func TestJWKSDeduplicatesAndRejectsNil(t *testing.T) {
+	a, err := GenerateKeySet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := GenerateKeySet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := JWKS(a, b, a)
+	if err != nil {
+		t.Fatalf("JWKS: %v", err)
+	}
+	set, err := jwk.Parse(data)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if set.Len() != 2 {
+		t.Errorf("JWKS holds %d keys, want 2", set.Len())
+	}
+	for _, sets := range [][]*KeySet{nil, {nil}, {a, nil}} {
+		if _, err := JWKS(sets...); err == nil {
+			t.Errorf("JWKS(%v) succeeded", sets)
+		}
+	}
+}

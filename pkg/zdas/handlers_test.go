@@ -16,9 +16,9 @@ import (
 
 // newTestEndpoints returns endpoints over store, keyed as NewServer keys
 // them, with entries expiring by the store's TTLs.
-func newTestEndpoints(cfg Config, keys *KeySet, reg *ProviderRegistry, store *sessionStore, p EnrollmentProvisioner) *endpoints {
+func newTestEndpoints(cfg Config, keys *KeySet, reg *ProviderRegistry, store *memStore, p EnrollmentProvisioner) *endpoints {
 	cfg.Session.Timeout, cfg.Session.CodeExpiry = store.sessionTTL, store.codeTTL
-	return newEndpoints(cfg, keys, nil, reg, sessionStoreAdapter{store}, nil, nil, p, slog.Default())
+	return newEndpoints(cfg, keys, nil, reg, store, nil, nil, p, slog.Default())
 }
 
 // seedSession stores sess as /authorize would, but without binding it to a
@@ -55,8 +55,8 @@ func setupHandlers(t *testing.T) (*endpoints, *stubProvider) {
 	if err := reg.Register(sp); err != nil {
 		t.Fatal(err)
 	}
-	store := newSessionStore(10*time.Minute, 60*time.Second)
-	t.Cleanup(store.Stop)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
 
 	cfg := Config{
 		ExternalURL: "https://zdas.example.com",
@@ -83,7 +83,7 @@ func generateTestPKCE(t *testing.T) (verifier, challenge string) {
 
 func TestHandleDiscovery(t *testing.T) {
 	h, _ := setupHandlers(t)
-	mux := h.Mux()
+	mux := h.mux()
 
 	req := httptest.NewRequest(http.MethodGet, "/.well-known/openid-configuration", nil)
 	w := httptest.NewRecorder()
@@ -118,7 +118,7 @@ func TestHandleDiscovery(t *testing.T) {
 
 func TestHandleJWKS(t *testing.T) {
 	h, _ := setupHandlers(t)
-	mux := h.Mux()
+	mux := h.mux()
 
 	req := httptest.NewRequest(http.MethodGet, "/.well-known/jwks.json", nil)
 	w := httptest.NewRecorder()
@@ -140,7 +140,7 @@ func TestHandleJWKS(t *testing.T) {
 
 func TestHandleNetworkJWTsNotCached(t *testing.T) {
 	h, _ := setupHandlers(t)
-	mux := h.Mux()
+	mux := h.mux()
 
 	req := httptest.NewRequest(http.MethodGet, "/network-jwts", nil)
 	w := httptest.NewRecorder()
@@ -154,7 +154,7 @@ func TestHandleNetworkJWTsNotCached(t *testing.T) {
 
 func TestHandleExtJWTSignersNotCached(t *testing.T) {
 	h, _ := setupHandlers(t)
-	mux := h.Mux()
+	mux := h.mux()
 
 	req := httptest.NewRequest(http.MethodGet, "/edge/client/v1/external-jwt-signers", nil)
 	w := httptest.NewRecorder()
@@ -168,7 +168,7 @@ func TestHandleExtJWTSignersNotCached(t *testing.T) {
 
 func TestHandleAuthorizeMissingDeviceNameFallbackDisabled(t *testing.T) {
 	h, _ := setupHandlers(t)
-	mux := h.Mux()
+	mux := h.mux()
 	_, challenge := generateTestPKCE(t)
 
 	reqURL := "/authorize?redirect_uri=http://localhost:20314/auth/callback&response_type=code&state=s1" +
@@ -192,8 +192,8 @@ func TestHandleAuthorizeFallbackEnabled(t *testing.T) {
 	reg := NewProviderRegistry()
 	sp := &stubProvider{name: "test-idp", issuer: "https://test-idp"}
 	_ = reg.Register(sp)
-	store := newSessionStore(10*time.Minute, 60*time.Second)
-	t.Cleanup(store.Stop)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
 
 	cfg := Config{
 		ExternalURL: "https://zdas.example.com",
@@ -206,7 +206,7 @@ func TestHandleAuthorizeFallbackEnabled(t *testing.T) {
 		},
 	}
 	h := newTestEndpoints(cfg, ks, reg, store, nil)
-	mux := h.Mux()
+	mux := h.mux()
 
 	_, challenge := generateTestPKCE(t)
 	reqURL := "/authorize?redirect_uri=http://localhost:20314/auth/callback&response_type=code&state=s1" +
@@ -233,8 +233,8 @@ func TestHandleAuthorizeIDPSelector(t *testing.T) {
 	reg := NewProviderRegistry()
 	_ = reg.Register(&stubProvider{name: "keycloak", issuer: "https://kc"})
 	_ = reg.Register(&stubProvider{name: "github", issuer: "https://github.com"})
-	store := newSessionStore(10*time.Minute, 60*time.Second)
-	t.Cleanup(store.Stop)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
 
 	cfg := Config{
 		ExternalURL: "https://zdas.example.com",
@@ -242,7 +242,7 @@ func TestHandleAuthorizeIDPSelector(t *testing.T) {
 		Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enrolltocert", Expiry: 5 * time.Minute},
 	}
 	h := newTestEndpoints(cfg, ks, reg, store, nil)
-	mux := h.Mux()
+	mux := h.mux()
 
 	_, challenge := generateTestPKCE(t)
 	// Multiple providers, no selection yet - should show selector page.
@@ -289,8 +289,8 @@ func idpSelectorHandlers(t *testing.T, selectorURL string) *http.ServeMux {
 	reg := NewProviderRegistry()
 	_ = reg.Register(&stubProvider{name: "github", issuer: "https://github.com"})
 	_ = reg.Register(&stubProvider{name: "keycloak", issuer: "https://kc"})
-	store := newSessionStore(10*time.Minute, 60*time.Second)
-	t.Cleanup(store.Stop)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
 
 	cfg := Config{
 		ExternalURL:    "https://zdas.example.com",
@@ -299,7 +299,7 @@ func idpSelectorHandlers(t *testing.T, selectorURL string) *http.ServeMux {
 		Token:          TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
 	h := newTestEndpoints(cfg, ks, reg, store, nil)
-	return h.Mux()
+	return h.mux()
 }
 
 func TestIDPSelectorURLUnsetRendersBuiltinPicker(t *testing.T) {
@@ -362,8 +362,8 @@ func TestIDPSelectorURLSingleProviderSkipsPicker(t *testing.T) {
 	ks, _ := GenerateKeySet()
 	reg := NewProviderRegistry()
 	_ = reg.Register(&stubProvider{name: "only-one", issuer: "https://only"})
-	store := newSessionStore(10*time.Minute, 60*time.Second)
-	t.Cleanup(store.Stop)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
 
 	cfg := Config{
 		ExternalURL:    "https://zdas.example.com",
@@ -372,7 +372,7 @@ func TestIDPSelectorURLSingleProviderSkipsPicker(t *testing.T) {
 		Token:          TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
 	h := newTestEndpoints(cfg, ks, reg, store, nil)
-	mux := h.Mux()
+	mux := h.mux()
 
 	_, challenge := generateTestPKCE(t)
 	reqURL := "/authorize?redirect_uri=http://localhost:20314/auth/callback&response_type=code&state=s1" +
@@ -447,7 +447,7 @@ func TestIDPSelectorURLAppendsToExistingQuery(t *testing.T) {
 
 func TestHandleAuthorizeMissingPKCE(t *testing.T) {
 	h, _ := setupHandlers(t)
-	mux := h.Mux()
+	mux := h.mux()
 
 	reqURL := "/authorize?redirect_uri=http://localhost:20314/auth/callback&response_type=code&state=s1&device_name=laptop"
 	req := httptest.NewRequest(http.MethodGet, reqURL, nil)
@@ -462,7 +462,7 @@ func TestHandleAuthorizeMissingPKCE(t *testing.T) {
 
 func TestHandleAuthorizeRedirects(t *testing.T) {
 	h, _ := setupHandlers(t)
-	mux := h.Mux()
+	mux := h.mux()
 	_, challenge := generateTestPKCE(t)
 
 	reqURL := "/authorize?redirect_uri=http://localhost:20314/auth/callback&response_type=code&state=s1" +
@@ -484,7 +484,7 @@ func TestTokenEndpointFullFlow(t *testing.T) {
 	// This tests the /token endpoint directly by pre-populating an auth code
 	// in the session store (simulating what /callback would have done).
 	h, _ := setupHandlers(t)
-	mux := h.Mux()
+	mux := h.mux()
 
 	verifier, challenge := generateTestPKCE(t)
 
@@ -538,7 +538,7 @@ func TestTokenEndpointFullFlow(t *testing.T) {
 
 func TestTokenEndpointRejectsReplay(t *testing.T) {
 	h, _ := setupHandlers(t)
-	mux := h.Mux()
+	mux := h.mux()
 	verifier, challenge := generateTestPKCE(t)
 
 	code, _ := h.createCode(t.Context(), &AuthCode{
@@ -581,7 +581,7 @@ func TestTokenEndpointRejectsReplay(t *testing.T) {
 
 func TestTokenEndpointBadPKCE(t *testing.T) {
 	h, _ := setupHandlers(t)
-	mux := h.Mux()
+	mux := h.mux()
 	_, challenge := generateTestPKCE(t)
 
 	code, _ := h.createCode(t.Context(), &AuthCode{
@@ -660,8 +660,8 @@ func TestCallbackToTokenFullFlow(t *testing.T) {
 		},
 	}
 	_ = reg.Register(cp)
-	store := newSessionStore(10*time.Minute, 60*time.Second)
-	t.Cleanup(store.Stop)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
 
 	cfg := Config{
 		ExternalURL: "https://zdas.example.com",
@@ -673,7 +673,7 @@ func TestCallbackToTokenFullFlow(t *testing.T) {
 		},
 	}
 	h := newTestEndpoints(cfg, ks, reg, store, nil)
-	mux := h.Mux()
+	mux := h.mux()
 
 	// Pre-create a session as if /authorize had run.
 	verifier, challenge := generateTestPKCE(t)
@@ -759,14 +759,17 @@ func TestCallbackErrorMapping(t *testing.T) {
 		{"provisioner returns nothing", "code=c", nil, provisionerFunc(func(context.Context, ProvisionRequest) (*ProvisionResult, error) {
 			return &ProvisionResult{}, nil
 		}), "server_error"},
+		{"provisioner returns a mistyped claim", "code=c", nil, provisionerFunc(func(context.Context, ProvisionRequest) (*ProvisionResult, error) {
+			return &ProvisionResult{Claims: map[string]any{"sub": 123}}, nil
+		}), "server_error"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ks, _ := GenerateKeySet()
 			reg := NewProviderRegistry()
 			_ = reg.Register(&callbackProvider{name: "mock-idp", issuer: "https://mock-idp", identity: identity, err: tc.err})
-			store := newSessionStore(10*time.Minute, time.Minute)
-			t.Cleanup(store.Stop)
+			store := newMemStore(10*time.Minute, time.Minute, storeSweepInterval)
+			t.Cleanup(store.stop)
 			cfg := Config{
 				ExternalURL: "https://zdas.test",
 				Claims:      defaultClaimsConfig(),
@@ -785,7 +788,7 @@ func TestCallbackErrorMapping(t *testing.T) {
 				target += "&" + tc.query
 			}
 			w := httptest.NewRecorder()
-			h.Mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
+			h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
 			loc, err := url.Parse(w.Header().Get("Location"))
 			if err != nil || w.Code != http.StatusFound {
 				t.Fatalf("status = %d, Location = %q", w.Code, w.Header().Get("Location"))

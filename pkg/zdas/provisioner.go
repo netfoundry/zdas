@@ -86,14 +86,16 @@ type ProvisionRequest struct {
 
 // ProvisionResult tells ZDAS how to proceed after provisioning.
 type ProvisionResult struct {
-	// Claims to include in the ZDAS JWT. When non-nil, ZDAS mints the token
-	// immediately. The map should include at minimum the identity name claim
-	// and external ID claim from ClaimsConfig.
+	// Claims to include in the ZDAS JWT. When non-empty, ZDAS mints the
+	// token immediately. The map should include at minimum the identity
+	// name claim and external ID claim from ClaimsConfig, and a registered
+	// claim such as sub must have the type the JWT spec gives it.
 	Claims map[string]any
 
-	// RedirectURL, when non-empty and Claims is nil, redirects the browser
+	// RedirectURL, when non-empty and Claims is empty, redirects the browser
 	// to an application-hosted page for interactive selection. ZDAS adds a
 	// pending_id query parameter, and the application's handler for the
 	// page finishes the flow by passing it to Handler.CompleteProvision.
+	// A result with neither fails the enrollment with server_error.
 	RedirectURL string
 }

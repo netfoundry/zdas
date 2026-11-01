@@ -1,6 +1,7 @@
 package zdas
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -9,8 +10,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"golang.org/x/time/rate"
 )
 
 // testLimiter returns a limiter for cfg with a clock the test controls.
@@ -93,8 +92,8 @@ func TestRateLimiterIgnoresUntrustedXFF(t *testing.T) {
 	if allowed != 1 {
 		t.Errorf("allowed %d of 50 requests with rotating X-Forwarded-For, want 1", allowed)
 	}
-	if len(rl.clients) != 1 {
-		t.Errorf("limiter holds %d buckets, want 1", len(rl.clients))
+	if n := rl.lru.Len(); n != 1 {
+		t.Errorf("limiter holds %d buckets, want 1", n)
 	}
 }
 
@@ -122,6 +121,9 @@ func TestRateLimiterClientAddr(t *testing.T) {
 		{"trusted proxy without xff", "10.0.0.1:1", nil, "10.0.0.1"},
 		{"garbage from trusted hop", "10.0.0.1:1", []string{"198.51.100.7, bogus"}, "10.0.0.1"},
 		{"all hops trusted", "10.0.0.1:1", []string{"10.0.0.3, 10.0.0.2"}, "10.0.0.3"},
+		{"hop with port", "10.0.0.1:1", []string{"198.51.100.7:4567"}, "198.51.100.7"},
+		{"bracketed ipv6 hop with port", "10.0.0.1:1", []string{"[2001:db8::7]:443"}, "2001:db8::7"},
+		{"bracketed ipv6 hop", "10.0.0.1:1", []string{"[2001:db8::7]"}, "2001:db8::7"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -135,30 +137,78 @@ func TestRateLimiterClientAddr(t *testing.T) {
 func TestRateLimiterRemovesIdleClients(t *testing.T) {
 	rl, now := testLimiter(t, RateLimitConfig{AuthorizePerSecond: 1, AuthorizeBurst: 1})
 	rl.allow(fromAddr("192.0.2.1:1"))
-	*now = now.Add(rateLimitIdle + rateLimitSweep)
+	*now = now.Add(rateLimitIdle + time.Second)
 	rl.allow(fromAddr("192.0.2.2:1"))
-	if _, ok := rl.clients[clientKey(netip.MustParseAddr("192.0.2.1"))]; ok {
+	if _, ok := rl.buckets[clientKey(netip.MustParseAddr("192.0.2.1"))]; ok {
 		t.Error("idle client was not removed")
 	}
-	if len(rl.clients) != 1 {
-		t.Errorf("limiter holds %d buckets, want 1", len(rl.clients))
+	if n := rl.lru.Len(); n != 1 {
+		t.Errorf("limiter holds %d buckets, want 1", n)
 	}
 }
 
-func TestRateLimiterCapsClients(t *testing.T) {
+// TestRateLimiterEvictsAtCap verifies that a full limiter makes room for a
+// new client by evicting the least recently used bucket, so that filling it
+// with addresses does not lock out everyone else.
+func TestRateLimiterEvictsAtCap(t *testing.T) {
 	rl, _ := testLimiter(t, RateLimitConfig{AuthorizePerSecond: 1, AuthorizeBurst: 1})
-	rl.allow(fromAddr("192.0.2.1:1"))
-	for i := 0; len(rl.clients) < maxRateLimitClients; i++ {
-		rl.clients[netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}), 32)] = &rateLimitEntry{
-			limiter:  rate.NewLimiter(rl.rate, rl.burst),
-			lastSeen: rl.now(),
+	for i := range maxRateLimitBuckets {
+		rl.allow(fromAddr(netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}), 1).String()))
+	}
+	if n := rl.lru.Len(); n != maxRateLimitBuckets {
+		t.Fatalf("limiter holds %d buckets, want %d", n, maxRateLimitBuckets)
+	}
+
+	// The first client comes back, so the second is now the least
+	// recently used.
+	rl.allow(fromAddr("10.0.0.0:1"))
+	if !rl.allow(fromAddr("192.0.2.2:1")) {
+		t.Error("new client refused with the limiter full")
+	}
+	if n := rl.lru.Len(); n != maxRateLimitBuckets {
+		t.Errorf("limiter holds %d buckets, want %d", n, maxRateLimitBuckets)
+	}
+	if _, ok := rl.buckets[clientKey(netip.MustParseAddr("10.0.0.1"))]; ok {
+		t.Error("least recently used bucket was not evicted")
+	}
+	if _, ok := rl.buckets[clientKey(netip.MustParseAddr("10.0.0.0"))]; !ok {
+		t.Error("recently used bucket was evicted")
+	}
+}
+
+// TestRateLimiterSiteLimit verifies that cycling through the /64s of one
+// IPv6 /48 runs into the /48's limit rather than getting a fresh bucket
+// each time.
+func TestRateLimiterSiteLimit(t *testing.T) {
+	rl, _ := testLimiter(t, RateLimitConfig{AuthorizePerSecond: 1, AuthorizeBurst: 1})
+	allowed := 0
+	for i := range 2 * siteRateMultiplier {
+		if rl.allow(fromAddr(fmt.Sprintf("[2001:db8:1:%x::1]:1", i))) {
+			allowed++
 		}
 	}
-	if rl.allow(fromAddr("192.0.2.2:1")) {
-		t.Error("new client allowed with the limiter full")
+	if allowed != siteRateMultiplier {
+		t.Errorf("allowed %d requests from distinct /64s of one /48, want %d", allowed, siteRateMultiplier)
 	}
-	if len(rl.clients) != maxRateLimitClients {
-		t.Errorf("limiter holds %d buckets, want %d", len(rl.clients), maxRateLimitClients)
+	if !rl.allow(fromAddr("[2001:db8:2::1]:1")) {
+		t.Error("a client in another /48 was refused")
+	}
+}
+
+// TestRateLimiterLogsUntrustedXFFOnce verifies that X-Forwarded-For from an
+// unlisted peer is reported, once, since behind an unlisted proxy every
+// client shares one bucket.
+func TestRateLimiterLogsUntrustedXFFOnce(t *testing.T) {
+	var buf bytes.Buffer
+	rl := newIPRateLimiter(RateLimitConfig{AuthorizePerSecond: 1}, slog.New(slog.NewTextHandler(&buf, nil)))
+	rl.allow(fromAddr("192.0.2.1:1"))
+	if buf.Len() != 0 {
+		t.Fatalf("logged without X-Forwarded-For: %s", buf.String())
+	}
+	rl.allow(fromAddr("192.0.2.1:1", "198.51.100.7"))
+	rl.allow(fromAddr("192.0.2.1:1", "198.51.100.8"))
+	if n := strings.Count(buf.String(), "trusted_proxies"); n != 1 {
+		t.Errorf("logged %d times, want once: %s", n, buf.String())
 	}
 }
 
@@ -192,7 +242,7 @@ func TestParseTrustedProxy(t *testing.T) {
 func TestRateLimiterDisabledByDefault(t *testing.T) {
 	// Config with zero rate limit - handler should not rate limit.
 	h, _ := setupHandlers(t)
-	mux := h.Mux()
+	mux := h.mux()
 	_, challenge := generateTestPKCE(t)
 
 	for i := 0; i < 50; i++ {
@@ -212,8 +262,8 @@ func TestRateLimiterEnabled(t *testing.T) {
 	ks, _ := GenerateKeySet()
 	reg := NewProviderRegistry()
 	_ = reg.Register(&stubProvider{name: "test-idp", issuer: "https://test-idp"})
-	store := newSessionStore(10*time.Minute, 60*time.Second)
-	t.Cleanup(store.Stop)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
 
 	cfg := Config{
 		ExternalURL: "https://zdas.example.com",
@@ -222,7 +272,7 @@ func TestRateLimiterEnabled(t *testing.T) {
 		RateLimit:   RateLimitConfig{AuthorizePerSecond: 1, AuthorizeBurst: 2},
 	}
 	h := newTestEndpoints(cfg, ks, reg, store, nil)
-	mux := h.Mux()
+	mux := h.mux()
 
 	_, challenge := generateTestPKCE(t)
 	reqURL := "/authorize?redirect_uri=http://localhost:20314/auth/callback&response_type=code&state=s1" +

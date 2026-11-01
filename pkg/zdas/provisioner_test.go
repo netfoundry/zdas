@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -56,8 +57,8 @@ func TestProvisionerImmediateClaims(t *testing.T) {
 		},
 	}
 	_ = reg.Register(cp)
-	store := newSessionStore(10*time.Minute, 60*time.Second)
-	t.Cleanup(store.Stop)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
 
 	provisioner := &immediateProvisioner{
 		claims: map[string]any{
@@ -73,7 +74,7 @@ func TestProvisionerImmediateClaims(t *testing.T) {
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
 	h := newTestEndpoints(cfg, ks, reg, store, provisioner)
-	mux := h.Mux()
+	mux := h.mux()
 
 	// Create a session as if /authorize ran.
 	verifier, challenge := generateTestPKCE(t)
@@ -136,8 +137,8 @@ func TestProvisionerInteractiveRedirect(t *testing.T) {
 		},
 	}
 	_ = reg.Register(cp)
-	store := newSessionStore(10*time.Minute, 60*time.Second)
-	t.Cleanup(store.Stop)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
 
 	provisioner := &interactiveProvisioner{
 		redirectURL: "https://ezziti.example.com/pick-network",
@@ -149,7 +150,7 @@ func TestProvisionerInteractiveRedirect(t *testing.T) {
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
 	h := newTestEndpoints(cfg, ks, reg, store, provisioner)
-	mux := h.Mux()
+	mux := h.mux()
 
 	verifier, challenge := generateTestPKCE(t)
 	sessID := seedSession(t, h, &AuthSession{
@@ -230,8 +231,8 @@ func runProvisionerCallback(t *testing.T, p EnrollmentProvisioner) *httptest.Res
 		},
 	}
 	_ = reg.Register(cp)
-	store := newSessionStore(10*time.Minute, 60*time.Second)
-	t.Cleanup(store.Stop)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
 
 	cfg := Config{
 		ExternalURL: "https://zdas.test",
@@ -239,7 +240,7 @@ func runProvisionerCallback(t *testing.T, p EnrollmentProvisioner) *httptest.Res
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
 	h := newTestEndpoints(cfg, ks, reg, store, p)
-	mux := h.Mux()
+	mux := h.mux()
 
 	_, challenge := generateTestPKCE(t)
 	sessID := seedSession(t, h, &AuthSession{
@@ -382,8 +383,8 @@ func setupProvisionComplete(t *testing.T) (h *endpoints, pendingID string) {
 		t.Fatalf("GenerateKeySet: %v", err)
 	}
 	reg := NewProviderRegistry()
-	store := newSessionStore(10*time.Minute, 60*time.Second)
-	t.Cleanup(store.Stop)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
 
 	cfg := Config{
 		ExternalURL: "https://zdas.test",
@@ -426,7 +427,7 @@ func TestProvisionCompleteRouteRemoved(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/provision/complete", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	h.Mux().ServeHTTP(w, req)
+	h.mux().ServeHTTP(w, req)
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", w.Code)
@@ -578,8 +579,8 @@ func TestProvisionerReceivesEnrollmentMethod(t *testing.T) {
 		},
 	}
 	_ = reg.Register(cp)
-	store := newSessionStore(10*time.Minute, 60*time.Second)
-	t.Cleanup(store.Stop)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
 
 	provisioner := &capturingProvisioner{
 		claims: map[string]any{
@@ -595,7 +596,7 @@ func TestProvisionerReceivesEnrollmentMethod(t *testing.T) {
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
 	h := newTestEndpoints(cfg, ks, reg, store, provisioner)
-	mux := h.Mux()
+	mux := h.mux()
 
 	_, challenge := generateTestPKCE(t)
 	sessID := seedSession(t, h, &AuthSession{
@@ -650,8 +651,8 @@ func TestProvisionerReceivesClientType(t *testing.T) {
 					Raw:      map[string]any{},
 				},
 			})
-			store := newSessionStore(10*time.Minute, 60*time.Second)
-			t.Cleanup(store.Stop)
+			store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+			t.Cleanup(store.stop)
 
 			provisioner := &capturingProvisioner{
 				claims: map[string]any{
@@ -665,7 +666,7 @@ func TestProvisionerReceivesClientType(t *testing.T) {
 				Claims:      defaultClaimsConfig(),
 				Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 			}
-			mux := newTestEndpoints(cfg, ks, reg, store, provisioner).Mux()
+			mux := newTestEndpoints(cfg, ks, reg, store, provisioner).mux()
 
 			_, challenge := generateTestPKCE(t)
 			w := httptest.NewRecorder()
@@ -703,8 +704,8 @@ func TestProvisionCompleteTracksFallback(t *testing.T) {
 		issuer:   "https://mock-idp",
 		identity: &UpstreamIdentity{Subject: "u1", Username: "alice", Issuer: "https://mock-idp"},
 	})
-	store := newSessionStore(10*time.Minute, 60*time.Second)
-	t.Cleanup(store.Stop)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
 	cfg := Config{
 		ExternalURL: "https://zdas.test",
 		Claims:      defaultClaimsConfig(),
@@ -721,7 +722,7 @@ func TestProvisionCompleteTracksFallback(t *testing.T) {
 	})
 
 	cb := httptest.NewRecorder()
-	h.Mux().ServeHTTP(cb, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+	h.mux().ServeHTTP(cb, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
 	pick, err := url.Parse(cb.Header().Get("Location"))
 	if err != nil || pick.Query().Get("pending_id") == "" {
 		t.Fatalf("callback: status = %d, Location = %q; want a picker redirect", cb.Code, cb.Header().Get("Location"))
@@ -736,7 +737,93 @@ func TestProvisionCompleteTracksFallback(t *testing.T) {
 	if w.Code != http.StatusFound {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
 	}
-	if n := h.reconciler.PendingCount(); n != 1 {
+	if n := h.reconciler.pendingCount(); n != 1 {
 		t.Errorf("PendingCount = %d, want 1", n)
+	}
+}
+
+// failCreateCode is a Store whose CreateCode always fails.
+type failCreateCode struct{ Store }
+
+func (failCreateCode) CreateCode(context.Context, string, *AuthCode) error {
+	return errors.New("database unavailable")
+}
+
+// TestProvisionCompleteFailuresRedirect verifies that once the pending
+// provision is consumed, a failure still sends the tunneler an error
+// redirect rather than leaving it waiting.
+func TestProvisionCompleteFailuresRedirect(t *testing.T) {
+	cases := []struct {
+		name   string
+		claims map[string]any
+		store  func(Store) Store
+	}{
+		{"mistyped claim", map[string]any{"sub": 123}, func(s Store) Store { return s }},
+		{"code store fails", map[string]any{"sub": "x"}, func(s Store) Store { return failCreateCode{s} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ks, _ := GenerateKeySet()
+			mem := newMemStore(10*time.Minute, time.Minute, storeSweepInterval)
+			t.Cleanup(mem.stop)
+			cfg := Config{
+				ExternalURL: "https://zdas.test",
+				Claims:      defaultClaimsConfig(),
+				Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
+				Session:     SessionConfig{Timeout: 10 * time.Minute, CodeExpiry: time.Minute},
+			}
+			h := newEndpoints(cfg, ks, nil, NewProviderRegistry(), tc.store(mem), nil, nil, nil, slog.Default())
+			pendingID := seedPendingProvision(t, h, &PendingProvision{
+				TunnelerRedirectURI: "http://localhost:20314/auth/callback",
+				TunnelerState:       "tstate",
+			})
+
+			w := completeProvision(h, pendingID, tc.claims, nil)
+			loc, err := url.Parse(w.Header().Get("Location"))
+			if err != nil || w.Code != http.StatusFound || loc.Query().Get("error") != "server_error" {
+				t.Fatalf("status = %d, Location = %q; want a server_error redirect", w.Code, w.Header().Get("Location"))
+			}
+			if loc.Query().Has("code") {
+				t.Error("code issued")
+			}
+		})
+	}
+}
+
+// TestCallbackDoesNotTrackFailedEnrollment verifies that a fallback
+// enrollment whose code could not be created is not queued for the
+// reconciler.
+func TestCallbackDoesNotTrackFailedEnrollment(t *testing.T) {
+	ks, _ := GenerateKeySet()
+	reg := NewProviderRegistry()
+	_ = reg.Register(&callbackProvider{
+		name:     "mock-idp",
+		issuer:   "https://mock-idp",
+		identity: &UpstreamIdentity{Subject: "u1", Username: "alice", Issuer: "https://mock-idp"},
+	})
+	mem := newMemStore(10*time.Minute, time.Minute, storeSweepInterval)
+	t.Cleanup(mem.stop)
+	cfg := Config{
+		ExternalURL: "https://zdas.test",
+		Claims:      defaultClaimsConfig(),
+		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
+		Session:     SessionConfig{Timeout: 10 * time.Minute, CodeExpiry: time.Minute},
+	}
+	h := newEndpoints(cfg, ks, nil, reg, failCreateCode{mem}, nil, testReconciler("https://ctrl", time.Hour), nil, slog.Default())
+	sessID := seedSession(t, h, &AuthSession{
+		TunnelerRedirectURI:  "http://localhost:20314/auth/callback",
+		TunnelerState:        "tstate",
+		DeviceInfo:           &DeviceInfo{},
+		FallbackNonce:        "0123456789abcdef",
+		UpstreamProviderName: "mock-idp",
+	})
+
+	w := httptest.NewRecorder()
+	h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+	if loc, _ := url.Parse(w.Header().Get("Location")); loc == nil || loc.Query().Get("error") != "server_error" {
+		t.Fatalf("status = %d, Location = %q; want a server_error redirect", w.Code, w.Header().Get("Location"))
+	}
+	if n := h.reconciler.pendingCount(); n != 0 {
+		t.Errorf("pendingCount = %d, want 0 for a failed enrollment", n)
 	}
 }

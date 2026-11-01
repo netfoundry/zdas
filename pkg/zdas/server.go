@@ -15,11 +15,16 @@ import (
 type Server struct {
 	cfg        Config
 	registry   *ProviderRegistry
-	store      *sessionStore // nil with WithStore; ZDAS stops only a store it created
+	store      *memStore // nil with WithStore; ZDAS stops only a store it created
 	discovery  *signerDiscovery
 	reconciler *fallbackReconciler // nil when fallback is disabled
 	handlers   *endpoints
 	logger     *slog.Logger
+
+	// runCtx scopes background work (discovery and reconciler polling) and
+	// the initial discovery poll; Shutdown cancels it.
+	runCtx    context.Context
+	cancelRun context.CancelFunc
 
 	mu       sync.Mutex
 	stopping bool         // Shutdown has been called
@@ -60,15 +65,15 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 
 	registry := NewProviderRegistry()
 	store := sopts.store
-	var memStore *sessionStore
+	var owned *memStore // the store ZDAS created, and so stops
 	if store == nil {
-		memStore = newSessionStore(cfg.Session.Timeout, cfg.Session.CodeExpiry)
-		store = sessionStoreAdapter{memStore}
-		// Stop the session store cleanup goroutine if NewServer fails
-		// partway through; on success the returned Server owns it.
+		owned = newMemStore(cfg.Session.Timeout, cfg.Session.CodeExpiry, storeSweepInterval)
+		store = owned
+		// Stop the store's sweep goroutine if NewServer fails partway
+		// through; on success the returned Server owns it.
 		defer func() {
 			if retErr != nil {
-				memStore.Stop()
+				owned.stop()
 			}
 		}()
 	}
@@ -127,8 +132,7 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 	if err != nil {
 		return nil, fmt.Errorf("create controller client: %w", err)
 	}
-	disc := newSignerDiscovery(cfg.Controller, ctrlClient, registry, configuredNames, logger)
-	disc.upstreamClient = sopts.upstream
+	disc := newSignerDiscovery(cfg.Controller, ctrlClient, sopts.upstream, registry, configuredNames, logger)
 
 	var reconciler *fallbackReconciler
 	if cfg.Fallback.Enabled && id != nil {
@@ -145,14 +149,17 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 
 	handlers := newEndpoints(cfg, keys, sopts.verifyKeys, registry, store, disc, reconciler, sopts.provisioner, logger)
 
+	runCtx, cancelRun := context.WithCancel(context.Background())
 	return &Server{
 		cfg:        cfg,
 		registry:   registry,
-		store:      memStore,
+		store:      owned,
 		discovery:  disc,
 		reconciler: reconciler,
 		handlers:   handlers,
 		logger:     logger,
+		runCtx:     runCtx,
+		cancelRun:  cancelRun,
 	}, nil
 }
 
@@ -166,9 +173,10 @@ type Handler struct {
 // Stop halts background goroutines started by NewHandler. Call this when the
 // embedding application is shutting down.
 func (h *Handler) Stop() {
-	h.srv.discovery.Stop()
+	h.srv.cancelRun()
+	h.srv.discovery.stop()
 	if h.srv.reconciler != nil {
-		h.srv.reconciler.Stop()
+		h.srv.reconciler.stop()
 	}
 	h.srv.stopStore()
 }
@@ -198,40 +206,47 @@ func NewHandler(cfg Config, logger *slog.Logger, opts ...Option) (*Handler, erro
 	if err != nil {
 		return nil, err
 	}
-	ctx := context.Background()
-	if err := srv.discovery.Start(ctx); err != nil {
+	if err := srv.discovery.start(srv.runCtx); err != nil {
+		srv.cancelRun()
 		srv.stopStore()
 		return nil, fmt.Errorf("start discovery: %w", err)
 	}
 	if srv.reconciler != nil {
-		srv.reconciler.Start(ctx)
+		srv.reconciler.start(srv.runCtx)
 	}
-	return &Handler{Handler: srv.handlers.Mux(), srv: srv}, nil
+	return &Handler{Handler: srv.handlers.mux(), srv: srv}, nil
 }
 
 // Start performs initial discovery and begins serving HTTP(S). It blocks until
 // the server stops, and returns nil when that is because Shutdown was called,
-// including before serving began. A ctx canceled during initial discovery
-// also makes it return nil without serving; the caller still calls Shutdown.
+// including before or during startup.
+//
+// ctx bounds startup only: canceling it during initial discovery stops the
+// server as Shutdown would, and Start returns nil without serving. Once
+// serving, background polling runs until Shutdown. Callers always call
+// Shutdown, including after Start returns an error.
 func (s *Server) Start(ctx context.Context) error {
-	if err := s.discovery.Start(ctx); err != nil {
-		if ctx.Err() != nil {
-			return nil
-		}
+	stopOnCancel := context.AfterFunc(ctx, s.cancelRun)
+	err := s.discovery.start(s.runCtx)
+	stopOnCancel()
+	if s.runCtx.Err() != nil {
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("start discovery: %w", err)
 	}
 	if s.reconciler != nil {
-		s.reconciler.Start(ctx)
+		s.reconciler.start(s.runCtx)
 	}
 
-	srv := newHTTPServer(s.cfg.Listen, s.handlers.Mux())
+	srv := newHTTPServer(s.cfg.Listen, s.handlers.mux())
 	s.mu.Lock()
 	if s.stopping {
 		s.mu.Unlock()
 		// Shutdown may have run before the background work above started.
-		s.discovery.Stop()
+		s.discovery.stop()
 		if s.reconciler != nil {
-			s.reconciler.Stop()
+			s.reconciler.stop()
 		}
 		return nil
 	}
@@ -245,7 +260,6 @@ func (s *Server) Start(ctx context.Context) error {
 		"providers", s.registry.Len(),
 	)
 
-	var err error
 	switch s.cfg.TLS.Mode {
 	case TLSModeNone:
 		err = srv.ListenAndServe()
@@ -262,25 +276,35 @@ func (s *Server) Start(ctx context.Context) error {
 	return err
 }
 
+// Timeouts for ZDAS's HTTP servers.
+const (
+	serverReadTimeout  = 15 * time.Second
+	serverWriteTimeout = 15 * time.Second
+	serverIdleTimeout  = 60 * time.Second
+)
+
 // newHTTPServer returns a server for addr with ZDAS's timeouts.
 func newHTTPServer(addr string, h http.Handler) *http.Server {
 	return &http.Server{
 		Addr:         addr,
 		Handler:      h,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  serverReadTimeout,
+		WriteTimeout: serverWriteTimeout,
+		IdleTimeout:  serverIdleTimeout,
 	}
 }
 
-// Shutdown gracefully shuts down the server: it stops accepting connections,
-// waits for in-flight requests until ctx is done, then stops background
-// work. It may be called more than once, and before or during Start.
+// Shutdown gracefully shuts down the server: it cancels background work,
+// including an initial discovery poll still running, stops accepting
+// connections, waits for in-flight requests until ctx is done, then waits
+// for the background work to stop. It may be called more than once, and
+// before or during Start.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	s.stopping = true
 	httpSrv, chalSrv := s.httpSrv, s.chalSrv
 	s.mu.Unlock()
+	s.cancelRun()
 
 	var errs []error
 	if chalSrv != nil {
@@ -289,9 +313,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if httpSrv != nil {
 		errs = append(errs, httpSrv.Shutdown(ctx))
 	}
-	s.discovery.Stop()
+	s.discovery.stop()
 	if s.reconciler != nil {
-		s.reconciler.Stop()
+		s.reconciler.stop()
 	}
 	s.stopStore()
 	return errors.Join(errs...)
@@ -301,6 +325,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // store. A Store passed to WithStore belongs to the caller and is left alone.
 func (s *Server) stopStore() {
 	if s.store != nil {
-		s.store.Stop()
+		s.store.stop()
 	}
 }

@@ -239,6 +239,11 @@ func (p *OIDCProvider) exchangeAndIdentify(ctx context.Context, code, redirectUR
 	if err := idToken.Claims(&claims); err != nil {
 		return nil, fmt.Errorf("extract claims from %s: %w", p.name, err)
 	}
+	if claims.Sub == "" {
+		// The external ID is derived from the subject, so every user
+		// without one would share a device identity.
+		return nil, fmt.Errorf("id_token from %s has no sub", p.name)
+	}
 
 	var raw map[string]any
 	if err := idToken.Claims(&raw); err != nil {

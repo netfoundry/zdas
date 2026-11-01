@@ -242,11 +242,28 @@ func TestGitHubProviderOrgCheckPaginates(t *testing.T) {
 	}
 }
 
+// TestGitHubProviderRejectsMissingSubject verifies that a user whose ID
+// field is missing, null or not a scalar is rejected, rather than sharing
+// one subject, and so one device identity, with every such user.
 func TestGitHubProviderRejectsMissingSubject(t *testing.T) {
-	server := mockGitHubServer(t, map[string]any{"login": "no-id"}, nil, nil)
-	p := newTestGitHubProvider(t, server, nil)
-	if _, err := p.ExchangeAndIdentify(context.Background(), "code", "https://zdas/callback"); err == nil {
-		t.Error("user without an id accepted")
+	cases := map[string]map[string]any{
+		"missing":    {"login": "no-id"},
+		"null":       {"login": "null-id", "id": nil},
+		"object":     {"login": "obj-id", "id": map[string]any{"v": 1}},
+		"empty":      {"login": "empty-id", "id": ""},
+		"null email": {"login": "private", "id": float64(1), "email": nil},
+	}
+	for name, user := range cases {
+		t.Run(name, func(t *testing.T) {
+			server := mockGitHubServer(t, user, nil, nil)
+			p := newTestGitHubProvider(t, server, nil)
+			if name == "null email" {
+				p.userIDField = "email"
+			}
+			if id, err := p.ExchangeAndIdentify(context.Background(), "code", "https://zdas/callback"); err == nil {
+				t.Errorf("accepted with subject %q", id.Subject)
+			}
+		})
 	}
 }
 
