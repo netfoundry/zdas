@@ -212,7 +212,7 @@ func TestRateLimiterEnabled(t *testing.T) {
 	ks, _ := GenerateKeySet()
 	reg := NewProviderRegistry()
 	_ = reg.Register(&stubProvider{name: "test-idp", issuer: "https://test-idp"})
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	t.Cleanup(store.Stop)
 
 	cfg := Config{
@@ -221,7 +221,7 @@ func TestRateLimiterEnabled(t *testing.T) {
 		Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 		RateLimit:   RateLimitConfig{AuthorizePerSecond: 1, AuthorizeBurst: 2},
 	}
-	h := NewHandlers(cfg, ks, reg, store, nil, nil, nil, slog.Default())
+	h := newTestEndpoints(cfg, ks, reg, store, nil)
 	mux := h.Mux()
 
 	_, challenge := generateTestPKCE(t)
@@ -267,7 +267,7 @@ func TestTrustedProxiesValidation(t *testing.T) {
 		Controller:  ControllerConfig{APIURL: "https://c"},
 		RateLimit:   RateLimitConfig{AuthorizePerSecond: 1, TrustedProxies: []string{"10.0.0.0/8", "proxy.internal"}},
 	}
-	cfg.applyDefaults()
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "trusted_proxies[1]") {
 		t.Errorf("Validate = %v, want an error for trusted_proxies[1]", err)
 	}

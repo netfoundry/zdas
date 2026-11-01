@@ -2,6 +2,7 @@ package zdas
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,11 +12,15 @@ import (
 	"time"
 )
 
+// outboundTimeout bounds each request ZDAS makes to the controller or an
+// upstream identity provider.
+const outboundTimeout = 15 * time.Second
+
 // httpClient is the shared HTTP client for requests to upstream identity
 // providers (OIDC discovery and keys, token exchanges, GitHub API calls,
 // etc.), with a timeout and a cap on response size.
 var httpClient = &http.Client{
-	Timeout:   15 * time.Second,
+	Timeout:   outboundTimeout,
 	Transport: limitedBodyTransport{base: http.DefaultTransport},
 }
 
@@ -40,6 +45,15 @@ type limitedBody struct {
 	io.Closer
 }
 
+// tlsClient returns a client with outboundTimeout whose transport is
+// http.DefaultTransport's, keeping its proxy settings, dial and handshake
+// timeouts and HTTP/2, with tlsCfg in place of its TLS config.
+func tlsClient(tlsCfg *tls.Config) *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.TLSClientConfig = tlsCfg
+	return &http.Client{Timeout: outboundTimeout, Transport: t}
+}
+
 // maxResponseBytes is the cap on outbound response body reads. Prevents a
 // compromised upstream or MITM from exhausting memory. 2 MB is generous for
 // any JSON API response ZDAS consumes.
@@ -60,16 +74,24 @@ type TokenError struct {
 }
 
 func (e *TokenError) Error() string {
-	return fmt.Sprintf("token endpoint returned %d: %s", e.StatusCode, e.Body)
+	return fmt.Sprintf("token endpoint returned %d: %s", e.StatusCode, truncateBody(e.Body))
+}
+
+// maxErrorBody is how much of an unexpected response body an error message
+// quotes, so that a large reply does not end up whole in the logs.
+const maxErrorBody = 512
+
+// truncateBody returns body for an error message, cut to maxErrorBody bytes.
+func truncateBody(body []byte) string {
+	if len(body) <= maxErrorBody {
+		return string(body)
+	}
+	return string(body[:maxErrorBody]) + "...(truncated)"
 }
 
 // oidcTokenExchange performs an OAuth2 token exchange POST with client and
-// returns the parsed JSON response body. It is a package-level function
-// variable so tests can replace the transport without starting real HTTP
-// servers.
-var oidcTokenExchange = defaultOIDCTokenExchange
-
-func defaultOIDCTokenExchange(ctx context.Context, client *http.Client, tokenURL string, params url.Values) (map[string]interface{}, error) {
+// returns the parsed JSON response body.
+func oidcTokenExchange(ctx context.Context, client *http.Client, tokenURL string, params url.Values) (map[string]any, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(params.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("build token request: %w", err)
@@ -91,7 +113,7 @@ func defaultOIDCTokenExchange(ctx context.Context, client *http.Client, tokenURL
 		return nil, &TokenError{StatusCode: resp.StatusCode, Body: body}
 	}
 
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("parse token response: %w", err)
 	}

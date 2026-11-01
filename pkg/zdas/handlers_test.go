@@ -3,6 +3,8 @@ package zdas
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +14,37 @@ import (
 	"time"
 )
 
-func setupHandlers(t *testing.T) (*Handlers, *stubProvider) {
+// newTestEndpoints returns endpoints over store, keyed as NewServer keys
+// them, with entries expiring by the store's TTLs.
+func newTestEndpoints(cfg Config, keys *KeySet, reg *ProviderRegistry, store *sessionStore, p EnrollmentProvisioner) *endpoints {
+	cfg.Session.Timeout, cfg.Session.CodeExpiry = store.sessionTTL, store.codeTTL
+	return newEndpoints(cfg, keys, nil, reg, sessionStoreAdapter{store}, nil, nil, p, slog.Default())
+}
+
+// seedSession stores sess as /authorize would, but without binding it to a
+// browser, so that a /callback without a cookie finds it. It returns the
+// session ID.
+func seedSession(t *testing.T, h *endpoints, sess *AuthSession) string {
+	t.Helper()
+	id, err := h.createSession(context.Background(), sess, "")
+	if err != nil {
+		t.Fatalf("createSession: %v", err)
+	}
+	return id
+}
+
+// seedPendingProvision stores pp as a provisioner redirect would, and
+// returns its pending ID.
+func seedPendingProvision(t *testing.T, h *endpoints, pp *PendingProvision) string {
+	t.Helper()
+	id, err := h.createPendingProvision(context.Background(), pp)
+	if err != nil {
+		t.Fatalf("createPendingProvision: %v", err)
+	}
+	return id
+}
+
+func setupHandlers(t *testing.T) (*endpoints, *stubProvider) {
 	t.Helper()
 	ks, err := GenerateKeySet()
 	if err != nil {
@@ -23,7 +55,7 @@ func setupHandlers(t *testing.T) (*Handlers, *stubProvider) {
 	if err := reg.Register(sp); err != nil {
 		t.Fatal(err)
 	}
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	t.Cleanup(store.Stop)
 
 	cfg := Config{
@@ -35,7 +67,7 @@ func setupHandlers(t *testing.T) (*Handlers, *stubProvider) {
 			Expiry:   5 * time.Minute,
 		},
 	}
-	h := NewHandlers(cfg, ks, reg, store, nil, nil, nil, slog.Default())
+	h := newTestEndpoints(cfg, ks, reg, store, nil)
 	return h, sp
 }
 
@@ -60,7 +92,7 @@ func TestHandleDiscovery(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}
-	var doc map[string]interface{}
+	var doc map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &doc); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -69,6 +101,18 @@ func TestHandleDiscovery(t *testing.T) {
 	}
 	if doc["jwks_uri"] != "https://zdas.example.com/.well-known/jwks.json" {
 		t.Errorf("jwks_uri = %v", doc["jwks_uri"])
+	}
+
+	// The advertised issuer is the one tokens carry, which may differ from
+	// the external URL.
+	h.cfg.Token.Issuer = "https://issuer.example.com"
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/.well-known/openid-configuration", nil))
+	if err := json.Unmarshal(w.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if doc["issuer"] != "https://issuer.example.com" {
+		t.Errorf("issuer = %v, want the token issuer", doc["issuer"])
 	}
 }
 
@@ -148,7 +192,7 @@ func TestHandleAuthorizeFallbackEnabled(t *testing.T) {
 	reg := NewProviderRegistry()
 	sp := &stubProvider{name: "test-idp", issuer: "https://test-idp"}
 	_ = reg.Register(sp)
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	t.Cleanup(store.Stop)
 
 	cfg := Config{
@@ -161,7 +205,7 @@ func TestHandleAuthorizeFallbackEnabled(t *testing.T) {
 			Expiry:   5 * time.Minute,
 		},
 	}
-	h := NewHandlers(cfg, ks, reg, store, nil, nil, nil, slog.Default())
+	h := newTestEndpoints(cfg, ks, reg, store, nil)
 	mux := h.Mux()
 
 	_, challenge := generateTestPKCE(t)
@@ -189,7 +233,7 @@ func TestHandleAuthorizeIDPSelector(t *testing.T) {
 	reg := NewProviderRegistry()
 	_ = reg.Register(&stubProvider{name: "keycloak", issuer: "https://kc"})
 	_ = reg.Register(&stubProvider{name: "github", issuer: "https://github.com"})
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	t.Cleanup(store.Stop)
 
 	cfg := Config{
@@ -197,7 +241,7 @@ func TestHandleAuthorizeIDPSelector(t *testing.T) {
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enrolltocert", Expiry: 5 * time.Minute},
 	}
-	h := NewHandlers(cfg, ks, reg, store, nil, nil, nil, slog.Default())
+	h := newTestEndpoints(cfg, ks, reg, store, nil)
 	mux := h.Mux()
 
 	_, challenge := generateTestPKCE(t)
@@ -237,7 +281,7 @@ func TestHandleAuthorizeIDPSelector(t *testing.T) {
 	}
 }
 
-// idpSelectorHandlers sets up Handlers with multiple providers and an
+// idpSelectorHandlers sets up endpoints with multiple providers and an
 // optional IDPSelectorURL. Returns the mux for sending requests.
 func idpSelectorHandlers(t *testing.T, selectorURL string) *http.ServeMux {
 	t.Helper()
@@ -245,7 +289,7 @@ func idpSelectorHandlers(t *testing.T, selectorURL string) *http.ServeMux {
 	reg := NewProviderRegistry()
 	_ = reg.Register(&stubProvider{name: "github", issuer: "https://github.com"})
 	_ = reg.Register(&stubProvider{name: "keycloak", issuer: "https://kc"})
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	t.Cleanup(store.Stop)
 
 	cfg := Config{
@@ -254,7 +298,7 @@ func idpSelectorHandlers(t *testing.T, selectorURL string) *http.ServeMux {
 		Claims:         defaultClaimsConfig(),
 		Token:          TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := NewHandlers(cfg, ks, reg, store, nil, nil, nil, slog.Default())
+	h := newTestEndpoints(cfg, ks, reg, store, nil)
 	return h.Mux()
 }
 
@@ -318,7 +362,7 @@ func TestIDPSelectorURLSingleProviderSkipsPicker(t *testing.T) {
 	ks, _ := GenerateKeySet()
 	reg := NewProviderRegistry()
 	_ = reg.Register(&stubProvider{name: "only-one", issuer: "https://only"})
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	t.Cleanup(store.Stop)
 
 	cfg := Config{
@@ -327,7 +371,7 @@ func TestIDPSelectorURLSingleProviderSkipsPicker(t *testing.T) {
 		Claims:         defaultClaimsConfig(),
 		Token:          TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := NewHandlers(cfg, ks, reg, store, nil, nil, nil, slog.Default())
+	h := newTestEndpoints(cfg, ks, reg, store, nil)
 	mux := h.Mux()
 
 	_, challenge := generateTestPKCE(t)
@@ -448,7 +492,7 @@ func TestTokenEndpointFullFlow(t *testing.T) {
 		Subject:  "user1",
 		Username: "alice",
 		Issuer:   "https://test-idp",
-		Raw:      map[string]interface{}{"preferred_username": "alice"},
+		Raw:      map[string]any{"preferred_username": "alice"},
 	}, &DeviceInfo{DeviceName: "macbook"}, "")
 
 	code, err := h.createCode(t.Context(), &AuthCode{
@@ -477,7 +521,7 @@ func TestTokenEndpointFullFlow(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
 	}
 
-	var resp map[string]interface{}
+	var resp map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -498,7 +542,7 @@ func TestTokenEndpointRejectsReplay(t *testing.T) {
 	verifier, challenge := generateTestPKCE(t)
 
 	code, _ := h.createCode(t.Context(), &AuthCode{
-		Claims:              map[string]interface{}{"sub": "x"},
+		Claims:              map[string]any{"sub": "x"},
 		RedirectURI:         "http://localhost:20314/auth/callback",
 		CodeChallenge:       challenge,
 		CodeChallengeMethod: "S256",
@@ -541,7 +585,7 @@ func TestTokenEndpointBadPKCE(t *testing.T) {
 	_, challenge := generateTestPKCE(t)
 
 	code, _ := h.createCode(t.Context(), &AuthCode{
-		Claims:              map[string]interface{}{"sub": "x"},
+		Claims:              map[string]any{"sub": "x"},
 		RedirectURI:         "http://localhost:20314/auth/callback",
 		CodeChallenge:       challenge,
 		CodeChallengeMethod: "S256",
@@ -587,6 +631,7 @@ type callbackProvider struct {
 	name     string
 	issuer   string
 	identity *UpstreamIdentity
+	err      error // returned by ExchangeAndIdentify when set
 }
 
 func (p *callbackProvider) Name() string   { return p.name }
@@ -595,6 +640,9 @@ func (p *callbackProvider) AuthorizeURL(state, redirectURI string) string {
 	return "https://idp/authorize?state=" + state
 }
 func (p *callbackProvider) ExchangeAndIdentify(_ context.Context, code, redirectURI string) (*UpstreamIdentity, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
 	return p.identity, nil
 }
 
@@ -608,11 +656,11 @@ func TestCallbackToTokenFullFlow(t *testing.T) {
 			Subject:  "u42",
 			Username: "jsmith",
 			Issuer:   "https://mock-idp",
-			Raw:      map[string]interface{}{"preferred_username": "jsmith"},
+			Raw:      map[string]any{"preferred_username": "jsmith"},
 		},
 	}
 	_ = reg.Register(cp)
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	t.Cleanup(store.Stop)
 
 	cfg := Config{
@@ -624,12 +672,12 @@ func TestCallbackToTokenFullFlow(t *testing.T) {
 			Expiry:   5 * time.Minute,
 		},
 	}
-	h := NewHandlers(cfg, ks, reg, store, nil, nil, nil, slog.Default())
+	h := newTestEndpoints(cfg, ks, reg, store, nil)
 	mux := h.Mux()
 
 	// Pre-create a session as if /authorize had run.
 	verifier, challenge := generateTestPKCE(t)
-	sessID, _ := store.CreateSession(&AuthSession{
+	sessID := seedSession(t, h, &AuthSession{
 		TunnelerRedirectURI:         "http://localhost:20314/auth/callback",
 		TunnelerState:               "tstate",
 		TunnelerCodeChallenge:       challenge,
@@ -674,9 +722,95 @@ func TestCallbackToTokenFullFlow(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("token status = %d, body = %s", w.Code, w.Body.String())
 	}
-	var resp map[string]interface{}
+	var resp map[string]any
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["access_token"] == nil || resp["access_token"] == "" {
 		t.Error("missing access_token")
+	}
+}
+
+// provisionerFunc adapts a function to EnrollmentProvisioner.
+type provisionerFunc func(context.Context, ProvisionRequest) (*ProvisionResult, error)
+
+func (f provisionerFunc) Provision(ctx context.Context, req ProvisionRequest) (*ProvisionResult, error) {
+	return f(ctx, req)
+}
+
+// TestCallbackErrorMapping verifies the error the tunneler gets for each way
+// /callback can fail after the session is found.
+func TestCallbackErrorMapping(t *testing.T) {
+	identity := &UpstreamIdentity{Subject: "u1", Username: "alice", Issuer: "https://mock-idp"}
+	cases := []struct {
+		name        string
+		query       string
+		err         error
+		provisioner EnrollmentProvisioner
+		wantError   string
+	}{
+		{"not permitted upstream", "code=c", fmt.Errorf("%w: not in org", ErrAccessDenied), nil, "access_denied"},
+		{"upstream failure", "code=c", errors.New("token endpoint down"), nil, "server_error"},
+		{"upstream access_denied", "error=access_denied", nil, nil, "access_denied"},
+		{"upstream login_required", "error=login_required", nil, nil, "login_required"},
+		{"upstream unknown error", "error=%3Cscript%3E", nil, nil, "server_error"},
+		{"no code", "", nil, nil, "server_error"},
+		{"provisioner returns nil", "code=c", nil, provisionerFunc(func(context.Context, ProvisionRequest) (*ProvisionResult, error) {
+			return nil, nil
+		}), "server_error"},
+		{"provisioner returns nothing", "code=c", nil, provisionerFunc(func(context.Context, ProvisionRequest) (*ProvisionResult, error) {
+			return &ProvisionResult{}, nil
+		}), "server_error"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ks, _ := GenerateKeySet()
+			reg := NewProviderRegistry()
+			_ = reg.Register(&callbackProvider{name: "mock-idp", issuer: "https://mock-idp", identity: identity, err: tc.err})
+			store := newSessionStore(10*time.Minute, time.Minute)
+			t.Cleanup(store.Stop)
+			cfg := Config{
+				ExternalURL: "https://zdas.test",
+				Claims:      defaultClaimsConfig(),
+				Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
+			}
+			h := newTestEndpoints(cfg, ks, reg, store, tc.provisioner)
+			sessID := seedSession(t, h, &AuthSession{
+				TunnelerRedirectURI:  "http://localhost:20314/auth/callback",
+				TunnelerState:        "tstate",
+				DeviceInfo:           &DeviceInfo{DeviceName: "laptop"},
+				UpstreamProviderName: "mock-idp",
+			})
+
+			target := "/callback?state=" + sessID
+			if tc.query != "" {
+				target += "&" + tc.query
+			}
+			w := httptest.NewRecorder()
+			h.Mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
+			loc, err := url.Parse(w.Header().Get("Location"))
+			if err != nil || w.Code != http.StatusFound {
+				t.Fatalf("status = %d, Location = %q", w.Code, w.Header().Get("Location"))
+			}
+			if got := loc.Query().Get("error"); got != tc.wantError {
+				t.Errorf("error = %q, want %q", got, tc.wantError)
+			}
+			if loc.Query().Has("code") {
+				t.Error("code issued on a failed callback")
+			}
+		})
+	}
+}
+
+// TestRedirectKeepsExistingQuery verifies that a code is appended to a
+// redirect URI that already has a query, rather than starting a second one.
+func TestRedirectKeepsExistingQuery(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"http://localhost:1/cb", "http://localhost:1/cb?code=c"},
+		{"http://localhost:1/cb?x=1", "http://localhost:1/cb?x=1&code=c"},
+		{"http://localhost:1/cb?x=1#frag", "http://localhost:1/cb?x=1&code=c#frag"},
+	}
+	for _, tc := range cases {
+		if got := withQuery(tc.in, url.Values{"code": {"c"}}); got != tc.want {
+			t.Errorf("withQuery(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

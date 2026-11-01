@@ -2,6 +2,7 @@ package zdas
 
 import (
 	"errors"
+	"log/slog"
 	"net"
 	"net/url"
 	"strings"
@@ -27,17 +28,37 @@ func parseRedirectURI(raw string) (*url.URL, error) {
 	return u, nil
 }
 
+// parseAllowList parses AllowedRedirectURIs. It returns nil for an empty
+// list, which keeps the loopback default, and otherwise a non-nil slice of
+// the entries that parse, so that a list whose entries are all invalid
+// allows nothing rather than falling back to the default. Invalid entries
+// are logged; Config.Validate rejects them for configs that go through it.
+func parseAllowList(raw []string, logger *slog.Logger) []*url.URL {
+	if len(raw) == 0 {
+		return nil
+	}
+	entries := make([]*url.URL, 0, len(raw))
+	for _, r := range raw {
+		u, err := parseRedirectURI(r)
+		if err != nil {
+			logger.Error("ignoring invalid allowed_redirect_uris entry", "entry", r, "error", err)
+			continue
+		}
+		entries = append(entries, u)
+	}
+	return entries
+}
+
 // redirectAllowed reports whether a code may be sent to u, which must come
-// from parseRedirectURI. With no allow list, only loopback callbacks are
-// accepted (RFC 8252 section 7.3), which is all a tunneler sends. Entries
-// that fail to parse never match; Config.Validate rejects them at startup.
-func redirectAllowed(u *url.URL, allowList []string) bool {
-	if len(allowList) == 0 {
+// from parseRedirectURI, under allowList from parseAllowList. With a nil
+// list, only loopback callbacks are accepted (RFC 8252 section 7.3), which
+// is all a tunneler sends.
+func redirectAllowed(u *url.URL, allowList []*url.URL) bool {
+	if allowList == nil {
 		return isLoopbackHost(u.Hostname())
 	}
-	for _, raw := range allowList {
-		entry, err := parseRedirectURI(raw)
-		if err == nil && redirectMatches(u, entry) {
+	for _, entry := range allowList {
+		if redirectMatches(u, entry) {
 			return true
 		}
 	}
@@ -79,4 +100,19 @@ func isLoopbackHost(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// withQuery returns rawURL with v added to its query string, after any query
+// it already has and before any fragment.
+func withQuery(rawURL string, v url.Values) string {
+	base, fragment, hasFragment := strings.Cut(rawURL, "#")
+	sep := "?"
+	if strings.Contains(base, "?") {
+		sep = "&"
+	}
+	out := base + sep + v.Encode()
+	if hasFragment {
+		out += "#" + fragment
+	}
+	return out
 }

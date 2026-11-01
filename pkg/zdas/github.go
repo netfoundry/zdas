@@ -3,6 +3,7 @@ package zdas
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -15,7 +16,11 @@ const (
 	gitHubAuthURL  = "https://github.com/login/oauth/authorize"
 	gitHubTokenURL = "https://github.com/login/oauth/access_token"
 	gitHubUserURL  = "https://api.github.com/user"
-	gitHubOrgsURL  = "https://api.github.com/user/orgs"
+
+	// gitHubOrgsPageSize is the most organizations GitHub returns per page,
+	// and maxGitHubOrgPages bounds how many pages checkOrgs reads.
+	gitHubOrgsPageSize = 100
+	maxGitHubOrgPages  = 10
 )
 
 // GitHubProvider is an UpstreamProvider for GitHub's OAuth 2.0 flow. GitHub
@@ -33,7 +38,7 @@ type GitHubProvider struct {
 	// Overridable for tests.
 	authBaseURL  string
 	tokenBaseURL string
-	apiBaseURL   string
+	userURL      string // the /user API; /orgs and /emails live under it
 }
 
 // NewGitHubProvider creates a GitHubProvider from the given config.
@@ -48,23 +53,29 @@ func NewGitHubProvider(cfg ProviderConfig) *GitHubProvider {
 		client:        httpClient,
 		authBaseURL:   gitHubAuthURL,
 		tokenBaseURL:  gitHubTokenURL,
-		apiBaseURL:    gitHubUserURL,
+		userURL:       gitHubUserURL,
 	}
 }
 
-func (p *GitHubProvider) Name() string   { return p.name }
+// Name returns the provider's name.
+func (p *GitHubProvider) Name() string { return p.name }
+
+// Issuer returns "https://github.com".
 func (p *GitHubProvider) Issuer() string { return gitHubIssuer }
 
+// AuthorizeURL builds GitHub's OAuth authorization URL.
 func (p *GitHubProvider) AuthorizeURL(state, redirectURI string) string {
-	v := url.Values{
+	return withQuery(p.authBaseURL, url.Values{
 		"client_id":    {p.clientID},
 		"redirect_uri": {redirectURI},
 		"state":        {state},
 		"scope":        {"read:user user:email read:org"},
-	}
-	return p.authBaseURL + "?" + v.Encode()
+	})
 }
 
+// ExchangeAndIdentify exchanges the code for an access token and reads the
+// user from GitHub's API. With AllowedOrgs set, a user in none of them gets
+// an error wrapping ErrAccessDenied.
 func (p *GitHubProvider) ExchangeAndIdentify(ctx context.Context, code, redirectURI string) (*UpstreamIdentity, error) {
 	accessToken, err := p.exchangeCode(ctx, code, redirectURI)
 	if err != nil {
@@ -81,6 +92,10 @@ func (p *GitHubProvider) ExchangeAndIdentify(ctx context.Context, code, redirect
 	}
 
 	subject := extractField(user, p.userIDField)
+	if subject == "" {
+		// Every user would otherwise share one external ID per device name.
+		return nil, fmt.Errorf("github user has no %q field to use as subject", p.userIDField)
+	}
 	username := extractField(user, p.usernameField)
 
 	// Always fetch /user/emails and use the primary verified address. The
@@ -121,10 +136,10 @@ func (p *GitHubProvider) exchangeCode(ctx context.Context, code, redirectURI str
 		return "", fmt.Errorf("read github token response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("github token endpoint returned %d: %s", resp.StatusCode, body)
+		return "", fmt.Errorf("github token endpoint returned %d: %s", resp.StatusCode, truncateBody(body))
 	}
 
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.Unmarshal(body, &result); err != nil {
 		return "", fmt.Errorf("parse github token response: %w", err)
 	}
@@ -134,105 +149,58 @@ func (p *GitHubProvider) exchangeCode(ctx context.Context, code, redirectURI str
 	}
 	token, ok := result["access_token"].(string)
 	if !ok || token == "" {
-		return "", fmt.Errorf("no access_token in github response")
+		return "", errors.New("no access_token in github response")
 	}
 	return token, nil
 }
 
-func (p *GitHubProvider) fetchUser(ctx context.Context, accessToken string) (map[string]interface{}, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.apiBaseURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build github user request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("github user request: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err := readResponseBody(resp)
-	if err != nil {
-		return nil, fmt.Errorf("read github user response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("github user api returned %d: %s", resp.StatusCode, body)
-	}
-
-	var user map[string]interface{}
-	if err := json.Unmarshal(body, &user); err != nil {
-		return nil, fmt.Errorf("parse github user response: %w", err)
+func (p *GitHubProvider) fetchUser(ctx context.Context, accessToken string) (map[string]any, error) {
+	var user map[string]any
+	if err := p.getJSON(ctx, p.userURL, accessToken, &user); err != nil {
+		return nil, fmt.Errorf("github user api: %w", err)
 	}
 	return user, nil
 }
 
+// checkOrgs returns nil if the user belongs to one of AllowedOrgs, reading
+// up to maxGitHubOrgPages pages of the user's organizations.
 func (p *GitHubProvider) checkOrgs(ctx context.Context, accessToken string) error {
-	orgsURL := strings.TrimSuffix(p.apiBaseURL, "/") + "/orgs"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, orgsURL, nil)
-	if err != nil {
-		return fmt.Errorf("build github orgs request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("github orgs request: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err := readResponseBody(resp)
-	if err != nil {
-		return fmt.Errorf("read github orgs response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("github orgs api returned %d: %s", resp.StatusCode, body)
-	}
-
-	var orgs []map[string]interface{}
-	if err := json.Unmarshal(body, &orgs); err != nil {
-		return fmt.Errorf("parse github orgs response: %w", err)
-	}
-
 	allowed := make(map[string]struct{}, len(p.allowedOrgs))
 	for _, o := range p.allowedOrgs {
 		allowed[o] = struct{}{}
 	}
-	for _, org := range orgs {
-		login, _ := org["login"].(string)
-		if _, ok := allowed[login]; ok {
-			return nil
+	for page := 1; page <= maxGitHubOrgPages; page++ {
+		orgsURL := withQuery(strings.TrimSuffix(p.userURL, "/")+"/orgs", url.Values{
+			"per_page": {strconv.Itoa(gitHubOrgsPageSize)},
+			"page":     {strconv.Itoa(page)},
+		})
+		var orgs []struct {
+			Login string `json:"login"`
+		}
+		if err := p.getJSON(ctx, orgsURL, accessToken, &orgs); err != nil {
+			return fmt.Errorf("github orgs api: %w", err)
+		}
+		for _, org := range orgs {
+			if _, ok := allowed[org.Login]; ok {
+				return nil
+			}
+		}
+		if len(orgs) < gitHubOrgsPageSize {
+			break
 		}
 	}
-	return fmt.Errorf("user not in allowed organization")
+	return fmt.Errorf("%w: user is not in an allowed GitHub organization", ErrAccessDenied)
 }
 
 // fetchPrimaryEmail fetches the user's primary verified email from the GitHub
 // /user/emails endpoint. Returns empty string on any failure (best-effort).
 func (p *GitHubProvider) fetchPrimaryEmail(ctx context.Context, accessToken string) string {
-	emailsURL := strings.TrimSuffix(p.apiBaseURL, "/") + "/emails"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, emailsURL, nil)
-	if err != nil {
-		return ""
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return ""
-	}
-
 	var emails []struct {
 		Email    string `json:"email"`
 		Primary  bool   `json:"primary"`
 		Verified bool   `json:"verified"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&emails); err != nil {
+	if err := p.getJSON(ctx, strings.TrimSuffix(p.userURL, "/")+"/emails", accessToken, &emails); err != nil {
 		return ""
 	}
 	for _, e := range emails {
@@ -243,9 +211,37 @@ func (p *GitHubProvider) fetchPrimaryEmail(ctx context.Context, accessToken stri
 	return ""
 }
 
+// getJSON GETs apiURL from GitHub's API with accessToken and decodes the
+// JSON response into out.
+func (p *GitHubProvider) getJSON(ctx context.Context, apiURL, accessToken string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := readResponseBody(resp)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("returned %d: %s", resp.StatusCode, truncateBody(body))
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+	return nil
+}
+
 // extractField extracts a string value from a JSON-decoded map. Numeric values
 // (like GitHub's user ID) are converted to string.
-func extractField(data map[string]interface{}, field string) string {
+func extractField(data map[string]any, field string) string {
 	v, ok := data[field]
 	if !ok {
 		return ""

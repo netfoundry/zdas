@@ -43,8 +43,6 @@ import (
 // instead. ZDAS imposes no cap on a Store, and every /authorize request
 // creates an entry, so bound /authorize with Config.RateLimit or in front of
 // ZDAS.
-//
-// AuthCode.Used is an in-memory detail and not part of this contract.
 type Store interface {
 	CreateSession(ctx context.Context, key string, s *AuthSession) error
 	ConsumeSession(ctx context.Context, key string) (*AuthSession, error)
@@ -67,10 +65,10 @@ const (
 // with their own clocks, so small skew is expected.
 const maxClockSkew = time.Minute
 
-// sessionStoreAdapter exposes a SessionStore as a Store. The in-memory store
+// sessionStoreAdapter exposes a sessionStore as a Store. The in-memory store
 // cannot fail on consume, so every consume error is nil.
 type sessionStoreAdapter struct {
-	s *SessionStore
+	s *sessionStore
 }
 
 func (a sessionStoreAdapter) CreateSession(_ context.Context, key string, sess *AuthSession) error {
@@ -79,7 +77,7 @@ func (a sessionStoreAdapter) CreateSession(_ context.Context, key string, sess *
 }
 
 func (a sessionStoreAdapter) ConsumeSession(_ context.Context, key string) (*AuthSession, error) {
-	return a.s.GetSession(key), nil
+	return a.s.consumeSession(key), nil
 }
 
 func (a sessionStoreAdapter) CreateCode(_ context.Context, key string, ac *AuthCode) error {
@@ -87,7 +85,7 @@ func (a sessionStoreAdapter) CreateCode(_ context.Context, key string, ac *AuthC
 }
 
 func (a sessionStoreAdapter) ConsumeCode(_ context.Context, key string) (*AuthCode, error) {
-	return a.s.ConsumeCode(key), nil
+	return a.s.consumeCode(key), nil
 }
 
 func (a sessionStoreAdapter) CreatePendingProvision(_ context.Context, key string, pp *PendingProvision) error {
@@ -95,7 +93,7 @@ func (a sessionStoreAdapter) CreatePendingProvision(_ context.Context, key strin
 }
 
 func (a sessionStoreAdapter) ConsumePendingProvision(_ context.Context, key string) (*PendingProvision, error) {
-	return a.s.ConsumePendingProvision(key), nil
+	return a.s.consumePendingProvision(key), nil
 }
 
 // hashStoreKey derives the key an entry with the given kind and ID is stored

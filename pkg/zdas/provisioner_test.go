@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -16,7 +15,7 @@ import (
 
 // immediateProvisioner returns claims directly (no interactive redirect).
 type immediateProvisioner struct {
-	claims map[string]interface{}
+	claims map[string]any
 }
 
 func (p *immediateProvisioner) Provision(_ context.Context, req ProvisionRequest) (*ProvisionResult, error) {
@@ -53,15 +52,15 @@ func TestProvisionerImmediateClaims(t *testing.T) {
 			Email:    "alice@example.com",
 			Username: "alice",
 			Issuer:   "https://mock-idp",
-			Raw:      map[string]interface{}{"preferred_username": "alice"},
+			Raw:      map[string]any{"preferred_username": "alice"},
 		},
 	}
 	_ = reg.Register(cp)
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	t.Cleanup(store.Stop)
 
 	provisioner := &immediateProvisioner{
-		claims: map[string]interface{}{
+		claims: map[string]any{
 			"device_identity_name": "custom-name",
 			"device_external_id":   "custom-ext-id",
 			"sub":                  "custom-ext-id",
@@ -73,12 +72,12 @@ func TestProvisionerImmediateClaims(t *testing.T) {
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := NewHandlers(cfg, ks, reg, store, nil, nil, provisioner, slog.Default())
+	h := newTestEndpoints(cfg, ks, reg, store, provisioner)
 	mux := h.Mux()
 
 	// Create a session as if /authorize ran.
 	verifier, challenge := generateTestPKCE(t)
-	sessID, _ := store.CreateSession(&AuthSession{
+	sessID := seedSession(t, h, &AuthSession{
 		TunnelerRedirectURI:         "http://localhost:20314/auth/callback",
 		TunnelerState:               "tstate",
 		TunnelerCodeChallenge:       challenge,
@@ -116,7 +115,7 @@ func TestProvisionerImmediateClaims(t *testing.T) {
 	}
 
 	// Verify the token contains the provisioner's custom claims.
-	var resp map[string]interface{}
+	var resp map[string]any
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["access_token"] == nil {
 		t.Fatal("missing access_token")
@@ -133,11 +132,11 @@ func TestProvisionerInteractiveRedirect(t *testing.T) {
 			Subject:  "u1",
 			Username: "alice",
 			Issuer:   "https://mock-idp",
-			Raw:      map[string]interface{}{},
+			Raw:      map[string]any{},
 		},
 	}
 	_ = reg.Register(cp)
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	t.Cleanup(store.Stop)
 
 	provisioner := &interactiveProvisioner{
@@ -149,11 +148,11 @@ func TestProvisionerInteractiveRedirect(t *testing.T) {
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := NewHandlers(cfg, ks, reg, store, nil, nil, provisioner, slog.Default())
+	h := newTestEndpoints(cfg, ks, reg, store, provisioner)
 	mux := h.Mux()
 
 	verifier, challenge := generateTestPKCE(t)
-	sessID, _ := store.CreateSession(&AuthSession{
+	sessID := seedSession(t, h, &AuthSession{
 		TunnelerRedirectURI:         "http://localhost:20314/auth/callback",
 		TunnelerState:               "tstate",
 		TunnelerCodeChallenge:       challenge,
@@ -178,7 +177,7 @@ func TestProvisionerInteractiveRedirect(t *testing.T) {
 	}
 
 	// The picker page's handler completes provisioning.
-	claims := map[string]interface{}{
+	claims := map[string]any{
 		"device_identity_name": "alice-laptop",
 		"device_external_id":   "ext-from-picker",
 		"sub":                  "ext-from-picker",
@@ -227,11 +226,11 @@ func runProvisionerCallback(t *testing.T, p EnrollmentProvisioner) *httptest.Res
 			Email:    "alice@example.com",
 			Username: "alice",
 			Issuer:   "https://mock-idp",
-			Raw:      map[string]interface{}{},
+			Raw:      map[string]any{},
 		},
 	}
 	_ = reg.Register(cp)
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	t.Cleanup(store.Stop)
 
 	cfg := Config{
@@ -239,11 +238,11 @@ func runProvisionerCallback(t *testing.T, p EnrollmentProvisioner) *httptest.Res
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := NewHandlers(cfg, ks, reg, store, nil, nil, p, slog.Default())
+	h := newTestEndpoints(cfg, ks, reg, store, p)
 	mux := h.Mux()
 
 	_, challenge := generateTestPKCE(t)
-	sessID, _ := store.CreateSession(&AuthSession{
+	sessID := seedSession(t, h, &AuthSession{
 		TunnelerRedirectURI:         "http://localhost:20314/auth/callback",
 		TunnelerState:               "tstate",
 		TunnelerCodeChallenge:       challenge,
@@ -374,17 +373,16 @@ func TestProvisionerInvalidErrorCodeFallsBack(t *testing.T) {
 	}
 }
 
-// setupProvisionComplete creates a Handlers with a pre-loaded pending provision
-// and returns the handlers, the pending_id, and the store (so tests can verify
-// consumption).
-func setupProvisionComplete(t *testing.T) (h *Handlers, pendingID string, store *SessionStore) {
+// setupProvisionComplete returns endpoints with a pending provision stored,
+// and its pending ID.
+func setupProvisionComplete(t *testing.T) (h *endpoints, pendingID string) {
 	t.Helper()
 	ks, err := GenerateKeySet()
 	if err != nil {
 		t.Fatalf("GenerateKeySet: %v", err)
 	}
 	reg := NewProviderRegistry()
-	store = NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	t.Cleanup(store.Stop)
 
 	cfg := Config{
@@ -392,25 +390,29 @@ func setupProvisionComplete(t *testing.T) (h *Handlers, pendingID string, store 
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h = NewHandlers(cfg, ks, reg, store, nil, nil, nil, slog.Default())
+	h = newTestEndpoints(cfg, ks, reg, store, nil)
 
-	pendingID, err = store.CreatePendingProvision(&PendingProvision{
+	pendingID = seedPendingProvision(t, h, &PendingProvision{
 		TunnelerRedirectURI:         "http://localhost:20314/auth/callback",
 		TunnelerState:               "tstate",
 		TunnelerCodeChallenge:       "challenge",
 		TunnelerCodeChallengeMethod: "S256",
 	})
-	if err != nil {
-		t.Fatalf("CreatePendingProvision: %v", err)
-	}
-	return h, pendingID, store
+	return h, pendingID
+}
+
+// consumePending consumes the pending provision id, or returns nil if there
+// is none.
+func consumePending(h *endpoints, id string) *PendingProvision {
+	pp, _ := h.consumePendingProvision(context.Background(), id)
+	return pp
 }
 
 // completeProvision calls CompleteProvision as an embedder's picker handler
 // would, and returns the recorded response.
-func completeProvision(h *Handlers, pendingID string, claims map[string]any, err error) *httptest.ResponseRecorder {
+func completeProvision(h *endpoints, pendingID string, claims map[string]any, err error) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
-	h.CompleteProvision(w, httptest.NewRequest(http.MethodPost, "/pick-network", nil), pendingID, claims, err)
+	h.completeProvision(w, httptest.NewRequest(http.MethodPost, "/pick-network", nil), pendingID, claims, err)
 	return w
 }
 
@@ -419,7 +421,7 @@ func completeProvision(h *Handlers, pendingID string, claims map[string]any, err
 // public route that took claims from the request would let that user enroll
 // as any identity.
 func TestProvisionCompleteRouteRemoved(t *testing.T) {
-	h, pendingID, store := setupProvisionComplete(t)
+	h, pendingID := setupProvisionComplete(t)
 	body := `{"pending_id":"` + pendingID + `","claims":{"sub":"victim","device_external_id":"victim"}}`
 	req := httptest.NewRequest(http.MethodPost, "/provision/complete", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -429,7 +431,7 @@ func TestProvisionCompleteRouteRemoved(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", w.Code)
 	}
-	if pp := store.ConsumePendingProvision(pendingID); pp == nil {
+	if pp := consumePending(h, pendingID); pp == nil {
 		t.Error("pending provision was consumed by a request from the browser")
 	}
 }
@@ -447,7 +449,7 @@ func TestProvisionCompleteErrorPath(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h, pendingID, _ := setupProvisionComplete(t)
+			h, pendingID := setupProvisionComplete(t)
 			w := completeProvision(h, pendingID, nil, &ProvisionError{Code: tc.code, Description: tc.desc})
 
 			if w.Code != http.StatusFound {
@@ -480,7 +482,7 @@ func TestProvisionCompleteInvalidErrorFallsBack(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h, pendingID, _ := setupProvisionComplete(t)
+			h, pendingID := setupProvisionComplete(t)
 			w := completeProvision(h, pendingID, nil, tc.err)
 
 			loc, _ := url.Parse(w.Header().Get("Location"))
@@ -501,11 +503,11 @@ func TestProvisionCompleteInvalidErrorFallsBack(t *testing.T) {
 }
 
 func TestProvisionCompleteErrorPathConsumesPending(t *testing.T) {
-	h, pendingID, store := setupProvisionComplete(t)
+	h, pendingID := setupProvisionComplete(t)
 	denied := &ProvisionError{Code: "access_denied", Description: "no"}
 	completeProvision(h, pendingID, nil, denied)
 
-	if pp := store.ConsumePendingProvision(pendingID); pp != nil {
+	if pp := consumePending(h, pendingID); pp != nil {
 		t.Error("pending provision was not consumed")
 	}
 	w := completeProvision(h, pendingID, nil, denied)
@@ -515,7 +517,7 @@ func TestProvisionCompleteErrorPathConsumesPending(t *testing.T) {
 }
 
 func TestProvisionCompleteErrorTakesPrecedence(t *testing.T) {
-	h, pendingID, _ := setupProvisionComplete(t)
+	h, pendingID := setupProvisionComplete(t)
 	w := completeProvision(h, pendingID,
 		map[string]any{"device_external_id": "x"},
 		&ProvisionError{Code: "access_denied", Description: "denied"})
@@ -531,7 +533,7 @@ func TestProvisionCompleteErrorTakesPrecedence(t *testing.T) {
 }
 
 func TestProvisionCompleteErrorDescriptionSanitized(t *testing.T) {
-	h, pendingID, _ := setupProvisionComplete(t)
+	h, pendingID := setupProvisionComplete(t)
 	// Include a double-quote and backslash, both disallowed by RFC 6749
 	// 4.1.2.1, plus newline/tab control chars. None should survive.
 	w := completeProvision(h, pendingID, nil, &ProvisionError{
@@ -553,7 +555,7 @@ func TestProvisionCompleteErrorDescriptionSanitized(t *testing.T) {
 // capturingProvisioner records the ProvisionRequest it receives.
 type capturingProvisioner struct {
 	captured ProvisionRequest
-	claims   map[string]interface{}
+	claims   map[string]any
 }
 
 func (p *capturingProvisioner) Provision(_ context.Context, req ProvisionRequest) (*ProvisionResult, error) {
@@ -572,15 +574,15 @@ func TestProvisionerReceivesEnrollmentMethod(t *testing.T) {
 			Email:    "alice@example.com",
 			Username: "alice",
 			Issuer:   "https://mock-idp",
-			Raw:      map[string]interface{}{"preferred_username": "alice"},
+			Raw:      map[string]any{"preferred_username": "alice"},
 		},
 	}
 	_ = reg.Register(cp)
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	t.Cleanup(store.Stop)
 
 	provisioner := &capturingProvisioner{
-		claims: map[string]interface{}{
+		claims: map[string]any{
 			"device_identity_name": "alice-laptop",
 			"device_external_id":   "ext-id",
 			"sub":                  "ext-id",
@@ -592,11 +594,11 @@ func TestProvisionerReceivesEnrollmentMethod(t *testing.T) {
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := NewHandlers(cfg, ks, reg, store, nil, nil, provisioner, slog.Default())
+	h := newTestEndpoints(cfg, ks, reg, store, provisioner)
 	mux := h.Mux()
 
 	_, challenge := generateTestPKCE(t)
-	sessID, _ := store.CreateSession(&AuthSession{
+	sessID := seedSession(t, h, &AuthSession{
 		TunnelerRedirectURI:         "http://localhost:20314/auth/callback",
 		TunnelerState:               "tstate",
 		TunnelerCodeChallenge:       challenge,
@@ -618,7 +620,7 @@ func TestProvisionerReceivesEnrollmentMethod(t *testing.T) {
 }
 
 func TestProvisionCompleteExpired(t *testing.T) {
-	h, _, _ := setupProvisionComplete(t)
+	h, _ := setupProvisionComplete(t)
 	w := completeProvision(h, "bogus", map[string]any{"sub": "x"}, nil)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", w.Code)
@@ -645,14 +647,14 @@ func TestProvisionerReceivesClientType(t *testing.T) {
 					Subject:  "u1",
 					Username: "alice",
 					Issuer:   "https://mock-idp",
-					Raw:      map[string]interface{}{},
+					Raw:      map[string]any{},
 				},
 			})
-			store := NewSessionStore(10*time.Minute, 60*time.Second)
+			store := newSessionStore(10*time.Minute, 60*time.Second)
 			t.Cleanup(store.Stop)
 
 			provisioner := &capturingProvisioner{
-				claims: map[string]interface{}{
+				claims: map[string]any{
 					"device_identity_name": "alice-host",
 					"device_external_id":   "ext-id",
 					"sub":                  "ext-id",
@@ -663,7 +665,7 @@ func TestProvisionerReceivesClientType(t *testing.T) {
 				Claims:      defaultClaimsConfig(),
 				Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 			}
-			mux := NewHandlers(cfg, ks, reg, store, nil, nil, provisioner, slog.Default()).Mux()
+			mux := newTestEndpoints(cfg, ks, reg, store, provisioner).Mux()
 
 			_, challenge := generateTestPKCE(t)
 			w := httptest.NewRecorder()
@@ -687,5 +689,54 @@ func TestProvisionerReceivesClientType(t *testing.T) {
 				t.Errorf("ClientType = %q, want %q", provisioner.captured.ClientType, tc.want)
 			}
 		})
+	}
+}
+
+// TestProvisionCompleteTracksFallback verifies that a fallback enrollment
+// that goes through a provisioner page is queued for the reconciler when the
+// page finishes it, as one finished at /callback is.
+func TestProvisionCompleteTracksFallback(t *testing.T) {
+	ks, _ := GenerateKeySet()
+	reg := NewProviderRegistry()
+	_ = reg.Register(&callbackProvider{
+		name:     "mock-idp",
+		issuer:   "https://mock-idp",
+		identity: &UpstreamIdentity{Subject: "u1", Username: "alice", Issuer: "https://mock-idp"},
+	})
+	store := newSessionStore(10*time.Minute, 60*time.Second)
+	t.Cleanup(store.Stop)
+	cfg := Config{
+		ExternalURL: "https://zdas.test",
+		Claims:      defaultClaimsConfig(),
+		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
+	}
+	h := newTestEndpoints(cfg, ks, reg, store, &interactiveProvisioner{redirectURL: "https://embedder.example.com/pick"})
+	h.reconciler = testReconciler("https://ctrl", time.Hour)
+	sessID := seedSession(t, h, &AuthSession{
+		TunnelerRedirectURI:  "http://localhost:20314/auth/callback",
+		TunnelerState:        "tstate",
+		DeviceInfo:           &DeviceInfo{},
+		FallbackNonce:        "0123456789abcdef",
+		UpstreamProviderName: "mock-idp",
+	})
+
+	cb := httptest.NewRecorder()
+	h.Mux().ServeHTTP(cb, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+	pick, err := url.Parse(cb.Header().Get("Location"))
+	if err != nil || pick.Query().Get("pending_id") == "" {
+		t.Fatalf("callback: status = %d, Location = %q; want a picker redirect", cb.Code, cb.Header().Get("Location"))
+	}
+
+	w := completeProvision(h, pick.Query().Get("pending_id"), map[string]any{
+		"sub":                  "0a1b2c",
+		"device_external_id":   "0a1b2c",
+		"device_identity_name": "alice-pending-0123",
+		"preferred_username":   "alice",
+	}, nil)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if n := h.reconciler.PendingCount(); n != 1 {
+		t.Errorf("PendingCount = %d, want 1", n)
 	}
 }

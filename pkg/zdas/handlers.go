@@ -2,9 +2,7 @@ package zdas
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,18 +15,18 @@ import (
 	"time"
 )
 
-// Handlers groups the HTTP handler dependencies for the ZDAS endpoints.
-type Handlers struct {
+// endpoints serves the ZDAS HTTP endpoints and holds their dependencies.
+type endpoints struct {
 	cfg         Config
 	keys        *KeySet   // active signing key
 	jwksKeys    []*KeySet // keys served at /.well-known/jwks.json: keys first, unique by kid
 	registry    *ProviderRegistry
 	store       Store
-	rawKeys     bool                  // store entries under their raw IDs (NewHandlers only)
-	discovery   *Discovery            // for cached network JWTs; may be nil in tests
-	reconciler  *Reconciler           // nil when fallback is disabled
+	discovery   *signerDiscovery      // for cached network JWTs; may be nil in tests
+	reconciler  *fallbackReconciler   // nil when fallback is disabled
 	provisioner EnrollmentProvisioner // nil uses built-in ComposeClaims
 	rateLimiter *ipRateLimiter        // nil when rate limiting is disabled
+	redirects   []*url.URL            // parsed cfg.AllowedRedirectURIs; nil keeps the loopback default
 	logger      *slog.Logger
 
 	// Scope of the browser binding cookie, from cfg.ExternalURL.
@@ -36,29 +34,14 @@ type Handlers struct {
 	cookieSecure bool
 }
 
-// NewHandlers creates a Handlers with the given dependencies. discovery,
-// reconciler, and provisioner may be nil.
-func NewHandlers(cfg Config, keys *KeySet, registry *ProviderRegistry, store *SessionStore, discovery *Discovery, reconciler *Reconciler, provisioner EnrollmentProvisioner, logger *slog.Logger) *Handlers {
-	if store != nil {
-		// Expire entries by the store's own TTLs, which the caller may have
-		// set differently from cfg.Session when building the store.
-		cfg.Session.Timeout, cfg.Session.CodeExpiry = store.sessionTTL, store.codeTTL
-	}
-	h := newHandlers(cfg, keys, nil, registry, sessionStoreAdapter{store}, discovery, reconciler, provisioner, logger)
-	// Callers may populate the SessionStore directly and pass the IDs it
-	// returns to the endpoints, so entries stay keyed by raw ID.
-	h.rawKeys = true
-	return h
-}
-
-// newHandlers creates a Handlers that signs with keys, publishes keys plus
-// verifyKeys, and expires store entries by cfg.Session.
-func newHandlers(cfg Config, keys *KeySet, verifyKeys []*KeySet, registry *ProviderRegistry, store Store, discovery *Discovery, reconciler *Reconciler, provisioner EnrollmentProvisioner, logger *slog.Logger) *Handlers {
+// newEndpoints returns endpoints that sign with keys, publish keys plus
+// verifyKeys in the JWKS, and expire store entries by cfg.Session.
+func newEndpoints(cfg Config, keys *KeySet, verifyKeys []*KeySet, registry *ProviderRegistry, store Store, discovery *signerDiscovery, reconciler *fallbackReconciler, provisioner EnrollmentProvisioner, logger *slog.Logger) *endpoints {
 	var jwksKeys []*KeySet
 	if keys != nil {
 		jwksKeys = uniqueKeySets(keys, verifyKeys)
 	}
-	h := &Handlers{
+	h := &endpoints{
 		cfg:         cfg,
 		keys:        keys,
 		jwksKeys:    jwksKeys,
@@ -71,11 +54,12 @@ func newHandlers(cfg Config, keys *KeySet, verifyKeys []*KeySet, registry *Provi
 	}
 	h.cookiePath, h.cookieSecure = bindingCookieScope(cfg.ExternalURL)
 	h.rateLimiter = newIPRateLimiter(cfg.RateLimit, logger)
+	h.redirects = parseAllowList(cfg.AllowedRedirectURIs, logger)
 	return h
 }
 
 // Mux returns an http.ServeMux wired to all ZDAS endpoints.
-func (h *Handlers) Mux() *http.ServeMux {
+func (h *endpoints) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /.well-known/openid-configuration", h.handleDiscovery)
 	mux.HandleFunc("GET /.well-known/jwks.json", h.handleJWKS)
@@ -88,10 +72,10 @@ func (h *Handlers) Mux() *http.ServeMux {
 	return mux
 }
 
-func (h *Handlers) handleDiscovery(w http.ResponseWriter, r *http.Request) {
+func (h *endpoints) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 	ext := h.cfg.ExternalURL
-	doc := map[string]interface{}{
-		"issuer":                                ext,
+	doc := map[string]any{
+		"issuer":                                h.cfg.Token.Issuer,
 		"authorization_endpoint":                ext + "/authorize",
 		"token_endpoint":                        ext + "/token",
 		"jwks_uri":                              ext + "/.well-known/jwks.json",
@@ -104,7 +88,7 @@ func (h *Handlers) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(doc)
 }
 
-func (h *Handlers) handleNetworkJWTs(w http.ResponseWriter, r *http.Request) {
+func (h *endpoints) handleNetworkJWTs(w http.ResponseWriter, r *http.Request) {
 	if h.discovery == nil {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
@@ -118,7 +102,7 @@ func (h *Handlers) handleNetworkJWTs(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
-func (h *Handlers) handleExtJWTSigners(w http.ResponseWriter, r *http.Request) {
+func (h *endpoints) handleExtJWTSigners(w http.ResponseWriter, r *http.Request) {
 	if h.discovery == nil {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
@@ -132,7 +116,7 @@ func (h *Handlers) handleExtJWTSigners(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
-func (h *Handlers) handleJWKS(w http.ResponseWriter, r *http.Request) {
+func (h *endpoints) handleJWKS(w http.ResponseWriter, r *http.Request) {
 	data, err := publicJWKS(h.jwksKeys)
 	if err != nil {
 		h.logger.Error("marshal jwks", "error", err)
@@ -143,7 +127,7 @@ func (h *Handlers) handleJWKS(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
+func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	if h.rateLimiter != nil && !h.rateLimiter.allow(r) {
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
@@ -175,7 +159,7 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "redirect_uri must be a valid http(s) URL", http.StatusBadRequest)
 		return
 	}
-	if !redirectAllowed(parsedRedirect, h.cfg.AllowedRedirectURIs) {
+	if !redirectAllowed(parsedRedirect, h.redirects) {
 		http.Error(w, "redirect_uri is not allowed", http.StatusBadRequest)
 		return
 	}
@@ -205,6 +189,12 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		fallbackNonce = nonce
 	} else if len(deviceName) > 255 {
 		oidcErrorRedirect(w, r, redirectURI, state, "invalid_request", "device_name too long (max 255 characters)")
+		return
+	} else if strings.Contains(deviceName, ":") {
+		// The external ID hashes issuer, subject and device name joined by
+		// ':', so a ':' here could make one user's device collide with
+		// another's. See computeExternalID.
+		oidcErrorRedirect(w, r, redirectURI, state, "invalid_request", "device_name must not contain ':'")
 		return
 	}
 	// Always populate DeviceInfo with whatever the tunneler sent. On the
@@ -270,16 +260,7 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			oidcErrorRedirect(w, r, redirectURI, state, "server_error", "internal error")
 			return
 		}
-		v := url.Values{
-			"client_id":             {oidcProv.clientID},
-			"response_type":         {"code"},
-			"redirect_uri":          {callbackURL},
-			"state":                 {sessionState},
-			"scope":                 {joinScopes(oidcProv.scopes)},
-			"code_challenge":        {challenge},
-			"code_challenge_method": {"S256"},
-		}
-		upstreamURL = oidcProv.authURL + "?" + v.Encode()
+		upstreamURL = oidcProv.authorizeURL(sessionState, callbackURL, challenge)
 	} else {
 		// Non-OIDC (e.g. GitHub): no upstream PKCE.
 		sessionState, err := h.startSession(w, r, sess)
@@ -304,7 +285,7 @@ func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 // it lacks the binding cookie the session is stored under.
 const sessionMissing = "session not found or expired; enrollment must finish in the browser that started it"
 
-func (h *Handlers) handleCallback(w http.ResponseWriter, r *http.Request) {
+func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	code := q.Get("code")
 	sessionState := q.Get("state")
@@ -323,7 +304,7 @@ func (h *Handlers) handleCallback(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, sessionMissing, http.StatusBadRequest)
 			return
 		}
-		oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, errParam, sanitizeErrorDescription(desc))
+		oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, upstreamErrorCode(errParam), sanitizeErrorDescription(desc))
 		return
 	}
 
@@ -335,6 +316,11 @@ func (h *Handlers) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	if sess == nil {
 		http.Error(w, sessionMissing, http.StatusBadRequest)
+		return
+	}
+	if code == "" {
+		h.logger.Warn("upstream callback without a code", "provider", sess.UpstreamProviderName)
+		oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, "server_error", "upstream returned no authorization code")
 		return
 	}
 
@@ -352,13 +338,18 @@ func (h *Handlers) handleCallback(w http.ResponseWriter, r *http.Request) {
 	} else {
 		identity, err = provider.ExchangeAndIdentify(r.Context(), code, callbackURL)
 	}
+	if errors.Is(err, ErrAccessDenied) {
+		h.logger.Info("upstream identity not permitted", "provider", provider.Name(), "error", err)
+		oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, "access_denied", "your account is not permitted to enroll")
+		return
+	}
 	if err != nil {
 		h.logger.Error("exchange and identify", "provider", provider.Name(), "error", err)
 		oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, "server_error", "upstream authentication failed")
 		return
 	}
 
-	var claims map[string]interface{}
+	var claims map[string]any
 	if h.provisioner != nil {
 		req := ProvisionRequest{
 			Email:            identity.Email,
@@ -369,19 +360,22 @@ func (h *Handlers) handleCallback(w http.ResponseWriter, r *http.Request) {
 			ClientType:       sess.ClientType,
 			IsFallback:       sess.FallbackNonce != "",
 			FallbackNonce:    sess.FallbackNonce,
+			DeviceName:       sess.DeviceInfo.DeviceName,
+			Hostname:         sess.DeviceInfo.Hostname,
+			OS:               sess.DeviceInfo.OS,
+			Arch:             sess.DeviceInfo.Arch,
+			OSRelease:        sess.DeviceInfo.OSRelease,
+			OSVersion:        sess.DeviceInfo.OSVersion,
 		}
-		req.DeviceName = sess.DeviceInfo.DeviceName
-		req.Hostname = sess.DeviceInfo.Hostname
-		req.OS = sess.DeviceInfo.OS
-		req.Arch = sess.DeviceInfo.Arch
-		req.OSRelease = sess.DeviceInfo.OSRelease
-		req.OSVersion = sess.DeviceInfo.OSVersion
 		result, err := h.provisioner.Provision(r.Context(), req)
+		if err == nil && (result == nil || (len(result.Claims) == 0 && result.RedirectURL == "")) {
+			err = errors.New("provisioner returned neither claims nor a redirect URL")
+		}
 		if err != nil {
 			h.handleProvisionerError(w, r, err, sess.TunnelerRedirectURI, sess.TunnelerState, "provider", sess.UpstreamProviderName)
 			return
 		}
-		if result.RedirectURL != "" && result.Claims == nil {
+		if len(result.Claims) == 0 {
 			// Interactive provisioning - stash session state and redirect.
 			pendingID, err := h.createPendingProvision(r.Context(), &PendingProvision{
 				TunnelerRedirectURI:         sess.TunnelerRedirectURI,
@@ -389,17 +383,14 @@ func (h *Handlers) handleCallback(w http.ResponseWriter, r *http.Request) {
 				TunnelerCodeChallenge:       sess.TunnelerCodeChallenge,
 				TunnelerCodeChallengeMethod: sess.TunnelerCodeChallengeMethod,
 				IsFallback:                  sess.FallbackNonce != "",
+				FallbackNonce:               sess.FallbackNonce,
 			})
 			if err != nil {
 				h.logger.Error("create pending provision", "error", err)
 				oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, "server_error", "internal error")
 				return
 			}
-			sep := "?"
-			if strings.Contains(result.RedirectURL, "?") {
-				sep = "&"
-			}
-			http.Redirect(w, r, result.RedirectURL+sep+"pending_id="+url.QueryEscape(pendingID), http.StatusFound)
+			http.Redirect(w, r, withQuery(result.RedirectURL, url.Values{"pending_id": {pendingID}}), http.StatusFound)
 			return
 		}
 		claims = result.Claims
@@ -407,13 +398,7 @@ func (h *Handlers) handleCallback(w http.ResponseWriter, r *http.Request) {
 		claims = ComposeClaims(h.cfg.Claims, h.cfg.Fallback, identity, sess.DeviceInfo, sess.FallbackNonce)
 	}
 
-	// Track fallback enrollments for reconciliation.
-	if sess.FallbackNonce != "" && h.reconciler != nil {
-		if extID, ok := claims[h.cfg.Claims.ExternalIDClaim].(string); ok {
-			username, _ := claims["preferred_username"].(string)
-			h.reconciler.Track(extID, username, sess.FallbackNonce)
-		}
-	}
+	h.trackFallback(claims, sess.FallbackNonce)
 
 	ac := &AuthCode{
 		Claims:              claims,
@@ -429,10 +414,10 @@ func (h *Handlers) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	redir := sess.TunnelerRedirectURI + "?" + url.Values{
+	redir := withQuery(sess.TunnelerRedirectURI, url.Values{
 		"code":  {zdasCode},
 		"state": {sess.TunnelerState},
-	}.Encode()
+	})
 	deviceLog := sess.DeviceInfo.DeviceName
 	if deviceLog == "" {
 		deviceLog = "fallback"
@@ -441,7 +426,7 @@ func (h *Handlers) handleCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, redir, http.StatusFound)
 }
 
-func (h *Handlers) handleToken(w http.ResponseWriter, r *http.Request) {
+func (h *endpoints) handleToken(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		tokenError(w, "invalid_request", "malformed form body")
 		return
@@ -487,7 +472,7 @@ func (h *Handlers) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := map[string]interface{}{
+	resp := map[string]any{
 		"access_token": signed,
 		"id_token":     signed,
 		"token_type":   "Bearer",
@@ -496,6 +481,21 @@ func (h *Handlers) handleToken(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// upstreamErrorCode returns the error code to send the tunneler for an
+// error the upstream IdP returned to /callback: the code itself when it is
+// one OAuth 2.0 or OpenID Connect defines for an authorization response, and
+// server_error otherwise.
+func upstreamErrorCode(code string) string {
+	switch code {
+	case "invalid_request", "unauthorized_client", "access_denied",
+		"unsupported_response_type", "invalid_scope", "server_error",
+		"temporarily_unavailable", "interaction_required", "login_required",
+		"account_selection_required", "consent_required":
+		return code
+	}
+	return "server_error"
 }
 
 // sanitizeErrorDescription enforces RFC 6749 section 4.1.2.1 character class
@@ -536,7 +536,7 @@ func truncateParam(s string, maxLen int) string {
 // passed through to the tunneler. Anything else (plain error or invalid code)
 // becomes server_error with a generic description. logArgs are added to
 // the log entry.
-func (h *Handlers) handleProvisionerError(w http.ResponseWriter, r *http.Request, err error, redirectURI, state string, logArgs ...any) {
+func (h *endpoints) handleProvisionerError(w http.ResponseWriter, r *http.Request, err error, redirectURI, state string, logArgs ...any) {
 	logger := h.logger.With(logArgs...)
 	var pe *ProvisionError
 	if errors.As(err, &pe) {
@@ -557,20 +557,8 @@ func (h *Handlers) handleProvisionerError(w http.ResponseWriter, r *http.Request
 	oidcErrorRedirect(w, r, redirectURI, state, "server_error", "provisioning failed")
 }
 
-// CompleteProvision finishes an enrollment that the provisioner sent to an
-// interactive page with ProvisionResult.RedirectURL. The embedding
-// application calls it from its own handler for that page, with the
-// pending_id ZDAS added to the redirect URL and the outcome of its
-// provisioning: the claims to mint, or an error, which follows the same
-// rules as an error from Provision and takes precedence over claims. It
-// consumes the pending provision and redirects the browser back to the
-// tunneler, or responds 400 when the pending provision is missing or
-// expired.
-//
-// The claims must come from the application's own state, never from the
-// request: the user enrolling holds the pending ID, so claims taken from
-// the browser would let that user enroll as any identity.
-func (h *Handlers) CompleteProvision(w http.ResponseWriter, r *http.Request, pendingID string, claims map[string]any, err error) {
+// completeProvision implements Handler.CompleteProvision.
+func (h *endpoints) completeProvision(w http.ResponseWriter, r *http.Request, pendingID string, claims map[string]any, err error) {
 	pp, cerr := h.consumePendingProvision(r.Context(), pendingID)
 	if cerr != nil {
 		h.logger.Error("consume pending provision", "error", cerr)
@@ -603,11 +591,25 @@ func (h *Handlers) CompleteProvision(w http.ResponseWriter, r *http.Request, pen
 		return
 	}
 
-	redir := pp.TunnelerRedirectURI + "?" + url.Values{
+	h.trackFallback(claims, pp.FallbackNonce)
+	redir := withQuery(pp.TunnelerRedirectURI, url.Values{
 		"code":  {zdasCode},
 		"state": {pp.TunnelerState},
-	}.Encode()
+	})
 	http.Redirect(w, r, redir, http.StatusFound)
+}
+
+// trackFallback queues the identity in claims for the reconciler when nonce
+// marks a fallback enrollment. The reconciler renames the identity once the
+// tunneler reports its hostname.
+func (h *endpoints) trackFallback(claims map[string]any, nonce string) {
+	if nonce == "" || h.reconciler == nil {
+		return
+	}
+	if extID, ok := claims[h.cfg.Claims.ExternalIDClaim].(string); ok {
+		username, _ := claims[preferredUsernameClaim].(string)
+		h.reconciler.Track(extID, username, nonce)
+	}
 }
 
 // verifyPKCE validates the code_verifier against the stored code_challenge
@@ -616,9 +618,7 @@ func verifyPKCE(challenge, method, verifier string) bool {
 	if method != "S256" || verifier == "" {
 		return false
 	}
-	h := sha256.Sum256([]byte(verifier))
-	computed := base64.RawURLEncoding.EncodeToString(h[:])
-	return subtle.ConstantTimeCompare([]byte(computed), []byte(challenge)) == 1
+	return subtle.ConstantTimeCompare([]byte(pkceChallenge(verifier)), []byte(challenge)) == 1
 }
 
 // oidcErrorRedirect sends an OIDC-compliant error redirect.
@@ -630,21 +630,18 @@ func oidcErrorRedirect(w http.ResponseWriter, r *http.Request, redirectURI, stat
 	if state != "" {
 		v.Set("state", state)
 	}
-	http.Redirect(w, r, redirectURI+"?"+v.Encode(), http.StatusFound)
+	http.Redirect(w, r, withQuery(redirectURI, v), http.StatusFound)
 }
 
 // storeKey returns the key the entry of the given kind and ID is stored
 // under. See Store for why it is a hash.
-func (h *Handlers) storeKey(kind, id string) string {
-	if h.rawKeys {
-		return id
-	}
+func (h *endpoints) storeKey(kind, id string) string {
 	return hashStoreKey(kind, h.cfg.Token.Issuer, id)
 }
 
 // createSession stamps sess with the current time, stores it under a new
 // ID bound to nonce (see sessionKey), and returns the ID.
-func (h *Handlers) createSession(ctx context.Context, sess *AuthSession, nonce string) (string, error) {
+func (h *endpoints) createSession(ctx context.Context, sess *AuthSession, nonce string) (string, error) {
 	id, err := randomID()
 	if err != nil {
 		return "", err
@@ -657,7 +654,7 @@ func (h *Handlers) createSession(ctx context.Context, sess *AuthSession, nonce s
 }
 
 // createCode is createSession for authorization codes.
-func (h *Handlers) createCode(ctx context.Context, ac *AuthCode) (string, error) {
+func (h *endpoints) createCode(ctx context.Context, ac *AuthCode) (string, error) {
 	code, err := randomID()
 	if err != nil {
 		return "", err
@@ -670,7 +667,7 @@ func (h *Handlers) createCode(ctx context.Context, ac *AuthCode) (string, error)
 }
 
 // createPendingProvision is createSession for pending provisions.
-func (h *Handlers) createPendingProvision(ctx context.Context, pp *PendingProvision) (string, error) {
+func (h *endpoints) createPendingProvision(ctx context.Context, pp *PendingProvision) (string, error) {
 	id, err := randomID()
 	if err != nil {
 		return "", err
@@ -686,7 +683,7 @@ func (h *Handlers) createPendingProvision(ctx context.Context, pp *PendingProvis
 // fresh as a miss, so a Store without expiry logic of its own never hands
 // back an expired session. A malformed ID is a miss without a store lookup.
 // It returns (nil, nil) on a miss. nonce is as for createSession.
-func (h *Handlers) consumeSession(ctx context.Context, id, nonce string) (*AuthSession, error) {
+func (h *endpoints) consumeSession(ctx context.Context, id, nonce string) (*AuthSession, error) {
 	if !validID(id) {
 		return nil, nil
 	}
@@ -699,7 +696,7 @@ func (h *Handlers) consumeSession(ctx context.Context, id, nonce string) (*AuthS
 
 // consumeCode is consumeSession for authorization codes, checked against the
 // code expiry.
-func (h *Handlers) consumeCode(ctx context.Context, code string) (*AuthCode, error) {
+func (h *endpoints) consumeCode(ctx context.Context, code string) (*AuthCode, error) {
 	if !validID(code) {
 		return nil, nil
 	}
@@ -712,7 +709,7 @@ func (h *Handlers) consumeCode(ctx context.Context, code string) (*AuthCode, err
 
 // consumePendingProvision is consumeSession for pending provisions, checked
 // against the session timeout.
-func (h *Handlers) consumePendingProvision(ctx context.Context, id string) (*PendingProvision, error) {
+func (h *endpoints) consumePendingProvision(ctx context.Context, id string) (*PendingProvision, error) {
 	if !validID(id) {
 		return nil, nil
 	}
@@ -727,7 +724,7 @@ func (h *Handlers) consumePendingProvision(ctx context.Context, id string) (*Pen
 // A zero CreatedAt, or one further in the future than clock skew explains,
 // means the store did not return the entry as stored; those are logged so
 // they do not pass for ordinary expiry.
-func (h *Handlers) fresh(kind string, createdAt time.Time, ttl time.Duration) bool {
+func (h *endpoints) fresh(kind string, createdAt time.Time, ttl time.Duration) bool {
 	age := time.Since(createdAt)
 	switch {
 	case createdAt.IsZero():
@@ -741,10 +738,17 @@ func (h *Handlers) fresh(kind string, createdAt time.Time, ttl time.Duration) bo
 	return age <= ttl
 }
 
-// tokenError writes a JSON error response for the /token endpoint.
+// tokenError writes a JSON error response for the /token endpoint: 500 for
+// server_error, which is ZDAS's failure, and 400 for the rest (RFC 6749
+// section 5.2).
 func tokenError(w http.ResponseWriter, errCode, errDesc string) {
+	status := http.StatusBadRequest
+	if errCode == "server_error" {
+		status = http.StatusInternalServerError
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]string{
 		"error":             errCode,
 		"error_description": errDesc,
@@ -757,7 +761,7 @@ func tokenError(w http.ResponseWriter, errCode, errDesc string) {
 // parameter added, and appends a `providers` query param listing the
 // available IdP names so the host app does not need to query ZDAS to know
 // what to render.
-func (h *Handlers) redirectToIDPSelector(w http.ResponseWriter, r *http.Request) {
+func (h *endpoints) redirectToIDPSelector(w http.ResponseWriter, r *http.Request) {
 	names := h.registry.Names()
 	sort.Strings(names)
 
@@ -769,12 +773,7 @@ func (h *Handlers) redirectToIDPSelector(w http.ResponseWriter, r *http.Request)
 	q := r.URL.Query()
 	q.Set("providers", strings.Join(names, ","))
 
-	target := h.cfg.IDPSelectorURL
-	sep := "?"
-	if strings.Contains(target, "?") {
-		sep = "&"
-	}
-	redirURL := target + sep + q.Encode()
+	redirURL := withQuery(h.cfg.IDPSelectorURL, q)
 
 	h.logger.Info("redirecting to host app idp selector",
 		"url", h.cfg.IDPSelectorURL,
@@ -787,7 +786,7 @@ func (h *Handlers) redirectToIDPSelector(w http.ResponseWriter, r *http.Request)
 // when multiple are configured and no selection has been made yet. Each link
 // re-enters /authorize with the original query parameters plus idp=<name>,
 // so all tunneler params (redirect_uri, state, PKCE, device info) carry through.
-func (h *Handlers) renderIDPSelector(w http.ResponseWriter, r *http.Request) {
+func (h *endpoints) renderIDPSelector(w http.ResponseWriter, r *http.Request) {
 	names := h.registry.Names()
 	sort.Strings(names)
 
@@ -807,11 +806,7 @@ func (h *Handlers) renderIDPSelector(w http.ResponseWriter, r *http.Request) {
 		// query. This works regardless of how the embedding application
 		// mounts ZDAS (e.g., at /zdas via http.StripPrefix).
 		href := "?" + q.Encode()
-		links.WriteString(fmt.Sprintf(
-			`<a href="%s">%s</a>`,
-			html.EscapeString(href),
-			html.EscapeString(name),
-		))
+		fmt.Fprintf(&links, `<a href="%s">%s</a>`, html.EscapeString(href), html.EscapeString(name))
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

@@ -17,7 +17,8 @@
 // [WithStore] let several replicas behind a load balancer share signing
 // keys and in-flight enrollment state, with the per-replica exceptions
 // listed on WithStore; package zdastest provides a conformance suite for
-// [Store] implementations. [WithUpstreamHTTPClient] sends every request to
+// [Store] implementations, and [JWKS] publishes the keys from somewhere
+// other than ZDAS's own endpoint. [WithUpstreamHTTPClient] sends every request to
 // upstream identity providers through the embedder's client, for an
 // embedder whose issuers are chosen by someone it does not fully trust.
 //
@@ -33,8 +34,9 @@
 //
 // # Compatibility
 //
-// Exported identifiers in this package are treated as a public API.
-// Struct fields are only added, never removed or retyped; new fields are
+// Exported identifiers in this package are treated as a public API. Until
+// v1, a minor release may still remove or change one, and its release notes
+// say which and what replaces it. Otherwise struct fields are only added, never removed or retyped; new fields are
 // optional and default to the previous behavior. Interface methods are
 // only added when every implementation in this package gains them at the
 // same time, and embedders that implement [UpstreamProvider] or [Store]

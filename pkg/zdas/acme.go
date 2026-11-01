@@ -19,7 +19,9 @@ func (s *Server) listenACME(srv *http.Server) error {
 	srv.TLSConfig = m.TLSConfig()
 
 	if s.cfg.Listen != ":443" {
-		chalSrv := newHTTPServer(":443", m.HTTPHandler(nil))
+		// The challenge is answered in the TLS handshake, so ordinary
+		// requests to this listener have nothing to reach.
+		chalSrv := newHTTPServer(":443", http.NotFoundHandler())
 		chalSrv.TLSConfig = m.TLSConfig()
 		s.mu.Lock()
 		if s.stopping {

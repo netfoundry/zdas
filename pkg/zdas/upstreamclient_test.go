@@ -49,8 +49,8 @@ func (rt *recordingTransport) seen() []string {
 // OIDCProviderConfig.HTTPClient, so an embedder controls every request the
 // provider makes to the issuer.
 func TestOIDCProviderSendsEveryRequestThroughHTTPClient(t *testing.T) {
-	server, _ := mockOIDCServerWithUserInfo(t, map[string]interface{}{"sub": "user-42"},
-		jsonUserInfo(t, map[string]interface{}{"sub": "user-42", "groups": []string{"eng"}}))
+	server, _ := mockOIDCServerWithUserInfo(t, map[string]any{"sub": "user-42"},
+		jsonUserInfo(t, map[string]any{"sub": "user-42", "groups": []string{"eng"}}))
 	rt := &recordingTransport{}
 	ctx := context.Background()
 	p, err := NewOIDCProvider(ctx, OIDCProviderConfig{
@@ -80,7 +80,7 @@ func TestOIDCProviderSendsEveryRequestThroughHTTPClient(t *testing.T) {
 // request stops the provider at discovery, rather than discovery falling
 // back to another client.
 func TestOIDCProviderHTTPClientRefusal(t *testing.T) {
-	server, _ := mockOIDCServer(t, map[string]interface{}{"sub": "user-42"})
+	server, _ := mockOIDCServer(t, map[string]any{"sub": "user-42"})
 	_, err := NewOIDCProvider(context.Background(), OIDCProviderConfig{
 		Name:       "test-idp",
 		Issuer:     server.URL,
@@ -97,9 +97,9 @@ func TestOIDCProviderHTTPClientRefusal(t *testing.T) {
 // WithUpstreamHTTPClient sets.
 func TestGitHubProviderSendsEveryRequestThroughItsClient(t *testing.T) {
 	server := mockGitHubServer(t,
-		map[string]interface{}{"id": float64(12345), "login": "jsmith"},
-		[]map[string]interface{}{{"login": "acme"}},
-		[]map[string]interface{}{{"email": "j@example.com", "primary": true, "verified": true}})
+		map[string]any{"id": float64(12345), "login": "jsmith"},
+		[]map[string]any{{"login": "acme"}},
+		[]map[string]any{{"email": "j@example.com", "primary": true, "verified": true}})
 	p := newTestGitHubProvider(t, server, []string{"acme"})
 	rt := &recordingTransport{}
 	p.client = &http.Client{Transport: rt}
@@ -123,7 +123,7 @@ func TestTokenError(t *testing.T) {
 		w.Write([]byte(`{"error":"invalid_grant"}`))
 	}))
 	t.Cleanup(srv.Close)
-	_, err := defaultOIDCTokenExchange(context.Background(), srv.Client(), srv.URL, url.Values{})
+	_, err := oidcTokenExchange(context.Background(), srv.Client(), srv.URL, url.Values{})
 	var te *TokenError
 	if !errors.As(err, &te) {
 		t.Fatalf("error = %v, want a *TokenError", err)
@@ -169,8 +169,8 @@ func upstreamClientConfig(t *testing.T, configured, signer string) Config {
 // upstream provider: configured OIDC, discovered from the controller's
 // signers, and GitHub.
 func TestWithUpstreamHTTPClient(t *testing.T) {
-	configured, _ := mockOIDCServer(t, map[string]interface{}{"sub": "a"})
-	discovered, _ := mockOIDCServer(t, map[string]interface{}{"sub": "b"})
+	configured, _ := mockOIDCServer(t, map[string]any{"sub": "a"})
+	discovered, _ := mockOIDCServer(t, map[string]any{"sub": "b"})
 	cfg := upstreamClientConfig(t, configured.URL, discovered.URL)
 
 	rt := &recordingTransport{}
@@ -180,7 +180,7 @@ func TestWithUpstreamHTTPClient(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	t.Cleanup(func() { srv.Shutdown(context.Background()) })
-	if err := srv.discovery.RunOnce(context.Background()); err != nil {
+	if err := srv.discovery.runOnce(context.Background()); err != nil {
 		t.Fatalf("discovery: %v", err)
 	}
 	seen := rt.seen()
@@ -215,7 +215,7 @@ func TestWithUpstreamHTTPClient(t *testing.T) {
 // from a controller signer is refused by a refusing upstream client, rather
 // than reaching its issuer with another client.
 func TestDiscoveredProviderUsesUpstreamClient(t *testing.T) {
-	discovered, _ := mockOIDCServer(t, map[string]interface{}{"sub": "b"})
+	discovered, _ := mockOIDCServer(t, map[string]any{"sub": "b"})
 	cfg := upstreamClientConfig(t, "", discovered.URL)
 	cfg.Providers = nil
 	srv, err := NewServer(cfg, slog.Default(), WithUpstreamHTTPClient(&http.Client{Transport: &recordingTransport{refuse: true}}))
@@ -223,7 +223,7 @@ func TestDiscoveredProviderUsesUpstreamClient(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	t.Cleanup(func() { srv.Shutdown(context.Background()) })
-	if err := srv.discovery.RunOnce(context.Background()); err != nil {
+	if err := srv.discovery.runOnce(context.Background()); err != nil {
 		t.Fatalf("discovery: %v", err)
 	}
 	if _, err := srv.registry.Resolve("discovered"); err == nil {
@@ -275,5 +275,12 @@ func TestOIDCProviderDefaultClientCapsDiscovery(t *testing.T) {
 	_, err := NewOIDCProvider(context.Background(), OIDCProviderConfig{Name: "big", Issuer: issuer, ClientID: "c"})
 	if err == nil {
 		t.Fatal("oversized discovery document accepted")
+	}
+}
+
+func TestTokenErrorTruncatesBody(t *testing.T) {
+	err := &TokenError{StatusCode: 400, Body: bytes.Repeat([]byte("x"), maxErrorBody+100)}
+	if n := len(err.Error()); n > maxErrorBody+64 {
+		t.Errorf("error message is %d bytes, want the body cut to about %d", n, maxErrorBody)
 	}
 }

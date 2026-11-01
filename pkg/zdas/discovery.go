@@ -28,11 +28,11 @@ const (
 	maxSignerPages = 20
 )
 
-// Discovery polls the Ziti controller's public ext-jwt-signers endpoint and
+// signerDiscovery polls the Ziti controller's public ext-jwt-signers endpoint and
 // builds OIDCProvider instances from signers that have enrollment enabled
 // (enrollToCertEnabled or enrollToTokenEnabled).
 // It merges them into the ProviderRegistry alongside any configured providers.
-type Discovery struct {
+type signerDiscovery struct {
 	cfg             ControllerConfig
 	registry        *ProviderRegistry
 	configuredNames map[string]struct{}
@@ -52,15 +52,12 @@ type Discovery struct {
 	extJWTSignersBody []byte // cached response from GET /edge/client/v1/external-jwt-signers
 }
 
-// NewDiscovery creates a Discovery poller. configuredNames is the set of
-// provider names that come from the ZDAS config (GitHub, etc.) and must not
-// collide with discovered signers.
-func NewDiscovery(cfg ControllerConfig, registry *ProviderRegistry, configuredNames map[string]struct{}, logger *slog.Logger) (*Discovery, error) {
-	client, err := controllerClient(cfg)
-	if err != nil {
-		return nil, err
-	}
-	return &Discovery{
+// newSignerDiscovery creates a signerDiscovery poller that reaches the
+// controller with client. configuredNames is the set of provider names that
+// come from the ZDAS config (GitHub, etc.) and must not collide with
+// discovered signers.
+func newSignerDiscovery(cfg ControllerConfig, client *http.Client, registry *ProviderRegistry, configuredNames map[string]struct{}, logger *slog.Logger) *signerDiscovery {
+	return &signerDiscovery{
 		cfg:             cfg,
 		registry:        registry,
 		configuredNames: configuredNames,
@@ -68,18 +65,18 @@ func NewDiscovery(cfg ControllerConfig, registry *ProviderRegistry, configuredNa
 		setupTimeout:    providerSetupTimeout,
 		pageSize:        signerPageSize,
 		logger:          logger,
-	}, nil
+	}
 }
 
-// RunOnce performs a single discovery poll. Suitable for startup.
-func (d *Discovery) RunOnce(ctx context.Context) error {
+// runOnce performs a single discovery poll. Suitable for startup.
+func (d *signerDiscovery) runOnce(ctx context.Context) error {
 	return d.poll(ctx)
 }
 
 // Start begins periodic polling at the configured PollInterval. It runs the
 // first poll synchronously and returns an error if it fails. Subsequent poll
 // failures are logged but non-fatal.
-func (d *Discovery) Start(ctx context.Context) error {
+func (d *signerDiscovery) Start(ctx context.Context) error {
 	if err := d.poll(ctx); err != nil {
 		return fmt.Errorf("initial discovery poll: %w", err)
 	}
@@ -98,7 +95,7 @@ func (d *Discovery) Start(ctx context.Context) error {
 }
 
 // Stop cancels the background poll loop and waits for it to exit.
-func (d *Discovery) Stop() {
+func (d *signerDiscovery) Stop() {
 	d.mu.Lock()
 	cancel := d.cancel
 	stopped := d.stopped
@@ -112,7 +109,7 @@ func (d *Discovery) Stop() {
 	}
 }
 
-func (d *Discovery) loop(ctx context.Context) {
+func (d *signerDiscovery) loop(ctx context.Context) {
 	defer close(d.stopped)
 	ticker := time.NewTicker(d.cfg.PollInterval)
 	defer ticker.Stop()
@@ -155,7 +152,7 @@ type signerEntry struct {
 
 // NetworkJWTsBody returns the cached response from the controller's
 // /network-jwts endpoint, or nil if not yet fetched.
-func (d *Discovery) NetworkJWTsBody() []byte {
+func (d *signerDiscovery) NetworkJWTsBody() []byte {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.networkJWTsBody
@@ -163,13 +160,13 @@ func (d *Discovery) NetworkJWTsBody() []byte {
 
 // ExtJWTSignersBody returns the cached response from the controller's
 // /edge/client/v1/external-jwt-signers endpoint, or nil if not yet fetched.
-func (d *Discovery) ExtJWTSignersBody() []byte {
+func (d *signerDiscovery) ExtJWTSignersBody() []byte {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.extJWTSignersBody
 }
 
-func (d *Discovery) poll(ctx context.Context) error {
+func (d *signerDiscovery) poll(ctx context.Context) error {
 	d.pollMu.Lock()
 	defer d.pollMu.Unlock()
 
@@ -225,7 +222,7 @@ func (d *Discovery) poll(ctx context.Context) error {
 // name, ignoring case, is not already taken by a configured provider or an
 // earlier signer. A signer whose name is taken is skipped rather than
 // failing the poll, so that one misnamed signer cannot stop discovery.
-func (d *Discovery) usableSigners(signers []signerEntry) []signerEntry {
+func (d *signerDiscovery) usableSigners(signers []signerEntry) []signerEntry {
 	taken := make(map[string]bool, len(d.configuredNames)+len(signers))
 	for name := range d.configuredNames {
 		taken[strings.ToLower(name)] = true
@@ -254,7 +251,7 @@ func (d *Discovery) usableSigners(signers []signerEntry) []signerEntry {
 // isSelf reports whether s is ZDAS's own signer: its issuer is SelfIssuer,
 // or, since the public API may return an empty issuer for a new signer, its
 // externalAuthUrl is SelfIssuer or a path under it.
-func (d *Discovery) isSelf(s signerEntry) bool {
+func (d *signerDiscovery) isSelf(s signerEntry) bool {
 	self := strings.TrimSuffix(d.cfg.SelfIssuer, "/")
 	if self == "" {
 		return false
@@ -276,7 +273,7 @@ type builtProvider struct {
 // identical signer settings, it returns that one, so that an issuer that is
 // briefly unreachable does not break sign-ins already under way. It returns
 // nil if there is neither.
-func (d *Discovery) buildProvider(ctx context.Context, s signerEntry) *OIDCProvider {
+func (d *signerDiscovery) buildProvider(ctx context.Context, s signerEntry) *OIDCProvider {
 	setupCtx, cancel := context.WithTimeout(ctx, d.setupTimeout)
 	defer cancel()
 	p, err := NewOIDCProvider(setupCtx, OIDCProviderConfig{
@@ -302,7 +299,7 @@ func (d *Discovery) buildProvider(ctx context.Context, s signerEntry) *OIDCProvi
 // fetchSigners fetches every page of the controller's signer list. It
 // returns the body to re-serve, which is the controller's own response when
 // the list fits on one page, and the parsed entries.
-func (d *Discovery) fetchSigners(ctx context.Context) (rawBody []byte, entries []signerEntry, err error) {
+func (d *signerDiscovery) fetchSigners(ctx context.Context) (rawBody []byte, entries []signerEntry, err error) {
 	var all []json.RawMessage
 	for page := 1; ; page++ {
 		body, err := d.fetchSignerPage(ctx, len(all))
@@ -348,7 +345,7 @@ func (d *Discovery) fetchSigners(ctx context.Context) (rawBody []byte, entries [
 	return rawBody, entries, nil
 }
 
-func (d *Discovery) fetchSignerPage(ctx context.Context, offset int) ([]byte, error) {
+func (d *signerDiscovery) fetchSignerPage(ctx context.Context, offset int) ([]byte, error) {
 	q := url.Values{"limit": {strconv.Itoa(d.pageSize)}, "offset": {strconv.Itoa(offset)}}
 	reqURL := d.cfg.APIURL + "/edge/client/v1/external-jwt-signers?" + q.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
@@ -367,32 +364,25 @@ func (d *Discovery) fetchSignerPage(ctx context.Context, offset int) ([]byte, er
 		return nil, fmt.Errorf("read signers response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("signers endpoint returned %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("signers endpoint returned %d: %s", resp.StatusCode, truncateBody(body))
 	}
 	return body, nil
 }
 
 // controllerClient builds an HTTP client for controller communication.
-//   - identity file set: CA from identity JSON + no client cert (public API)
+//   - identity set (from cfg.IdentityFile): CA from the identity, no client cert
 //   - ca bundle set: CA from PEM file + system roots
 //   - neither set: system CA pool only (works for publicly-trusted controllers)
 //
 // No client certificate is presented; this is for the public Edge Client API.
-func controllerClient(cfg ControllerConfig) (*http.Client, error) {
-	if cfg.IdentityFile != "" {
-		id, err := loadIdentityFile(cfg.IdentityFile)
-		if err != nil {
-			return nil, err
-		}
+func controllerClient(cfg ControllerConfig, id *parsedIdentity) (*http.Client, error) {
+	if id != nil {
 		return discoveryClientFromIdentity(id), nil
 	}
-
 	if cfg.CABundle != "" {
 		return clientFromCABundle(cfg.CABundle)
 	}
-
-	// No identity file or CA bundle - use system CA pool.
-	return &http.Client{Timeout: 15 * time.Second}, nil
+	return &http.Client{Timeout: outboundTimeout}, nil
 }
 
 // clientFromCABundle builds an HTTP client that trusts both the system CA pool
@@ -409,13 +399,10 @@ func clientFromCABundle(path string) (*http.Client, error) {
 	if !pool.AppendCertsFromPEM(pem) {
 		return nil, fmt.Errorf("no valid certificates in ca bundle %s", path)
 	}
-	return &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
-	}, nil
+	return tlsClient(&tls.Config{RootCAs: pool}), nil
 }
 
-func (d *Discovery) fetchNetworkJWTs(ctx context.Context) ([]byte, error) {
+func (d *signerDiscovery) fetchNetworkJWTs(ctx context.Context) ([]byte, error) {
 	reqURL := d.cfg.APIURL + "/network-jwts"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
@@ -433,7 +420,7 @@ func (d *Discovery) fetchNetworkJWTs(ctx context.Context) ([]byte, error) {
 		return nil, fmt.Errorf("read network-jwts response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("network-jwts endpoint returned %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("network-jwts endpoint returned %d: %s", resp.StatusCode, truncateBody(body))
 	}
 	return body, nil
 }

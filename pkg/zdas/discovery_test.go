@@ -3,10 +3,13 @@ package zdas
 import (
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -35,7 +38,7 @@ func mockControllerAndIDPs(t *testing.T, signers []signerEntry) (*httptest.Serve
 		if !signers[i].EnrollToCertEnabled {
 			continue
 		}
-		idpServer, _ := mockOIDCServer(t, map[string]interface{}{"sub": "testuser"})
+		idpServer, _ := mockOIDCServer(t, map[string]any{"sub": "testuser"})
 		idpServers = append(idpServers, idpServer)
 		if signers[i].Issuer == "" {
 			signers[i].Issuer = idpServer.URL
@@ -63,16 +66,13 @@ func TestDiscoveryRunOnce(t *testing.T) {
 	ctrl, _ := mockControllerAndIDPs(t, signers)
 
 	reg := NewProviderRegistry()
-	d, err := NewDiscovery(ControllerConfig{
+	d := newSignerDiscovery(ControllerConfig{
 		APIURL:     ctrl.URL,
 		SelfIssuer: "https://zdas.example.com",
-	}, reg, nil, slog.Default())
-	if err != nil {
-		t.Fatalf("NewDiscovery: %v", err)
-	}
+	}, http.DefaultClient, reg, nil, slog.Default())
 
-	if err := d.RunOnce(context.Background()); err != nil {
-		t.Fatalf("RunOnce: %v", err)
+	if err := d.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce: %v", err)
 	}
 
 	if reg.Len() != 1 {
@@ -97,15 +97,12 @@ func TestDiscoveryExcludesSelf(t *testing.T) {
 	ctrl, _ := mockControllerAndIDPs(t, signers)
 
 	reg := NewProviderRegistry()
-	d, err := NewDiscovery(ControllerConfig{
+	d := newSignerDiscovery(ControllerConfig{
 		APIURL:     ctrl.URL,
 		SelfIssuer: selfIssuer,
-	}, reg, nil, slog.Default())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := d.RunOnce(context.Background()); err != nil {
-		t.Fatalf("RunOnce: %v", err)
+	}, http.DefaultClient, reg, nil, slog.Default())
+	if err := d.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce: %v", err)
 	}
 
 	if reg.Len() != 1 {
@@ -124,11 +121,8 @@ func TestDiscoveryFiltersNonEnrollToCert(t *testing.T) {
 	ctrl, _ := mockControllerAndIDPs(t, signers)
 
 	reg := NewProviderRegistry()
-	d, err := NewDiscovery(ControllerConfig{APIURL: ctrl.URL}, reg, nil, slog.Default())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := d.RunOnce(context.Background()); err != nil {
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, reg, nil, slog.Default())
+	if err := d.runOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if reg.Len() != 1 {
@@ -152,12 +146,9 @@ func TestDiscoveryNameCollisionSkipsSigner(t *testing.T) {
 	gh := &stubProvider{name: "github", issuer: "https://github.com"}
 	_ = reg.Register(gh)
 
-	d, err := NewDiscovery(ControllerConfig{APIURL: ctrl.URL}, reg, configured, slog.Default())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := d.RunOnce(context.Background()); err != nil {
-		t.Fatalf("RunOnce: %v", err)
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, reg, configured, slog.Default())
+	if err := d.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce: %v", err)
 	}
 	names := reg.Names()
 	slices.Sort(names)
@@ -173,8 +164,8 @@ func TestDiscoveryNameCollisionSkipsSigner(t *testing.T) {
 	signers2 := []signerEntry{{Name: "GitHub", ClientID: "c", EnrollToCertEnabled: true}}
 	ctrl2, _ := mockControllerAndIDPs(t, signers2)
 	d.cfg.APIURL = ctrl2.URL
-	if err := d.RunOnce(context.Background()); err != nil {
-		t.Fatalf("second RunOnce: %v", err)
+	if err := d.runOnce(context.Background()); err != nil {
+		t.Fatalf("second runOnce: %v", err)
 	}
 	if _, err := reg.Resolve("kc"); err == nil {
 		t.Error("signer removed on the controller is still registered")
@@ -196,7 +187,7 @@ func TestDiscoveryIsSelf(t *testing.T) {
 		{"", signerEntry{Issuer: "https://idp.example.com", ExternalAuthURL: "https://idp.example.com/auth"}, false},
 	}
 	for _, tc := range cases {
-		d := &Discovery{cfg: ControllerConfig{SelfIssuer: tc.self}}
+		d := &signerDiscovery{cfg: ControllerConfig{SelfIssuer: tc.self}}
 		if got := d.isSelf(tc.s); got != tc.want {
 			t.Errorf("isSelf(%+v) with SelfIssuer %q = %v, want %v", tc.s, tc.self, got, tc.want)
 		}
@@ -221,15 +212,12 @@ func TestDiscoveryUnresponsiveIssuer(t *testing.T) {
 	ctrl, _ := mockControllerAndIDPs(t, signers)
 
 	reg := NewProviderRegistry()
-	d, err := NewDiscovery(ControllerConfig{APIURL: ctrl.URL}, reg, nil, slog.Default())
-	if err != nil {
-		t.Fatal(err)
-	}
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, reg, nil, slog.Default())
 	d.setupTimeout = 200 * time.Millisecond
 
 	start := time.Now()
-	if err := d.RunOnce(context.Background()); err != nil {
-		t.Fatalf("RunOnce: %v", err)
+	if err := d.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("poll took %v with one unresponsive issuer", elapsed)
@@ -247,12 +235,9 @@ func TestDiscoveryKeepsProviderWhenRefreshFails(t *testing.T) {
 	ctrl, idps := mockControllerAndIDPs(t, signers)
 
 	reg := NewProviderRegistry()
-	d, err := NewDiscovery(ControllerConfig{APIURL: ctrl.URL}, reg, nil, slog.Default())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := d.RunOnce(context.Background()); err != nil {
-		t.Fatalf("RunOnce: %v", err)
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, reg, nil, slog.Default())
+	if err := d.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce: %v", err)
 	}
 	first, err := reg.Resolve("kc")
 	if err != nil {
@@ -260,16 +245,16 @@ func TestDiscoveryKeepsProviderWhenRefreshFails(t *testing.T) {
 	}
 
 	idps[0].Close()
-	if err := d.RunOnce(context.Background()); err != nil {
-		t.Fatalf("RunOnce with issuer down: %v", err)
+	if err := d.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce with issuer down: %v", err)
 	}
 	if p, err := reg.Resolve("kc"); err != nil || p != first {
 		t.Errorf("provider after failed refresh = %v, %v; want the previous one", p, err)
 	}
 
 	signers[0].ClientID = "changed"
-	if err := d.RunOnce(context.Background()); err != nil {
-		t.Fatalf("RunOnce with changed signer: %v", err)
+	if err := d.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce with changed signer: %v", err)
 	}
 	if _, err := reg.Resolve("kc"); err == nil {
 		t.Error("provider kept although the signer's settings changed")
@@ -282,7 +267,7 @@ func TestDiscoveryKeepsProviderWhenRefreshFails(t *testing.T) {
 func TestDiscoveryPaginates(t *testing.T) {
 	var entries []string
 	for i := range 3 {
-		idp, _ := mockOIDCServer(t, map[string]interface{}{"sub": "u"})
+		idp, _ := mockOIDCServer(t, map[string]any{"sub": "u"})
 		entries = append(entries, fmt.Sprintf(
 			`{"id":"id%d","name":"kc%d","issuer":%q,"clientId":"c","enrollToCertEnabled":true}`, i, i, idp.URL))
 	}
@@ -300,13 +285,10 @@ func TestDiscoveryPaginates(t *testing.T) {
 	t.Cleanup(ctrl.Close)
 
 	reg := NewProviderRegistry()
-	d, err := NewDiscovery(ControllerConfig{APIURL: ctrl.URL}, reg, nil, slog.Default())
-	if err != nil {
-		t.Fatal(err)
-	}
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, reg, nil, slog.Default())
 	d.pageSize = 2
-	if err := d.RunOnce(context.Background()); err != nil {
-		t.Fatalf("RunOnce: %v", err)
+	if err := d.runOnce(context.Background()); err != nil {
+		t.Fatalf("runOnce: %v", err)
 	}
 
 	if !slices.Equal(offsets, []string{"0", "2"}) {
@@ -343,14 +325,11 @@ func TestDiscoveryCachesNetworkJWTs(t *testing.T) {
 	ctrl, _ := mockControllerAndIDPs(t, signers)
 
 	reg := NewProviderRegistry()
-	d, err := NewDiscovery(ControllerConfig{APIURL: ctrl.URL}, reg, nil, slog.Default())
-	if err != nil {
-		t.Fatal(err)
-	}
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, reg, nil, slog.Default())
 	if d.NetworkJWTsBody() != nil {
 		t.Error("expected nil before first poll")
 	}
-	if err := d.RunOnce(t.Context()); err != nil {
+	if err := d.runOnce(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	body := d.NetworkJWTsBody()
@@ -369,14 +348,11 @@ func TestDiscoveryCachesExtJWTSigners(t *testing.T) {
 	ctrl, _ := mockControllerAndIDPs(t, signers)
 
 	reg := NewProviderRegistry()
-	d, err := NewDiscovery(ControllerConfig{APIURL: ctrl.URL}, reg, nil, slog.Default())
-	if err != nil {
-		t.Fatal(err)
-	}
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, reg, nil, slog.Default())
 	if d.ExtJWTSignersBody() != nil {
 		t.Error("expected nil before first poll")
 	}
-	if err := d.RunOnce(t.Context()); err != nil {
+	if err := d.runOnce(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	body := d.ExtJWTSignersBody()
@@ -398,11 +374,8 @@ func TestDiscoveryCachesExtJWTSigners(t *testing.T) {
 
 func TestDiscoveryControllerUnreachable(t *testing.T) {
 	reg := NewProviderRegistry()
-	d, err := NewDiscovery(ControllerConfig{APIURL: "http://127.0.0.1:1"}, reg, nil, slog.Default())
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = d.RunOnce(context.Background())
+	d := newSignerDiscovery(ControllerConfig{APIURL: "http://127.0.0.1:1"}, http.DefaultClient, reg, nil, slog.Default())
+	err := d.runOnce(context.Background())
 	if err == nil {
 		t.Error("expected error for unreachable controller")
 	}
@@ -416,11 +389,8 @@ func TestDiscoveryRefreshReplacesOIDCProviders(t *testing.T) {
 	ctrl1, _ := mockControllerAndIDPs(t, signers1)
 
 	reg := NewProviderRegistry()
-	d, err := NewDiscovery(ControllerConfig{APIURL: ctrl1.URL}, reg, nil, slog.Default())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := d.RunOnce(context.Background()); err != nil {
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl1.URL}, http.DefaultClient, reg, nil, slog.Default())
+	if err := d.runOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if reg.Len() != 1 {
@@ -434,7 +404,7 @@ func TestDiscoveryRefreshReplacesOIDCProviders(t *testing.T) {
 	ctrl2, _ := mockControllerAndIDPs(t, signers2)
 	d.cfg.APIURL = ctrl2.URL
 
-	if err := d.RunOnce(context.Background()); err != nil {
+	if err := d.runOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if reg.Len() != 1 {
@@ -445,5 +415,37 @@ func TestDiscoveryRefreshReplacesOIDCProviders(t *testing.T) {
 	}
 	if _, err := reg.Resolve("kc-old"); err == nil {
 		t.Error("kc-old should have been replaced")
+	}
+}
+
+// TestClientFromCABundle verifies that a client built from a CA bundle
+// trusts a server whose certificate that bundle issued.
+func TestClientFromCABundle(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(srv.Close)
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := clientFromCABundle(path)
+	if err != nil {
+		t.Fatalf("clientFromCABundle: %v", err)
+	}
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET with the bundle's client: %v", err)
+	}
+	resp.Body.Close()
+
+	if _, err := http.Get(srv.URL); err == nil {
+		t.Error("default client trusted the test server; the test proves nothing")
+	}
+	if err := os.WriteFile(path, []byte("not pem"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := clientFromCABundle(path); err == nil {
+		t.Error("clientFromCABundle accepted a file with no certificates")
 	}
 }

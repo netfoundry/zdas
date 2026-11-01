@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -47,7 +48,7 @@ func loadIdentityFile(path string) (*parsedIdentity, error) {
 	caPEM := strings.TrimPrefix(idFile.ID.CA, "pem:")
 
 	if certPEM == "" || keyPEM == "" {
-		return nil, fmt.Errorf("identity file missing cert or key")
+		return nil, errors.New("identity file missing cert or key")
 	}
 
 	tlsCert, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
@@ -64,7 +65,7 @@ func loadIdentityFile(path string) (*parsedIdentity, error) {
 	}
 	if caPEM != "" {
 		if !caPool.AppendCertsFromPEM([]byte(caPEM)) {
-			return nil, fmt.Errorf("no valid certificates in identity file CA")
+			return nil, errors.New("no valid certificates in identity file CA")
 		}
 	}
 
@@ -79,30 +80,17 @@ func loadIdentityFile(path string) (*parsedIdentity, error) {
 // the identity file but does not present a client certificate. This is used
 // for unauthenticated calls to the public Edge Client API.
 func discoveryClientFromIdentity(id *parsedIdentity) *http.Client {
-	tlsCfg := &tls.Config{}
-	if id.CAPool != nil {
-		tlsCfg.RootCAs = id.CAPool
-	}
-	return &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: tlsCfg},
-	}
+	return tlsClient(&tls.Config{RootCAs: id.CAPool})
 }
 
 // managementClientFromIdentity builds an HTTP client with mTLS: the CA pool
 // verifies the controller, and the client certificate authenticates ZDAS. This
 // is used for the POST /authenticate call and subsequent management API calls.
 func managementClientFromIdentity(id *parsedIdentity) *http.Client {
-	tlsCfg := &tls.Config{
+	return tlsClient(&tls.Config{
 		Certificates: []tls.Certificate{id.TLSCert},
-	}
-	if id.CAPool != nil {
-		tlsCfg.RootCAs = id.CAPool
-	}
-	return &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: tlsCfg},
-	}
+		RootCAs:      id.CAPool,
+	})
 }
 
 // apiSession holds the result of a POST /authenticate call.
@@ -114,9 +102,9 @@ type apiSession struct {
 // authenticateSession performs a certificate-based authentication against the
 // Ziti controller management API. It returns a session token that must be
 // passed as the zt-session header on subsequent management API calls.
-func authenticateSession(client *http.Client, apiURL string) (*apiSession, error) {
+func authenticateSession(ctx context.Context, client *http.Client, apiURL string) (*apiSession, error) {
 	authURL := strings.TrimSuffix(apiURL, "/") + "/authenticate?method=cert"
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, authURL, strings.NewReader("{}"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, authURL, strings.NewReader("{}"))
 	if err != nil {
 		return nil, fmt.Errorf("build authenticate request: %w", err)
 	}
@@ -139,11 +127,15 @@ func authenticateSession(client *http.Client, apiURL string) (*apiSession, error
 			ExpirationSeconds *int    `json:"expirationSeconds"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	body, err := readResponseBody(resp)
+	if err != nil {
+		return nil, fmt.Errorf("read authenticate response: %w", err)
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("parse authenticate response: %w", err)
 	}
 	if result.Data.Token == nil || *result.Data.Token == "" {
-		return nil, fmt.Errorf("api session token was empty")
+		return nil, errors.New("api session token was empty")
 	}
 
 	expiresAt := time.Now().Add(25 * time.Minute) // default

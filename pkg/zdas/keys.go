@@ -1,9 +1,11 @@
 package zdas
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,9 +22,10 @@ import (
 // survive restarts, load their own key with NewKeySet and pass it to
 // WithKeySet.
 type KeySet struct {
-	private   *ecdsa.PrivateKey
-	publicJWK jwk.Key
-	kid       string
+	private    *ecdsa.PrivateKey
+	privateJWK jwk.Key // signs tokens, with kid and alg set
+	publicJWK  jwk.Key
+	kid        string
 }
 
 // GenerateKeySet creates a fresh EC P-256 key pair and wraps it in a KeySet.
@@ -64,11 +67,11 @@ func NewKeySet(priv *ecdsa.PrivateKey) (*KeySet, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wrap public key as jwk: %w", err)
 	}
-	thumb, err := pub.Thumbprint(jwkThumbprintHash)
+	thumb, err := pub.Thumbprint(crypto.SHA256) // RFC 7638
 	if err != nil {
 		return nil, fmt.Errorf("compute jwk thumbprint: %w", err)
 	}
-	kid := base64urlNoPad(thumb)
+	kid := base64.RawURLEncoding.EncodeToString(thumb)
 	if err := pub.Set(jwk.KeyIDKey, kid); err != nil {
 		return nil, fmt.Errorf("set kid: %w", err)
 	}
@@ -78,7 +81,17 @@ func NewKeySet(priv *ecdsa.PrivateKey) (*KeySet, error) {
 	if err := pub.Set(jwk.KeyUsageKey, "sig"); err != nil {
 		return nil, fmt.Errorf("set use: %w", err)
 	}
-	return &KeySet{private: priv, publicJWK: pub, kid: kid}, nil
+	signing, err := jwk.FromRaw(priv)
+	if err != nil {
+		return nil, fmt.Errorf("wrap private key as jwk: %w", err)
+	}
+	if err := signing.Set(jwk.KeyIDKey, kid); err != nil {
+		return nil, fmt.Errorf("set signing kid: %w", err)
+	}
+	if err := signing.Set(jwk.AlgorithmKey, jwa.ES256); err != nil {
+		return nil, fmt.Errorf("set signing alg: %w", err)
+	}
+	return &KeySet{private: priv, privateJWK: signing, publicJWK: pub, kid: kid}, nil
 }
 
 // KID returns the key ID (JWK thumbprint) used to identify this key in JWS
@@ -88,14 +101,13 @@ func (ks *KeySet) KID() string { return ks.kid }
 // Private returns the raw ECDSA private key for signing operations.
 func (ks *KeySet) Private() *ecdsa.PrivateKey { return ks.private }
 
-// PublicJWK returns the public key as a jwk.Key with kid/alg/use set.
-func (ks *KeySet) PublicJWK() jwk.Key { return ks.publicJWK }
-
-// PublicJWKS returns the marshaled JWKS JSON containing this key alone. The
-// ZDAS JWKS endpoint also publishes any verify-only keys passed to WithKeySet,
-// so serve this only where no rotation is in progress.
-func (ks *KeySet) PublicJWKS() ([]byte, error) {
-	return publicJWKS([]*KeySet{ks})
+// JWKS returns the marshaled JWKS JSON publishing the public key of each set,
+// in order, with kid, alg and use set as the ZDAS JWKS endpoint sets them.
+// An embedder that serves keys on its own, for example to a controller that
+// cannot reach ZDAS, passes the active key and every verify-only key, as the
+// ZDAS endpoint does.
+func JWKS(sets ...*KeySet) ([]byte, error) {
+	return publicJWKS(sets)
 }
 
 // publicJWKS returns the marshaled JWKS JSON containing the public key of

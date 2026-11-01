@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -178,22 +179,19 @@ func LoadConfig(path string) (*Config, error) {
 	if err := cfg.applyEnv(); err != nil {
 		return nil, fmt.Errorf("apply env overrides: %w", err)
 	}
-	cfg.applyDefaults()
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
 }
 
-// ApplyDefaults fills in any unset fields with sensible defaults. Embedding
-// applications that construct Config directly (instead of using LoadConfig)
-// should call this before passing the config to NewServer or NewHandler.
-func (c *Config) ApplyDefaults() { c.applyDefaults() }
-
-// applyDefaults fills in any unset fields with sensible defaults. Called after
-// YAML parsing and env overrides so that explicit empty values from neither
-// source are replaced.
-func (c *Config) applyDefaults() {
+// ApplyDefaults fills in any unset fields with sensible defaults. LoadConfig
+// calls it after YAML parsing and env overrides, so that values neither
+// source set are replaced. Embedding applications that construct Config
+// directly must call it before passing the config to NewServer or
+// NewHandler.
+func (c *Config) ApplyDefaults() {
 	if c.Listen == "" {
 		c.Listen = ":18443"
 	}
@@ -207,7 +205,7 @@ func (c *Config) applyDefaults() {
 		c.Controller.SelfIssuer = c.ExternalURL
 	}
 	if c.Claims.UsernameClaim == "" {
-		c.Claims.UsernameClaim = "preferred_username"
+		c.Claims.UsernameClaim = preferredUsernameClaim
 	}
 	if c.Claims.NameTemplate == "" {
 		c.Claims.NameTemplate = "{username}-{device_name}"
@@ -257,8 +255,8 @@ func (c *Config) applyDefaults() {
 
 // Validate returns an error if the configuration is incomplete or inconsistent.
 func (c *Config) Validate() error {
-	if c.ExternalURL == "" {
-		return errors.New("external_url is required")
+	if err := c.checkRequired(); err != nil {
+		return err
 	}
 	if !strings.HasPrefix(c.ExternalURL, "http://") && !strings.HasPrefix(c.ExternalURL, "https://") {
 		return errors.New("external_url must be an http(s) URL")
@@ -309,9 +307,6 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("providers[%d] (%s): unknown type %q", i, p.Name, p.Type)
 		}
 	}
-	if c.Token.Audience == "" {
-		return errors.New("token.audience is required")
-	}
 	if !strings.Contains(c.Claims.NameTemplate, "{username}") || !strings.Contains(c.Claims.NameTemplate, "{device_name}") {
 		return errors.New("claims.name_template must contain both {username} and {device_name}")
 	}
@@ -340,6 +335,28 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// checkRequired returns an error for a setting NewServer cannot work
+// without. ApplyDefaults fills in all but external_url, so a config that
+// fails here usually skipped it: with a zero token expiry or session timeout,
+// every token and session would be expired on arrival.
+func (c *Config) checkRequired() error {
+	switch {
+	case c.ExternalURL == "":
+		return errors.New("external_url is required")
+	case c.Token.Issuer == "":
+		return errors.New("token.issuer is required")
+	case c.Token.Audience == "":
+		return errors.New("token.audience is required")
+	case c.Token.Expiry <= 0:
+		return errors.New("token.expiry must be positive")
+	case c.Session.Timeout <= 0:
+		return errors.New("session.timeout must be positive")
+	case c.Session.CodeExpiry <= 0:
+		return errors.New("session.code_expiry must be positive")
+	}
+	return nil
+}
+
 // applyEnv overlays ZDAS_* environment variables onto the config. Only scalar
 // fields are supported. Provider secrets are overridable per-provider via
 // ZDAS_PROVIDER_<NAME>_CLIENT_ID and ZDAS_PROVIDER_<NAME>_CLIENT_SECRET where
@@ -363,7 +380,9 @@ func (c *Config) applyEnv() error {
 		return err
 	}
 
-	setBool(&c.Fallback.Enabled, "ZDAS_FALLBACK_ENABLED")
+	if err := setBool(&c.Fallback.Enabled, "ZDAS_FALLBACK_ENABLED"); err != nil {
+		return err
+	}
 	setString(&c.Fallback.TempNameTemplate, "ZDAS_FALLBACK_TEMP_NAME_TEMPLATE")
 	if err := setDuration(&c.Fallback.PollInterval, "ZDAS_FALLBACK_POLL_INTERVAL"); err != nil {
 		return err
@@ -405,12 +424,27 @@ func setString(dst *string, key string) {
 	}
 }
 
-func setBool(dst *bool, key string) {
+// setBool sets dst from env var key, accepting what strconv.ParseBool does
+// plus "yes" and "no".
+func setBool(dst *bool, key string) error {
 	v, ok := os.LookupEnv(key)
 	if !ok {
-		return
+		return nil
 	}
-	*dst = v == "true" || v == "1" || v == "yes"
+	switch strings.ToLower(v) {
+	case "yes":
+		*dst = true
+		return nil
+	case "no":
+		*dst = false
+		return nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fmt.Errorf("%s: %w", key, err)
+	}
+	*dst = b
+	return nil
 }
 
 func setDuration(dst *time.Duration, key string) error {

@@ -68,7 +68,7 @@ func generateTestIdentityFile(t *testing.T, apiURL string) string {
 	}
 	clientKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 
-	idFile := map[string]interface{}{
+	idFile := map[string]any{
 		"ztAPI": apiURL,
 		"id": map[string]string{
 			"cert": string(clientCertPEM),
@@ -130,7 +130,7 @@ func TestLoadIdentityFileWithPEMPrefix(t *testing.T) {
 	keyDER, _ := x509.MarshalECPrivateKey(clientKey)
 	keyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
 
-	idFile := map[string]interface{}{
+	idFile := map[string]any{
 		"ztAPI": "https://ctrl:1280",
 		"id": map[string]string{
 			"cert": "pem:" + certPEM,
@@ -169,7 +169,7 @@ func TestLoadIdentityFileMalformedJSON(t *testing.T) {
 }
 
 func TestLoadIdentityFileMissingCert(t *testing.T) {
-	idFile := map[string]interface{}{
+	idFile := map[string]any{
 		"ztAPI": "https://ctrl:1280",
 		"id": map[string]string{
 			"key": "some-key",
@@ -223,7 +223,7 @@ func TestAuthenticateSession(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	session, err := authenticateSession(server.Client(), server.URL)
+	session, err := authenticateSession(t.Context(), server.Client(), server.URL)
 	if err != nil {
 		t.Fatalf("authenticateSession: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestAuthenticateSessionError(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	_, err := authenticateSession(server.Client(), server.URL)
+	_, err := authenticateSession(t.Context(), server.Client(), server.URL)
 	if err == nil || !strings.Contains(err.Error(), "401") {
 		t.Errorf("expected auth error, got %v", err)
 	}

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 )
 
@@ -22,11 +21,15 @@ type DeviceInfo struct {
 	OSVersion  string // from os_version param
 }
 
+// preferredUsernameClaim is the claim ZDAS puts the user's name in, and the
+// default claim it reads the name from upstream.
+const preferredUsernameClaim = "preferred_username"
+
 // ComposeClaims builds the full set of JWT claims for a ZDAS token. When nonce
 // is empty, it uses the primary path (device_name from tunneler). When nonce is
 // non-empty, it uses the fallback path (temporary name with a nonce-based
 // external ID) regardless of whether info is populated.
-func ComposeClaims(cfg ClaimsConfig, fbCfg FallbackConfig, identity *UpstreamIdentity, info *DeviceInfo, nonce string) map[string]interface{} {
+func ComposeClaims(cfg ClaimsConfig, fbCfg FallbackConfig, identity *UpstreamIdentity, info *DeviceInfo, nonce string) map[string]any {
 	username := resolveUsername(cfg.UsernameClaim, identity)
 
 	var identityName, externalID, deviceName string
@@ -42,28 +45,29 @@ func ComposeClaims(cfg ClaimsConfig, fbCfg FallbackConfig, identity *UpstreamIde
 		deviceName = ""
 	}
 
-	claims := map[string]interface{}{
-		cfg.IdentityNameClaim: identityName,
-		cfg.ExternalIDClaim:   externalID,
-		"sub":                 externalID, // per spec: sub = device_external_id
-		"upstream_sub":        identity.Subject,
-		"upstream_iss":        identity.Issuer,
-		"preferred_username":  username,
-		"device_name":         deviceName,
+	claims := map[string]any{
+		cfg.IdentityNameClaim:  identityName,
+		cfg.ExternalIDClaim:    externalID,
+		"sub":                  externalID, // per spec: sub = device_external_id
+		"upstream_sub":         identity.Subject,
+		"upstream_iss":         identity.Issuer,
+		preferredUsernameClaim: username,
+		"device_name":          deviceName,
 	}
 	return claims
 }
 
 // expandFallbackTemplate replaces {username} and {nonce_short} in the fallback
-// name template.
+// name template, in one pass so that a value containing a placeholder is not
+// expanded again.
 func expandFallbackTemplate(tmpl, username, nonce string) string {
-	s := strings.ReplaceAll(tmpl, "{username}", username)
-	s = strings.ReplaceAll(s, "{nonce_short}", nonce)
-	return s
+	return strings.NewReplacer("{username}", username, "{nonce_short}", nonce).Replace(tmpl)
 }
 
 // MintToken signs a ZDAS JWT with the given claims, token config, and key set.
-func MintToken(cfg TokenConfig, claims map[string]interface{}, ks *KeySet) (string, error) {
+// It fails if a claim has a value its registered type does not allow, such as
+// a non-string sub, rather than leaving the claim out.
+func MintToken(cfg TokenConfig, claims map[string]any, ks *KeySet) (string, error) {
 	now := time.Now()
 	tok := jwt.New()
 
@@ -71,21 +75,22 @@ func MintToken(cfg TokenConfig, claims map[string]interface{}, ks *KeySet) (stri
 	// neither the provisioner hook nor CompleteProvision can tamper with
 	// iss, aud, iat, or exp.
 	for k, v := range claims {
-		_ = tok.Set(k, v)
+		if err := tok.Set(k, v); err != nil {
+			return "", fmt.Errorf("set claim %q: %w", k, err)
+		}
 	}
-	_ = tok.Set(jwt.IssuerKey, cfg.Issuer)
-	_ = tok.Set(jwt.AudienceKey, cfg.Audience)
-	_ = tok.Set(jwt.IssuedAtKey, now)
-	_ = tok.Set(jwt.ExpirationKey, now.Add(cfg.Expiry))
-
-	privJWK, err := jwk.FromRaw(ks.Private())
-	if err != nil {
-		return "", fmt.Errorf("wrap signing key: %w", err)
+	for k, v := range map[string]any{
+		jwt.IssuerKey:     cfg.Issuer,
+		jwt.AudienceKey:   cfg.Audience,
+		jwt.IssuedAtKey:   now,
+		jwt.ExpirationKey: now.Add(cfg.Expiry),
+	} {
+		if err := tok.Set(k, v); err != nil {
+			return "", fmt.Errorf("set claim %q: %w", k, err)
+		}
 	}
-	_ = privJWK.Set(jwk.KeyIDKey, ks.KID())
-	_ = privJWK.Set(jwk.AlgorithmKey, jwa.ES256)
 
-	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256, privJWK))
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256, ks.privateJWK))
 	if err != nil {
 		return "", fmt.Errorf("sign jwt: %w", err)
 	}
@@ -109,18 +114,27 @@ func resolveUsername(claim string, identity *UpstreamIdentity) string {
 }
 
 // expandTemplate replaces placeholders in the name template with values from
-// the username and device info.
+// the username and device info, in one pass so that a value containing a
+// placeholder is not expanded again.
 func expandTemplate(tmpl, username string, info *DeviceInfo) string {
-	s := strings.ReplaceAll(tmpl, "{username}", username)
-	s = strings.ReplaceAll(s, "{device_name}", info.DeviceName)
-	s = strings.ReplaceAll(s, "{hostname}", info.Hostname)
-	s = strings.ReplaceAll(s, "{os}", info.OS)
-	s = strings.ReplaceAll(s, "{arch}", info.Arch)
-	return s
+	return strings.NewReplacer(
+		"{username}", username,
+		"{device_name}", info.DeviceName,
+		"{hostname}", info.Hostname,
+		"{os}", info.OS,
+		"{arch}", info.Arch,
+	).Replace(tmpl)
 }
 
 // computeExternalID returns the hex-encoded SHA-256 of issuer:subject:device,
-// ensuring uniqueness across providers, users, and devices.
+// unique across providers, users, and devices.
+//
+// The fields are joined by ':' without escaping, so the input is only
+// unambiguous because /authorize rejects a device name containing ':'.
+// Subjects and issuers can still contain ':', so two providers whose
+// issuers differ only by a port, such as https://idp and https://idp:8443,
+// could in principle collide for a subject that starts with the port.
+// Changing the encoding would change every existing device's external ID.
 func computeExternalID(issuer, subject, deviceName string) string {
 	raw := issuer + ":" + subject + ":" + deviceName
 	h := sha256.Sum256([]byte(raw))

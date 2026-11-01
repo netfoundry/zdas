@@ -143,3 +143,17 @@ func TestRegistrySetOIDCProvidersCollision(t *testing.T) {
 		t.Errorf("expected collision error, got %v", err)
 	}
 }
+
+// TestRegistryResolveAmbiguousIssuer verifies that an issuer shared by two
+// providers resolves to neither, rather than to whichever map order gives.
+func TestRegistryResolveAmbiguousIssuer(t *testing.T) {
+	reg := NewProviderRegistry()
+	_ = reg.Register(&stubProvider{name: "gh-a", issuer: "https://github.com"})
+	_ = reg.Register(&stubProvider{name: "gh-b", issuer: "https://github.com"})
+	if p, err := reg.Resolve("https://github.com"); err == nil {
+		t.Errorf("Resolve = %s, want an ambiguity error", p.Name())
+	}
+	if p, err := reg.Resolve("gh-b"); err != nil || p.Name() != "gh-b" {
+		t.Errorf("Resolve by name = %v, %v; want gh-b", p, err)
+	}
+}

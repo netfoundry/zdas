@@ -31,7 +31,7 @@ func TestGenerateKeySet(t *testing.T) {
 	}
 
 	// Public JWK should carry the right metadata.
-	k := ks.PublicJWK()
+	k := ks.publicJWK
 	if k.KeyType().String() != "EC" {
 		t.Errorf("key type = %q, want EC", k.KeyType())
 	}
@@ -49,14 +49,14 @@ func TestGenerateKeySet(t *testing.T) {
 	}
 }
 
-func TestPublicJWKS(t *testing.T) {
+func TestJWKS(t *testing.T) {
 	ks, err := GenerateKeySet()
 	if err != nil {
 		t.Fatalf("GenerateKeySet: %v", err)
 	}
-	data, err := ks.PublicJWKS()
+	data, err := JWKS(ks)
 	if err != nil {
-		t.Fatalf("PublicJWKS: %v", err)
+		t.Fatalf("JWKS: %v", err)
 	}
 
 	// Must be valid JSON with a "keys" array containing one element.
@@ -96,9 +96,9 @@ func TestSignAndVerifyRoundtrip(t *testing.T) {
 	}
 
 	// Verify using just the public JWKS (what the controller would do).
-	jwksBytes, err := ks.PublicJWKS()
+	jwksBytes, err := JWKS(ks)
 	if err != nil {
-		t.Fatalf("PublicJWKS: %v", err)
+		t.Fatalf("JWKS: %v", err)
 	}
 	pubSet, err := jwk.Parse(jwksBytes)
 	if err != nil {
@@ -198,9 +198,9 @@ func TestNewKeySetJWKSRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewKeySet: %v", err)
 	}
-	data, err := ks.PublicJWKS()
+	data, err := JWKS(ks)
 	if err != nil {
-		t.Fatalf("PublicJWKS: %v", err)
+		t.Fatalf("JWKS: %v", err)
 	}
 	set, err := jwk.Parse(data)
 	if err != nil {
@@ -248,7 +248,7 @@ func TestPublicJWKSMultipleKeys(t *testing.T) {
 		if _, ok := pubSet.LookupKeyID(ks.KID()); !ok {
 			t.Errorf("key %d: kid %q not in JWKS", i, ks.KID())
 		}
-		signed, err := MintToken(tokenCfg, map[string]interface{}{"sub": "x"}, ks)
+		signed, err := MintToken(tokenCfg, map[string]any{"sub": "x"}, ks)
 		if err != nil {
 			t.Fatalf("key %d: MintToken: %v", i, err)
 		}

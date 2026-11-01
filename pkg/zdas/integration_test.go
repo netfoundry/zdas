@@ -20,7 +20,7 @@ import (
 // flow using a mock Ziti controller and a mock OIDC provider.
 func TestIntegrationOIDCFlow(t *testing.T) {
 	// 1. Stand up a mock OIDC IdP.
-	idpClaims := map[string]interface{}{
+	idpClaims := map[string]any{
 		"sub":                "oidc-user-42",
 		"preferred_username": "alice",
 		"name":               "Alice Smith",
@@ -77,7 +77,7 @@ func TestIntegrationOIDCFlow(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	// Run initial discovery (discovers the OIDC provider).
-	if err := srv.discovery.RunOnce(t.Context()); err != nil {
+	if err := srv.discovery.runOnce(t.Context()); err != nil {
 		t.Fatalf("discovery: %v", err)
 	}
 	t.Cleanup(func() {
@@ -158,7 +158,7 @@ func TestIntegrationOIDCFlow(t *testing.T) {
 		t.Fatalf("token: status = %d, body = %s", w.Code, w.Body.String())
 	}
 
-	var tokenResp map[string]interface{}
+	var tokenResp map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &tokenResp); err != nil {
 		t.Fatalf("unmarshal token response: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestIntegrationOIDCFlow(t *testing.T) {
 
 	// 7. Verify the JWT.
 	rawJWT := tokenResp["id_token"].(string)
-	jwksBytes, _ := srv.keys.PublicJWKS()
+	jwksBytes, _ := JWKS(srv.handlers.keys)
 	pubSet, _ := jwk.Parse(jwksBytes)
 	tok, err := jwt.Parse([]byte(rawJWT), jwt.WithKeySet(pubSet, jws.WithInferAlgorithmFromKey(true)))
 	if err != nil {
@@ -198,7 +198,7 @@ func TestIntegrationOIDCFlow(t *testing.T) {
 // TestIntegrationGitHubFlow tests the flow with a GitHub provider.
 func TestIntegrationGitHubFlow(t *testing.T) {
 	// Mock GitHub API.
-	githubUser := map[string]interface{}{
+	githubUser := map[string]any{
 		"id":    float64(77777),
 		"login": "bobdev",
 		"name":  "Bob Developer",
@@ -254,7 +254,7 @@ func TestIntegrationGitHubFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	if err := srv.discovery.RunOnce(t.Context()); err != nil {
+	if err := srv.discovery.runOnce(t.Context()); err != nil {
 		t.Fatalf("discovery: %v", err)
 	}
 	t.Cleanup(func() { srv.store.Stop() })
@@ -267,7 +267,7 @@ func TestIntegrationGitHubFlow(t *testing.T) {
 	ghp := ghProv.(*GitHubProvider)
 	ghp.authBaseURL = ghServer.URL + "/login/oauth/authorize"
 	ghp.tokenBaseURL = ghServer.URL + "/login/oauth/access_token"
-	ghp.apiBaseURL = ghServer.URL + "/user"
+	ghp.userURL = ghServer.URL + "/user"
 
 	mux := srv.handlers.Mux()
 
@@ -316,11 +316,11 @@ func TestIntegrationGitHubFlow(t *testing.T) {
 		t.Fatalf("token: status = %d, body = %s", w.Code, w.Body.String())
 	}
 
-	var tokenResp map[string]interface{}
+	var tokenResp map[string]any
 	json.Unmarshal(w.Body.Bytes(), &tokenResp)
 	rawJWT := tokenResp["id_token"].(string)
 
-	jwksBytes, _ := srv.keys.PublicJWKS()
+	jwksBytes, _ := JWKS(srv.handlers.keys)
 	pubSet, _ := jwk.Parse(jwksBytes)
 	tok, err := jwt.Parse([]byte(rawJWT), jwt.WithKeySet(pubSet, jws.WithInferAlgorithmFromKey(true)))
 	if err != nil {
@@ -341,7 +341,7 @@ func TestIntegrationGitHubFlow(t *testing.T) {
 // fallback is enabled. The JWT should have a pending-style name and
 // nonce-based external ID.
 func TestIntegrationFallbackFlow(t *testing.T) {
-	idpClaims := map[string]interface{}{
+	idpClaims := map[string]any{
 		"sub":                "fallback-user",
 		"preferred_username": "charlie",
 	}
@@ -399,16 +399,16 @@ func TestIntegrationFallbackFlow(t *testing.T) {
 	// Build server components manually (no identity file needed for this test).
 	keys, _ := GenerateKeySet()
 	registry := NewProviderRegistry()
-	store := NewSessionStore(cfg.Session.Timeout, cfg.Session.CodeExpiry)
+	store := newSessionStore(cfg.Session.Timeout, cfg.Session.CodeExpiry)
 	t.Cleanup(store.Stop)
 
-	disc, _ := NewDiscovery(cfg.Controller, registry, nil, slog.Default())
-	if err := disc.RunOnce(t.Context()); err != nil {
+	disc := newSignerDiscovery(cfg.Controller, http.DefaultClient, registry, nil, slog.Default())
+	if err := disc.runOnce(t.Context()); err != nil {
 		t.Fatalf("discovery: %v", err)
 	}
 
 	// No reconciler in this test (no identity file), but fallback is enabled.
-	h := NewHandlers(cfg, keys, registry, store, nil, nil, nil, slog.Default())
+	h := newTestEndpoints(cfg, keys, registry, store, nil)
 	mux := h.Mux()
 
 	// Tunneler sends /authorize WITHOUT device_name.
@@ -458,11 +458,11 @@ func TestIntegrationFallbackFlow(t *testing.T) {
 		t.Fatalf("token: status = %d, body = %s", w.Code, w.Body.String())
 	}
 
-	var tokenResp map[string]interface{}
+	var tokenResp map[string]any
 	json.Unmarshal(w.Body.Bytes(), &tokenResp)
 	rawJWT := tokenResp["id_token"].(string)
 
-	jwksBytes, _ := keys.PublicJWKS()
+	jwksBytes, _ := JWKS(keys)
 	pubSet, _ := jwk.Parse(jwksBytes)
 	tok, err := jwt.Parse([]byte(rawJWT), jwt.WithKeySet(pubSet, jws.WithInferAlgorithmFromKey(true)))
 	if err != nil {
@@ -533,7 +533,7 @@ func newReplica(t *testing.T, cfg Config, opts ...Option) (*Server, http.Handler
 			Subject:  "u42",
 			Username: "alice",
 			Issuer:   "https://mock-idp",
-			Raw:      map[string]interface{}{"preferred_username": "alice"},
+			Raw:      map[string]any{"preferred_username": "alice"},
 		},
 	}); err != nil {
 		t.Fatal(err)
