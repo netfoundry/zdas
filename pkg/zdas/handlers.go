@@ -339,6 +339,14 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	var claims map[string]any
 	if h.provisioner != nil {
+		// Choose the pending ID up front so the provisioner can record it;
+		// the entry is stored only if Provision redirects.
+		pendingID, err := randomID()
+		if err != nil {
+			h.logger.Error("generate pending id", "error", err)
+			oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, "server_error", "internal error")
+			return
+		}
 		req := ProvisionRequest{
 			Email:            identity.Email,
 			Name:             identity.Username,
@@ -354,6 +362,7 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 			Arch:             sess.DeviceInfo.Arch,
 			OSRelease:        sess.DeviceInfo.OSRelease,
 			OSVersion:        sess.DeviceInfo.OSVersion,
+			PendingID:        pendingID,
 		}
 		result, err := h.provisioner.Provision(r.Context(), req)
 		if err == nil && (result == nil || (len(result.Claims) == 0 && result.RedirectURL == "")) {
@@ -365,7 +374,7 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(result.Claims) == 0 {
 			// Interactive provisioning - stash session state and redirect.
-			pendingID, err := h.createPendingProvision(r.Context(), &PendingProvision{
+			err := h.createPendingProvision(r.Context(), pendingID, &PendingProvision{
 				TunnelerRedirectURI:         sess.TunnelerRedirectURI,
 				TunnelerState:               sess.TunnelerState,
 				TunnelerCodeChallenge:       sess.TunnelerCodeChallenge,
@@ -664,17 +673,12 @@ func (h *endpoints) createCode(ctx context.Context, ac *AuthCode) (string, error
 	return code, nil
 }
 
-// createPendingProvision is createSession for pending provisions.
-func (h *endpoints) createPendingProvision(ctx context.Context, pp *PendingProvision) (string, error) {
-	id, err := randomID()
-	if err != nil {
-		return "", err
-	}
+// createPendingProvision stamps pp with the current time and stores it under
+// id, which the caller chose with randomID so it could pass it to the
+// provisioner first.
+func (h *endpoints) createPendingProvision(ctx context.Context, id string, pp *PendingProvision) error {
 	pp.CreatedAt = time.Now()
-	if err := h.store.CreatePendingProvision(ctx, h.storeKey(kindProvision, id), pp); err != nil {
-		return "", err
-	}
-	return id, nil
+	return h.store.CreatePendingProvision(ctx, h.storeKey(kindProvision, id), pp)
 }
 
 // consumeSession consumes an auth session and treats one that is no longer

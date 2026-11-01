@@ -184,16 +184,18 @@ func (h *Handler) Stop() {
 // CompleteProvision finishes an enrollment that the provisioner sent to an
 // interactive page with ProvisionResult.RedirectURL. The embedding
 // application calls it from its own handler for that page, with the
-// pending_id ZDAS added to the redirect URL and the outcome of its
-// provisioning: the claims to mint, or an error, which follows the same
-// rules as an error from Provision and takes precedence over claims. It
-// consumes the pending provision and redirects the browser back to the
-// tunneler, or responds 400 when the pending provision is missing or
-// expired.
+// enrollment's pending ID and the outcome of its provisioning: the claims
+// to mint, or an error, which follows the same rules as an error from
+// Provision and takes precedence over claims. It consumes the pending
+// provision and redirects the browser back to the tunneler, or responds 400
+// when the pending provision is missing or expired.
 //
-// The claims must come from the application's own state, never from the
-// request: the user enrolling holds the pending ID, so claims taken from
-// the browser would let that user enroll as any identity.
+// Both the claims and the pending ID must come from the application's own
+// state, never from the request. Pass the ProvisionRequest.PendingID the
+// provisioner recorded for the user it authenticated, not the pending_id
+// query parameter: the user enrolling can change the URL, and could
+// otherwise send someone else's pending ID, or choose claims for any
+// identity.
 func (h *Handler) CompleteProvision(w http.ResponseWriter, r *http.Request, pendingID string, claims map[string]any, err error) {
 	h.srv.handlers.completeProvision(w, r, pendingID, claims, err)
 }

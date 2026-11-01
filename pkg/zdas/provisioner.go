@@ -82,6 +82,15 @@ type ProvisionRequest struct {
 	// True when the tunneler didn't send device info (fallback path).
 	IsFallback    bool
 	FallbackNonce string
+
+	// PendingID is the ID ZDAS stores the enrollment under if Provision
+	// returns a RedirectURL. ZDAS also adds it to that URL as pending_id,
+	// but the user's browser can change a URL. A provisioner that redirects
+	// should record PendingID with its own state for this enrollment, tied
+	// to the user it authenticated, and pass the recorded value to
+	// Handler.CompleteProvision. That way a pending ID from someone else's
+	// enrollment cannot be paired with this user's claims.
+	PendingID string
 }
 
 // ProvisionResult tells ZDAS how to proceed after provisioning.
