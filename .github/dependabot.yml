@@ -1,0 +1,13 @@
+# Updates for the pinned GitHub Actions and the Go modules. Actions are
+# pinned to commit SHAs, so without this they would never move; every
+# update is a PR that CI, including govulncheck, checks first.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
