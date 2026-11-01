@@ -37,8 +37,8 @@ func seedSession(t *testing.T, h *endpoints, sess *AuthSession) string {
 // returns its pending ID.
 func seedPendingProvision(t *testing.T, h *endpoints, pp *PendingProvision) string {
 	t.Helper()
-	id, err := h.createPendingProvision(context.Background(), pp)
-	if err != nil {
+	id := mustID(t)
+	if err := h.createPendingProvision(context.Background(), id, pp); err != nil {
 		t.Fatalf("createPendingProvision: %v", err)
 	}
 	return id

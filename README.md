@@ -129,7 +129,7 @@ handler, err := zdas.NewHandler(cfg, logger,
 
 `WithKeySet` documents how to rotate keys across replicas, and `zdastest.TestStore` is a conformance suite for your `Store` implementation.
 
-A provisioner (`zdas.WithProvisioner`) can send the browser to a page of yours, such as a network picker, by returning `ProvisionResult.RedirectURL`. ZDAS adds a `pending_id` query parameter, and your handler for the page finishes the flow with `handler.CompleteProvision(w, r, pendingID, claims, err)`. Take the claims from your own server-side state, never from the request: the user enrolling holds the pending ID.
+A provisioner (`zdas.WithProvisioner`) can send the browser to a page of yours, such as a network picker, by returning `ProvisionResult.RedirectURL`. ZDAS passes the enrollment's pending ID to your provisioner as `ProvisionRequest.PendingID`; record it with your own state for the user you authenticated. Your handler for the page finishes the flow with `handler.CompleteProvision(w, r, pendingID, claims, err)`, passing the pending ID you recorded. Take both the pending ID and the claims from your own server-side state, never from the request: the user enrolling can change the URL. ZDAS also adds the ID to the redirect as `pending_id`, for compatibility.
 
 If someone you do not fully trust chooses the upstream issuers, such as a tenant admin in a multi-tenant service, pass `zdas.WithUpstreamHTTPClient(client)` so that discovery, signing keys, token exchanges and userinfo all go through a client you control, for example one whose dialer refuses internal addresses. `OIDCProviderConfig.HTTPClient` does the same for a provider used on its own. A refused token exchange is a `*zdas.TokenError`, whose `StatusCode` can be shown without the reply.
 

@@ -827,3 +827,65 @@ func TestCallbackDoesNotTrackFailedEnrollment(t *testing.T) {
 		t.Errorf("pendingCount = %d, want 0 for a failed enrollment", n)
 	}
 }
+
+// TestProvisionerReceivesPendingID verifies that Provision sees the pending
+// ID before it redirects, that it matches the pending_id on the redirect and
+// completes the enrollment, and that no pending entry is stored when
+// Provision returns claims instead.
+func TestProvisionerReceivesPendingID(t *testing.T) {
+	var got []string
+	redirect := true
+	p := provisionerFunc(func(_ context.Context, req ProvisionRequest) (*ProvisionResult, error) {
+		got = append(got, req.PendingID)
+		if redirect {
+			return &ProvisionResult{RedirectURL: "https://embedder.example.com/pick"}, nil
+		}
+		return &ProvisionResult{Claims: map[string]any{"sub": "x", "device_external_id": "x"}}, nil
+	})
+	ks, _ := GenerateKeySet()
+	reg := NewProviderRegistry()
+	_ = reg.Register(&callbackProvider{
+		name:     "mock-idp",
+		issuer:   "https://mock-idp",
+		identity: &UpstreamIdentity{Subject: "u1", Username: "alice", Issuer: "https://mock-idp"},
+	})
+	store := newMemStore(10*time.Minute, time.Minute, storeSweepInterval)
+	t.Cleanup(store.stop)
+	cfg := Config{
+		ExternalURL: "https://zdas.test",
+		Claims:      defaultClaimsConfig(),
+		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
+	}
+	h := newTestEndpoints(cfg, ks, reg, store, p)
+	callback := func() *httptest.ResponseRecorder {
+		sessID := seedSession(t, h, &AuthSession{
+			TunnelerRedirectURI:  "http://localhost:20314/auth/callback",
+			TunnelerState:        "tstate",
+			DeviceInfo:           &DeviceInfo{DeviceName: "laptop"},
+			UpstreamProviderName: "mock-idp",
+		})
+		w := httptest.NewRecorder()
+		h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+		return w
+	}
+
+	w := callback()
+	pick, err := url.Parse(w.Header().Get("Location"))
+	if err != nil || len(got) != 1 || !validID(got[0]) {
+		t.Fatalf("Provision saw pending IDs %q; Location %q", got, w.Header().Get("Location"))
+	}
+	if pick.Query().Get("pending_id") != got[0] {
+		t.Errorf("redirect pending_id = %q, Provision saw %q", pick.Query().Get("pending_id"), got[0])
+	}
+	if done := completeProvision(h, got[0], map[string]any{"sub": "x", "device_external_id": "x"}, nil); done.Code != http.StatusFound {
+		t.Errorf("CompleteProvision with the recorded ID: status = %d, body = %s", done.Code, done.Body.String())
+	}
+
+	redirect = false
+	if w := callback(); w.Code != http.StatusFound {
+		t.Fatalf("callback with claims: status = %d", w.Code)
+	}
+	if pp := consumePending(h, got[1]); pp != nil {
+		t.Error("pending entry stored although Provision returned claims")
+	}
+}
