@@ -2,6 +2,7 @@ package zdas
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ type mockManagementAPI struct {
 	mu         sync.Mutex
 	identities map[string]mockIdentity
 	renamed    map[string]string // id -> new name
+	rejectAll  bool              // answer identity calls with 401
 }
 
 type mockIdentity struct {
@@ -37,21 +39,12 @@ func newMockManagementAPI(identities []mockIdentity) *mockManagementAPI {
 	return m
 }
 
-func (m *mockManagementAPI) setHostname(externalID, hostname string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if id, ok := m.identities[externalID]; ok {
-		id.Hostname = hostname
-		m.identities[externalID] = id
-	}
-}
-
 func (m *mockManagementAPI) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/authenticate", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"data": map[string]interface{}{
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
 				"token":             "mock-zt-session",
 				"expirationSeconds": 1800,
 			},
@@ -76,13 +69,18 @@ func (m *mockManagementAPI) handler() http.Handler {
 		filter := r.URL.Query().Get("filter")
 		m.mu.Lock()
 		defer m.mu.Unlock()
+		if m.rejectAll {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 
-		var results []map[string]interface{}
+		var results []map[string]any
 		for _, id := range m.identities {
 			// Simple filter match: check if the externalId is in the filter string.
 			if strings.Contains(filter, id.ExternalID) {
-				entry := map[string]interface{}{
-					"id": id.ID,
+				entry := map[string]any{
+					"id":         id.ID,
+					"externalId": id.ExternalID,
 				}
 				if id.Hostname != "" {
 					entry["envInfo"] = map[string]string{"hostname": id.Hostname}
@@ -91,13 +89,13 @@ func (m *mockManagementAPI) handler() http.Handler {
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"data": results})
+		json.NewEncoder(w).Encode(map[string]any{"data": results})
 	})
 	return mux
 }
 
 func TestReconcilerTrack(t *testing.T) {
-	r := NewReconciler(
+	r := newFallbackReconciler(
 		FallbackConfig{PollInterval: 10 * time.Second, Timeout: 1 * time.Hour},
 		defaultClaimsConfig(),
 		http.DefaultClient,
@@ -121,7 +119,7 @@ func TestReconcilerReconcileOneWithHostname(t *testing.T) {
 	server := httptest.NewServer(mock.handler())
 	t.Cleanup(server.Close)
 
-	r := NewReconciler(
+	r := newFallbackReconciler(
 		FallbackConfig{PollInterval: 100 * time.Millisecond, Timeout: 1 * time.Hour},
 		defaultClaimsConfig(),
 		server.Client(),
@@ -131,7 +129,7 @@ func TestReconcilerReconcileOneWithHostname(t *testing.T) {
 	r.sessionToken = "mock-zt-session"
 	r.sessionExpires = time.Now().Add(30 * time.Minute)
 
-	p := &PendingReconciliation{
+	p := &pendingReconciliation{
 		ExternalID: "ext-1",
 		Username:   "jsmith",
 		Nonce:      "abc123",
@@ -156,7 +154,7 @@ func TestReconcilerReconcileOneNoHostname(t *testing.T) {
 	server := httptest.NewServer(mock.handler())
 	t.Cleanup(server.Close)
 
-	r := NewReconciler(
+	r := newFallbackReconciler(
 		FallbackConfig{PollInterval: 100 * time.Millisecond, Timeout: 1 * time.Hour},
 		defaultClaimsConfig(),
 		server.Client(),
@@ -166,7 +164,7 @@ func TestReconcilerReconcileOneNoHostname(t *testing.T) {
 	r.sessionToken = "mock-zt-session"
 	r.sessionExpires = time.Now().Add(30 * time.Minute)
 
-	p := &PendingReconciliation{
+	p := &pendingReconciliation{
 		ExternalID: "ext-1",
 		Username:   "jsmith",
 		TrackedAt:  time.Now(),
@@ -185,7 +183,7 @@ func TestReconcilerReconcileOneNotFound(t *testing.T) {
 	server := httptest.NewServer(mock.handler())
 	t.Cleanup(server.Close)
 
-	r := NewReconciler(
+	r := newFallbackReconciler(
 		FallbackConfig{PollInterval: 100 * time.Millisecond, Timeout: 1 * time.Hour},
 		defaultClaimsConfig(),
 		server.Client(),
@@ -195,7 +193,7 @@ func TestReconcilerReconcileOneNotFound(t *testing.T) {
 	r.sessionToken = "mock-zt-session"
 	r.sessionExpires = time.Now().Add(30 * time.Minute)
 
-	p := &PendingReconciliation{
+	p := &pendingReconciliation{
 		ExternalID: "nonexistent",
 		Username:   "jsmith",
 		TrackedAt:  time.Now(),
@@ -214,7 +212,7 @@ func TestReconcilerTimeout(t *testing.T) {
 	server := httptest.NewServer(mock.handler())
 	t.Cleanup(server.Close)
 
-	r := NewReconciler(
+	r := newFallbackReconciler(
 		FallbackConfig{PollInterval: 50 * time.Millisecond, Timeout: 1 * time.Millisecond},
 		defaultClaimsConfig(),
 		server.Client(),
@@ -239,7 +237,7 @@ func TestReconcilerSessionRefresh(t *testing.T) {
 	server := httptest.NewServer(mock.handler())
 	t.Cleanup(server.Close)
 
-	r := NewReconciler(
+	r := newFallbackReconciler(
 		FallbackConfig{PollInterval: 100 * time.Millisecond, Timeout: 1 * time.Hour},
 		defaultClaimsConfig(),
 		server.Client(),
@@ -254,5 +252,99 @@ func TestReconcilerSessionRefresh(t *testing.T) {
 
 	if r.sessionToken != "mock-zt-session" {
 		t.Errorf("session token not refreshed: %q", r.sessionToken)
+	}
+}
+
+// testReconciler returns a reconciler against apiURL with the given timeout.
+func testReconciler(apiURL string, timeout time.Duration) *fallbackReconciler {
+	return newFallbackReconciler(
+		FallbackConfig{PollInterval: 10 * time.Second, Timeout: timeout},
+		defaultClaimsConfig(),
+		http.DefaultClient,
+		apiURL,
+		slog.Default(),
+	)
+}
+
+// TestReconcilerRefusesUnsupportedExternalID verifies that an external ID
+// that could break out of the management API filter is never tracked.
+func TestReconcilerRefusesUnsupportedExternalID(t *testing.T) {
+	r := testReconciler("https://ctrl", time.Hour)
+	for _, id := range []string{`x" or name = "edge-router-1`, "", "a b", "a\\b"} {
+		r.Track(id, "alice", "n")
+	}
+	if n := r.PendingCount(); n != 0 {
+		t.Errorf("PendingCount = %d, want 0", n)
+	}
+	r.Track("0123abcdef", "alice", "n")
+	if n := r.PendingCount(); n != 1 {
+		t.Errorf("PendingCount after a hex ID = %d, want 1", n)
+	}
+}
+
+// TestReconcilerFindIdentityRequiresOneMatch verifies that the reconciler
+// renames only an identity whose external ID is the one it asked for.
+func TestReconcilerFindIdentityRequiresOneMatch(t *testing.T) {
+	cases := []struct {
+		name       string
+		identities []mockIdentity
+	}{
+		{"different external ID", []mockIdentity{{ID: "id-1", ExternalID: "ext", Hostname: "h"}}},
+		{"two matches", []mockIdentity{{ID: "id-1", ExternalID: "ext", Hostname: "h"}, {ID: "id-2", ExternalID: "xt-1", Hostname: "h"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newMockManagementAPI(tc.identities)
+			srv := httptest.NewServer(api.handler())
+			t.Cleanup(srv.Close)
+			r := testReconciler(srv.URL, time.Hour)
+
+			if _, _, err := r.findIdentity(t.Context(), "ext-1"); err == nil {
+				t.Error("findIdentity accepted a result that is not exactly the asked-for identity")
+			}
+		})
+	}
+
+	// Two identities with the asked-for external ID: neither is renamed.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":[{"id":"id-1","externalId":"ext-1"},{"id":"id-2","externalId":"ext-1"}]}`)
+	}))
+	t.Cleanup(srv.Close)
+	if _, _, err := testReconciler(srv.URL, time.Hour).findIdentity(t.Context(), "ext-1"); err == nil {
+		t.Error("findIdentity accepted two identities with one external ID")
+	}
+}
+
+// TestReconcilerPrunesWhileControllerDown verifies that timed-out entries
+// are dropped even when the reconciler cannot authenticate.
+func TestReconcilerPrunesWhileControllerDown(t *testing.T) {
+	r := testReconciler("http://127.0.0.1:1", time.Millisecond)
+	r.Track("ext-1", "alice", "n")
+	time.Sleep(5 * time.Millisecond)
+	r.poll(t.Context())
+	if n := r.PendingCount(); n != 0 {
+		t.Errorf("PendingCount = %d, want 0", n)
+	}
+}
+
+// TestReconcilerRefreshesRejectedSession verifies that a 401 from the
+// management API makes the next poll authenticate again.
+func TestReconcilerRefreshesRejectedSession(t *testing.T) {
+	api := newMockManagementAPI([]mockIdentity{{ID: "id-1", ExternalID: "ext-1", Hostname: "h"}})
+	api.rejectAll = true
+	srv := httptest.NewServer(api.handler())
+	t.Cleanup(srv.Close)
+	r := testReconciler(srv.URL, time.Hour)
+	r.Track("ext-1", "alice", "n")
+
+	r.poll(t.Context())
+	r.sessMu.RLock()
+	expires := r.sessionExpires
+	r.sessMu.RUnlock()
+	if !expires.IsZero() {
+		t.Errorf("session still valid until %v after a 401", expires)
+	}
+	if n := r.PendingCount(); n != 1 {
+		t.Errorf("PendingCount = %d, want the entry kept for retry", n)
 	}
 }

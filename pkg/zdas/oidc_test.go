@@ -6,7 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -25,7 +25,7 @@ import (
 //   - /token  (returns a signed id_token)
 //
 // It returns the server and the signing key.
-func mockOIDCServer(t *testing.T, claims map[string]interface{}) (*httptest.Server, jwk.Key) {
+func mockOIDCServer(t *testing.T, claims map[string]any) (*httptest.Server, jwk.Key) {
 	t.Helper()
 	return mockOIDCServerWithUserInfo(t, claims, nil)
 }
@@ -33,7 +33,7 @@ func mockOIDCServer(t *testing.T, claims map[string]interface{}) (*httptest.Serv
 // mockOIDCServerWithUserInfo is mockOIDCServer plus a /userinfo endpoint
 // served by userInfo. When userInfo is nil the discovery document omits
 // userinfo_endpoint, matching an issuer that does not offer one.
-func mockOIDCServerWithUserInfo(t *testing.T, claims map[string]interface{}, userInfo http.HandlerFunc) (*httptest.Server, jwk.Key) {
+func mockOIDCServerWithUserInfo(t *testing.T, claims map[string]any, userInfo http.HandlerFunc) (*httptest.Server, jwk.Key) {
 	t.Helper()
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -60,7 +60,7 @@ func mockOIDCServerWithUserInfo(t *testing.T, claims map[string]interface{}, use
 
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
 		baseURL := server.URL
-		doc := map[string]interface{}{
+		doc := map[string]any{
 			"issuer":                                baseURL,
 			"authorization_endpoint":                baseURL + "/authorize",
 			"token_endpoint":                        baseURL + "/token",
@@ -104,7 +104,7 @@ func mockOIDCServerWithUserInfo(t *testing.T, claims map[string]interface{}, use
 			return
 		}
 
-		resp := map[string]interface{}{
+		resp := map[string]any{
 			"access_token": "opaque-at",
 			"id_token":     string(signed),
 			"token_type":   "Bearer",
@@ -119,7 +119,7 @@ func mockOIDCServerWithUserInfo(t *testing.T, claims map[string]interface{}, use
 }
 
 func TestOIDCProviderAuthorizeURL(t *testing.T) {
-	server, _ := mockOIDCServer(t, map[string]interface{}{"sub": "u123"})
+	server, _ := mockOIDCServer(t, map[string]any{"sub": "u123"})
 
 	ctx := context.Background()
 	p, err := NewOIDCProvider(ctx, OIDCProviderConfig{
@@ -151,7 +151,7 @@ func TestOIDCProviderAuthorizeURL(t *testing.T) {
 }
 
 func TestOIDCProviderAuthorizeURLWithPKCE(t *testing.T) {
-	server, _ := mockOIDCServer(t, map[string]interface{}{"sub": "u123"})
+	server, _ := mockOIDCServer(t, map[string]any{"sub": "u123"})
 
 	ctx := context.Background()
 	p, err := NewOIDCProvider(ctx, OIDCProviderConfig{
@@ -184,7 +184,7 @@ func TestOIDCProviderAuthorizeURLWithPKCE(t *testing.T) {
 }
 
 func TestOIDCProviderExchangeAndIdentify(t *testing.T) {
-	claims := map[string]interface{}{
+	claims := map[string]any{
 		"sub":                "user-42",
 		"preferred_username": "jsmith",
 		"name":               "John Smith",
@@ -202,11 +202,6 @@ func TestOIDCProviderExchangeAndIdentify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewOIDCProvider: %v", err)
 	}
-
-	// Replace the token exchange function to hit the mock server directly.
-	origExchange := oidcTokenExchange
-	t.Cleanup(func() { oidcTokenExchange = origExchange })
-	// Use the default (real HTTP), since our mock server handles /token.
 
 	identity, err := p.ExchangeAndIdentify(ctx, "fake-code", server.URL+"/callback")
 	if err != nil {
@@ -229,11 +224,11 @@ func TestOIDCProviderExchangeAndIdentify(t *testing.T) {
 func TestOIDCProviderUnverifiedEmailDropped(t *testing.T) {
 	cases := []struct {
 		name   string
-		claims map[string]interface{}
+		claims map[string]any
 	}{
 		{
 			name: "email_verified false",
-			claims: map[string]interface{}{
+			claims: map[string]any{
 				"sub":            "u1",
 				"email":          "attacker@example.com",
 				"email_verified": false,
@@ -241,7 +236,7 @@ func TestOIDCProviderUnverifiedEmailDropped(t *testing.T) {
 		},
 		{
 			name: "email_verified missing",
-			claims: map[string]interface{}{
+			claims: map[string]any{
 				"sub":   "u1",
 				"email": "attacker@example.com",
 			},
@@ -276,7 +271,7 @@ func TestOIDCProviderUnverifiedEmailDropped(t *testing.T) {
 
 func TestOIDCProviderUsernameFallback(t *testing.T) {
 	// No preferred_username - should fall back to name.
-	claims := map[string]interface{}{
+	claims := map[string]any{
 		"sub":  "user-99",
 		"name": "Fallback Name",
 	}
@@ -303,7 +298,7 @@ func TestOIDCProviderUsernameFallback(t *testing.T) {
 
 // jsonUserInfo returns a /userinfo handler that checks the bearer token
 // matches the mock token endpoint's access token and replies with body.
-func jsonUserInfo(t *testing.T, body map[string]interface{}) http.HandlerFunc {
+func jsonUserInfo(t *testing.T, body map[string]any) http.HandlerFunc {
 	t.Helper()
 	return func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer opaque-at" {
@@ -315,14 +310,14 @@ func jsonUserInfo(t *testing.T, body map[string]interface{}) http.HandlerFunc {
 }
 
 func TestOIDCFetchUserInfoMergesClaims(t *testing.T) {
-	idClaims := map[string]interface{}{
+	idClaims := map[string]any{
 		"sub":   "user-42",
 		"email": "id@example.com",
 	}
-	server, _ := mockOIDCServerWithUserInfo(t, idClaims, jsonUserInfo(t, map[string]interface{}{
+	server, _ := mockOIDCServerWithUserInfo(t, idClaims, jsonUserInfo(t, map[string]any{
 		"sub":    "user-42",
 		"email":  "userinfo@example.com", // conflicts with id_token; id_token must win
-		"groups": []interface{}{"admins", "devs"},
+		"groups": []any{"admins", "devs"},
 	}))
 
 	p, err := NewOIDCProvider(context.Background(), OIDCProviderConfig{
@@ -339,7 +334,7 @@ func TestOIDCFetchUserInfoMergesClaims(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExchangeAndIdentify: %v", err)
 	}
-	groups, ok := identity.Raw["groups"].([]interface{})
+	groups, ok := identity.Raw["groups"].([]any)
 	if !ok || len(groups) != 2 || groups[0] != "admins" {
 		t.Errorf("Raw[groups] = %v, want [admins devs]", identity.Raw["groups"])
 	}
@@ -349,7 +344,7 @@ func TestOIDCFetchUserInfoMergesClaims(t *testing.T) {
 }
 
 func TestOIDCFetchUserInfoOffByDefault(t *testing.T) {
-	server, _ := mockOIDCServerWithUserInfo(t, map[string]interface{}{"sub": "u1"}, func(w http.ResponseWriter, r *http.Request) {
+	server, _ := mockOIDCServerWithUserInfo(t, map[string]any{"sub": "u1"}, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("userinfo endpoint called without FetchUserInfo")
 		http.Error(w, "unexpected", http.StatusInternalServerError)
 	})
@@ -379,11 +374,11 @@ func TestOIDCFetchUserInfoFailureNonFatal(t *testing.T) {
 		{"http error", func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "boom", http.StatusInternalServerError)
 		}},
-		{"sub mismatch", jsonUserInfo(t, map[string]interface{}{"sub": "someone-else", "groups": []interface{}{"admins"}})},
+		{"sub mismatch", jsonUserInfo(t, map[string]any{"sub": "someone-else", "groups": []any{"admins"}})},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			server, _ := mockOIDCServerWithUserInfo(t, map[string]interface{}{"sub": "u1", "name": "n"}, tc.userInfo)
+			server, _ := mockOIDCServerWithUserInfo(t, map[string]any{"sub": "u1", "name": "n"}, tc.userInfo)
 			p, err := NewOIDCProvider(context.Background(), OIDCProviderConfig{
 				Name:          "idp",
 				Issuer:        server.URL,
@@ -415,11 +410,11 @@ func TestOIDCRequireUserInfoFailureIsFatal(t *testing.T) {
 		{"http error", func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "boom", http.StatusInternalServerError)
 		}},
-		{"sub mismatch", jsonUserInfo(t, map[string]interface{}{"sub": "someone-else"})},
+		{"sub mismatch", jsonUserInfo(t, map[string]any{"sub": "someone-else"})},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			server, _ := mockOIDCServerWithUserInfo(t, map[string]interface{}{"sub": "u1"}, tc.userInfo)
+			server, _ := mockOIDCServerWithUserInfo(t, map[string]any{"sub": "u1"}, tc.userInfo)
 			p, err := NewOIDCProvider(context.Background(), OIDCProviderConfig{
 				Name:            "idp",
 				Issuer:          server.URL,
@@ -439,7 +434,7 @@ func TestOIDCRequireUserInfoFailureIsFatal(t *testing.T) {
 
 func TestOIDCUserInfoWithoutEndpoint(t *testing.T) {
 	// Discovery document has no userinfo_endpoint.
-	server, _ := mockOIDCServer(t, map[string]interface{}{"sub": "u1"})
+	server, _ := mockOIDCServer(t, map[string]any{"sub": "u1"})
 
 	p, err := NewOIDCProvider(context.Background(), OIDCProviderConfig{
 		Name:          "idp",
@@ -470,7 +465,7 @@ func TestOIDCUserInfoWithoutEndpoint(t *testing.T) {
 }
 
 func TestNewOIDCProviderStoresClientSecret(t *testing.T) {
-	server, _ := mockOIDCServer(t, map[string]interface{}{"sub": "u1"})
+	server, _ := mockOIDCServer(t, map[string]any{"sub": "u1"})
 
 	p, err := NewOIDCProvider(context.Background(), OIDCProviderConfig{
 		Name:         "confidential",
@@ -486,36 +481,30 @@ func TestNewOIDCProviderStoresClientSecret(t *testing.T) {
 	}
 }
 
-// withRecordingTokenExchange swaps the package-level oidcTokenExchange
-// function for the duration of a test. The recorded params are returned via
-// the pointer so the test can assert on what ExchangeAndIdentify submitted.
-func withRecordingTokenExchange(t *testing.T, idTokenClaims map[string]interface{}) *url.Values {
+// recordTokenRequest makes p's token exchange record the form it posts and
+// fail with errTestRecorded, so a test can check what was sent.
+func recordTokenRequest(t *testing.T, p *OIDCProvider) *url.Values {
 	t.Helper()
 	var recorded url.Values
-
-	// Generate a signed id_token the verifier will accept. Reuse the mock
-	// OIDC server's signing helpers by spinning up an instance and capturing
-	// its key; simpler to just stub via an httptest server and exchange
-	// through it. We take the simpler approach: stub oidcTokenExchange
-	// entirely but also need a verifier that accepts the token.
-	// For these tests we only care about the request params, not the
-	// verifier output, so have the stub return an error after recording.
-	orig := oidcTokenExchange
-	oidcTokenExchange = func(_ context.Context, _ *http.Client, _ string, params url.Values) (map[string]interface{}, error) {
-		recorded = params
-		// Return an error so the test short-circuits after the recording.
-		// The test asserts on recorded params, not on the identity result.
+	p.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse token request: %v", err)
+		}
+		recorded = r.PostForm
 		return nil, errTestRecorded
-	}
-	t.Cleanup(func() { oidcTokenExchange = orig })
-	_ = idTokenClaims
+	})}
 	return &recorded
 }
 
-var errTestRecorded = fmt.Errorf("test-recorded")
+// roundTripFunc adapts a function to http.RoundTripper.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+var errTestRecorded = errors.New("test-recorded")
 
 func TestOIDCTokenExchangeIncludesClientSecret(t *testing.T) {
-	server, _ := mockOIDCServer(t, map[string]interface{}{"sub": "u1"})
+	server, _ := mockOIDCServer(t, map[string]any{"sub": "u1"})
 	p, err := NewOIDCProvider(context.Background(), OIDCProviderConfig{
 		Name:         "confidential",
 		Issuer:       server.URL,
@@ -526,8 +515,10 @@ func TestOIDCTokenExchangeIncludesClientSecret(t *testing.T) {
 		t.Fatalf("NewOIDCProvider: %v", err)
 	}
 
-	recorded := withRecordingTokenExchange(t, nil)
-	_, _ = p.ExchangeAndIdentifyWithPKCE(context.Background(), "code", "https://zdas/cb", "verifier")
+	recorded := recordTokenRequest(t, p)
+	if _, err := p.ExchangeAndIdentifyWithPKCE(context.Background(), "code", "https://zdas/cb", "verifier"); !errors.Is(err, errTestRecorded) {
+		t.Fatalf("ExchangeAndIdentifyWithPKCE = %v, want the recording transport's error", err)
+	}
 
 	if got := recorded.Get("client_secret"); got != "topsecret" {
 		t.Errorf("client_secret = %q, want topsecret", got)
@@ -541,7 +532,7 @@ func TestOIDCTokenExchangeIncludesClientSecret(t *testing.T) {
 }
 
 func TestOIDCTokenExchangeOmitsClientSecretWhenUnset(t *testing.T) {
-	server, _ := mockOIDCServer(t, map[string]interface{}{"sub": "u1"})
+	server, _ := mockOIDCServer(t, map[string]any{"sub": "u1"})
 	p, err := NewOIDCProvider(context.Background(), OIDCProviderConfig{
 		Name:     "public",
 		Issuer:   server.URL,
@@ -552,8 +543,10 @@ func TestOIDCTokenExchangeOmitsClientSecretWhenUnset(t *testing.T) {
 		t.Fatalf("NewOIDCProvider: %v", err)
 	}
 
-	recorded := withRecordingTokenExchange(t, nil)
-	_, _ = p.ExchangeAndIdentifyWithPKCE(context.Background(), "code", "https://zdas/cb", "verifier")
+	recorded := recordTokenRequest(t, p)
+	if _, err := p.ExchangeAndIdentifyWithPKCE(context.Background(), "code", "https://zdas/cb", "verifier"); !errors.Is(err, errTestRecorded) {
+		t.Fatalf("ExchangeAndIdentifyWithPKCE = %v, want the recording transport's error", err)
+	}
 
 	if _, present := (*recorded)["client_secret"]; present {
 		t.Errorf("client_secret should not be in params, got %q", recorded.Get("client_secret"))

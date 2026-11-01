@@ -13,10 +13,15 @@ var (
 	// ErrMultipleProviders is returned by Resolve when multiple providers are
 	// registered and no hint was given.
 	ErrMultipleProviders = errors.New("multiple idps available, selection required")
+	// ErrAccessDenied is wrapped by the error ExchangeAndIdentify returns
+	// when the upstream login succeeded but the user may not enroll, such
+	// as a GitHub user outside the allowed organizations. ZDAS reports it
+	// to the tunneler as access_denied rather than server_error.
+	ErrAccessDenied = errors.New("access denied")
 )
 
 // UpstreamProvider abstracts the differences between OIDC and non-OIDC upstreams.
-// Handlers call AuthorizeURL to get a redirect, then ExchangeAndIdentify on
+// ZDAS calls AuthorizeURL to get a redirect, then ExchangeAndIdentify on
 // callback.
 type UpstreamProvider interface {
 	// Name returns the human-readable provider name, used for display on the
@@ -47,9 +52,9 @@ type UpstreamIdentity struct {
 	// lookup can trust that an empty Email means no verified address was
 	// available; they should never trust an unverified address from Raw.
 	Email    string
-	Username string                 // human-readable username (preferred_username, GitHub login, etc.)
-	Issuer   string                 // where this identity came from
-	Raw      map[string]interface{} // all upstream claims/fields for debugging or future use
+	Username string         // human-readable username (preferred_username, GitHub login, etc.)
+	Issuer   string         // where this identity came from
+	Raw      map[string]any // all upstream claims/fields for debugging or future use
 }
 
 // ProviderRegistry is a concurrency-safe directory of available upstream
@@ -79,9 +84,10 @@ func (r *ProviderRegistry) Register(p UpstreamProvider) error {
 	return nil
 }
 
-// Resolve looks up a provider by name or issuer. If hint is empty and exactly
-// one provider is registered, it returns that provider. Otherwise an empty hint
-// with multiple providers returns an error indicating the caller must specify.
+// Resolve looks up a provider by name, or else by issuer when exactly one
+// provider has that issuer. If hint is empty and exactly one provider is
+// registered, it returns that provider. Otherwise an empty hint with multiple
+// providers returns ErrMultipleProviders.
 func (r *ProviderRegistry) Resolve(hint string) (UpstreamProvider, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -102,13 +108,21 @@ func (r *ProviderRegistry) Resolve(hint string) (UpstreamProvider, error) {
 	if p, ok := r.providers[hint]; ok {
 		return p, nil
 	}
-	// Fallback: match by issuer.
+	// Fallback: match by issuer, which must name exactly one provider.
+	var match UpstreamProvider
 	for _, p := range r.providers {
-		if p.Issuer() == hint {
-			return p, nil
+		if p.Issuer() != hint {
+			continue
 		}
+		if match != nil {
+			return nil, fmt.Errorf("idp %q is ambiguous: more than one provider has that issuer", hint)
+		}
+		match = p
 	}
-	return nil, fmt.Errorf("unknown idp: %q", hint)
+	if match == nil {
+		return nil, fmt.Errorf("unknown idp: %q", hint)
+	}
+	return match, nil
 }
 
 // SetOIDCProviders atomically replaces all OIDC providers (those whose names

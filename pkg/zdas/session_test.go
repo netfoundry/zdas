@@ -6,8 +6,30 @@ import (
 	"time"
 )
 
+// createSession stores sess under a new ID, stamped with the current time,
+// and returns the ID.
+func (s *sessionStore) createSession(sess *AuthSession) (string, error) {
+	id, err := randomID()
+	if err != nil {
+		return "", err
+	}
+	sess.CreatedAt = time.Now()
+	s.putSession(id, sess)
+	return id, nil
+}
+
+// createCode is createSession for authorization codes.
+func (s *sessionStore) createCode(ac *AuthCode) (string, error) {
+	code, err := randomID()
+	if err != nil {
+		return "", err
+	}
+	ac.CreatedAt = time.Now()
+	return code, s.putCode(code, ac)
+}
+
 func TestSessionCreateAndGet(t *testing.T) {
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	defer store.Stop()
 
 	sess := &AuthSession{
@@ -15,17 +37,17 @@ func TestSessionCreateAndGet(t *testing.T) {
 		DeviceInfo:           &DeviceInfo{DeviceName: "macbook"},
 		UpstreamProviderName: "keycloak",
 	}
-	id, err := store.CreateSession(sess)
+	id, err := store.createSession(sess)
 	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
+		t.Fatalf("createSession: %v", err)
 	}
 	if id == "" {
 		t.Fatal("session id is empty")
 	}
 
-	got := store.GetSession(id)
+	got := store.consumeSession(id)
 	if got == nil {
-		t.Fatal("GetSession returned nil")
+		t.Fatal("consumeSession returned nil")
 	}
 	if got.DeviceInfo == nil || got.DeviceInfo.DeviceName != "macbook" {
 		t.Errorf("DeviceInfo.DeviceName = %v", got.DeviceInfo)
@@ -36,44 +58,44 @@ func TestSessionCreateAndGet(t *testing.T) {
 }
 
 func TestSessionConsumedOnGet(t *testing.T) {
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	defer store.Stop()
 
-	id, _ := store.CreateSession(&AuthSession{DeviceInfo: &DeviceInfo{DeviceName: "test"}})
-	if store.GetSession(id) == nil {
+	id, _ := store.createSession(&AuthSession{DeviceInfo: &DeviceInfo{DeviceName: "test"}})
+	if store.consumeSession(id) == nil {
 		t.Fatal("first get should succeed")
 	}
-	if store.GetSession(id) != nil {
+	if store.consumeSession(id) != nil {
 		t.Error("second get should return nil (consumed)")
 	}
 }
 
 func TestSessionExpiration(t *testing.T) {
-	store := NewSessionStore(1*time.Millisecond, 60*time.Second)
+	store := newSessionStore(1*time.Millisecond, 60*time.Second)
 	defer store.Stop()
 
-	id, _ := store.CreateSession(&AuthSession{DeviceInfo: &DeviceInfo{DeviceName: "test"}})
+	id, _ := store.createSession(&AuthSession{DeviceInfo: &DeviceInfo{DeviceName: "test"}})
 	time.Sleep(5 * time.Millisecond)
 
-	if store.GetSession(id) != nil {
+	if store.consumeSession(id) != nil {
 		t.Error("expired session should return nil")
 	}
 }
 
 func TestCodeCreateAndConsume(t *testing.T) {
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	defer store.Stop()
 
 	ac := &AuthCode{
-		Claims:      map[string]interface{}{"sub": "user1"},
+		Claims:      map[string]any{"sub": "user1"},
 		RedirectURI: "https://tunneler/callback",
 	}
-	code, err := store.CreateCode(ac)
+	code, err := store.createCode(ac)
 	if err != nil {
-		t.Fatalf("CreateCode: %v", err)
+		t.Fatalf("createCode: %v", err)
 	}
 
-	got := store.ConsumeCode(code)
+	got := store.consumeCode(code)
 	if got == nil {
 		t.Fatal("ConsumeCode returned nil")
 	}
@@ -83,26 +105,26 @@ func TestCodeCreateAndConsume(t *testing.T) {
 }
 
 func TestCodeSingleUse(t *testing.T) {
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	defer store.Stop()
 
-	code, _ := store.CreateCode(&AuthCode{Claims: map[string]interface{}{}})
-	if store.ConsumeCode(code) == nil {
+	code, _ := store.createCode(&AuthCode{Claims: map[string]any{}})
+	if store.consumeCode(code) == nil {
 		t.Fatal("first consume should succeed")
 	}
-	if store.ConsumeCode(code) != nil {
+	if store.consumeCode(code) != nil {
 		t.Error("second consume should return nil (already used)")
 	}
 }
 
 func TestCodeExpiration(t *testing.T) {
-	store := NewSessionStore(10*time.Minute, 1*time.Millisecond)
+	store := newSessionStore(10*time.Minute, 1*time.Millisecond)
 	defer store.Stop()
 
-	code, _ := store.CreateCode(&AuthCode{Claims: map[string]interface{}{}})
+	code, _ := store.createCode(&AuthCode{Claims: map[string]any{}})
 	time.Sleep(5 * time.Millisecond)
 
-	if store.ConsumeCode(code) != nil {
+	if store.consumeCode(code) != nil {
 		t.Error("expired code should return nil")
 	}
 }
@@ -125,14 +147,14 @@ func TestRandomIDUniqueness(t *testing.T) {
 // a new session by evicting the oldest, so a flood of anonymous /authorize
 // requests cannot lock out every user.
 func TestSessionStoreFullEvictsOldest(t *testing.T) {
-	s := NewSessionStore(10*time.Minute, time.Minute)
+	s := newSessionStore(10*time.Minute, time.Minute)
 	t.Cleanup(s.Stop)
 	start := time.Now().Add(-time.Minute)
 	for i := range maxStoreEntries {
 		s.putSession(fmt.Sprintf("s%d", i), &AuthSession{CreatedAt: start.Add(time.Duration(i) * time.Millisecond)})
 	}
 
-	id, err := s.CreateSession(&AuthSession{})
+	id, err := s.createSession(&AuthSession{})
 	if err != nil {
 		t.Fatalf("CreateSession on a full store: %v", err)
 	}
@@ -145,13 +167,13 @@ func TestSessionStoreFullEvictsOldest(t *testing.T) {
 	if _, ok := s.sessions["s1"]; !ok {
 		t.Error("second-oldest session was evicted")
 	}
-	if s.GetSession(id) == nil {
+	if s.consumeSession(id) == nil {
 		t.Error("new session not stored")
 	}
 }
 
 func TestSessionStoreStopTwice(t *testing.T) {
-	s := NewSessionStore(time.Minute, time.Minute)
+	s := newSessionStore(time.Minute, time.Minute)
 	s.Stop()
 	s.Stop()
 }

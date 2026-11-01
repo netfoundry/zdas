@@ -3,10 +3,7 @@ package zdas
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -17,48 +14,15 @@ import (
 func TestNewServerRegistersConfiguredOIDCProvider(t *testing.T) {
 	// Mock OIDC issuer that serves /.well-known/openid-configuration so
 	// NewOIDCProvider's discovery call succeeds.
-	idpServer, _ := mockOIDCServer(t, map[string]interface{}{"sub": "test"})
+	idpServer, _ := mockOIDCServer(t, map[string]any{"sub": "test"})
 
-	// Mock controller (returns no signers - we're testing the configured path).
-	ctrlMux := http.NewServeMux()
-	ctrlMux.HandleFunc("/edge/client/v1/external-jwt-signers", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(signerResponse{Data: []signerEntry{}})
-	})
-	ctrlServer := httptest.NewServer(ctrlMux)
-	t.Cleanup(ctrlServer.Close)
-
-	cfg := Config{
-		Listen:      ":0",
-		ExternalURL: "https://zdas.test",
-		TLS:         TLSConfig{Mode: TLSModeNone},
-		Controller: ControllerConfig{
-			APIURL:       ctrlServer.URL,
-			PollInterval: 0,
-			SelfIssuer:   "https://zdas.test",
-		},
-		Providers: []ProviderConfig{
-			{
-				Type:          ProviderTypeOIDC,
-				Name:          "my-keycloak",
-				ClientID:      "test-client",
-				OIDCIssuerURL: idpServer.URL,
-			},
-		},
-		Claims: ClaimsConfig{
-			UsernameClaim:     "preferred_username",
-			NameTemplate:      "{username}-{device_name}",
-			IdentityNameClaim: "device_identity_name",
-			ExternalIDClaim:   "device_external_id",
-		},
-		Token: TokenConfig{
-			Issuer:   "https://zdas.test",
-			Audience: "ziti-enroll",
-			Expiry:   5 * time.Minute,
-		},
-		Session: SessionConfig{
-			Timeout:    10 * time.Minute,
-			CodeExpiry: 60 * time.Second,
+	cfg := replicaConfig(t)
+	cfg.Providers = []ProviderConfig{
+		{
+			Type:          ProviderTypeOIDC,
+			Name:          "my-keycloak",
+			ClientID:      "test-client",
+			OIDCIssuerURL: idpServer.URL,
 		},
 	}
 
@@ -66,7 +30,7 @@ func TestNewServerRegistersConfiguredOIDCProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	t.Cleanup(func() { srv.store.Stop() })
+	t.Cleanup(func() { srv.Shutdown(context.Background()) })
 
 	// The configured OIDC provider should be in the registry.
 	got, err := srv.registry.Resolve("my-keycloak")
@@ -88,48 +52,16 @@ func TestNewServerRegistersConfiguredOIDCProvider(t *testing.T) {
 // configured OIDC provider with a ClientSecret set (e.g. Google Web client)
 // lands in the registry with the secret threaded through to the provider.
 func TestNewServerRegistersConfiguredOIDCProviderWithSecret(t *testing.T) {
-	idpServer, _ := mockOIDCServer(t, map[string]interface{}{"sub": "test"})
+	idpServer, _ := mockOIDCServer(t, map[string]any{"sub": "test"})
 
-	ctrlMux := http.NewServeMux()
-	ctrlMux.HandleFunc("/edge/client/v1/external-jwt-signers", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(signerResponse{Data: []signerEntry{}})
-	})
-	ctrlServer := httptest.NewServer(ctrlMux)
-	t.Cleanup(ctrlServer.Close)
-
-	cfg := Config{
-		Listen:      ":0",
-		ExternalURL: "https://zdas.test",
-		TLS:         TLSConfig{Mode: TLSModeNone},
-		Controller: ControllerConfig{
-			APIURL:       ctrlServer.URL,
-			PollInterval: 0,
-			SelfIssuer:   "https://zdas.test",
-		},
-		Providers: []ProviderConfig{
-			{
-				Type:          ProviderTypeOIDC,
-				Name:          "google",
-				ClientID:      "gcid",
-				ClientSecret:  "gcsecret",
-				OIDCIssuerURL: idpServer.URL,
-			},
-		},
-		Claims: ClaimsConfig{
-			UsernameClaim:     "preferred_username",
-			NameTemplate:      "{username}-{device_name}",
-			IdentityNameClaim: "device_identity_name",
-			ExternalIDClaim:   "device_external_id",
-		},
-		Token: TokenConfig{
-			Issuer:   "https://zdas.test",
-			Audience: "ziti-enroll",
-			Expiry:   5 * time.Minute,
-		},
-		Session: SessionConfig{
-			Timeout:    10 * time.Minute,
-			CodeExpiry: 60 * time.Second,
+	cfg := replicaConfig(t)
+	cfg.Providers = []ProviderConfig{
+		{
+			Type:          ProviderTypeOIDC,
+			Name:          "google",
+			ClientID:      "gcid",
+			ClientSecret:  "gcsecret",
+			OIDCIssuerURL: idpServer.URL,
 		},
 	}
 
@@ -137,7 +69,7 @@ func TestNewServerRegistersConfiguredOIDCProviderWithSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	t.Cleanup(func() { srv.store.Stop() })
+	t.Cleanup(func() { srv.Shutdown(context.Background()) })
 
 	got, err := srv.registry.Resolve("google")
 	if err != nil {
@@ -155,45 +87,13 @@ func TestNewServerRegistersConfiguredOIDCProviderWithSecret(t *testing.T) {
 // TestNewServerOIDCProviderDiscoveryFailure verifies that a configured OIDC
 // provider with an unreachable issuer fails NewServer at startup (fail-fast).
 func TestNewServerOIDCProviderDiscoveryFailure(t *testing.T) {
-	ctrlMux := http.NewServeMux()
-	ctrlMux.HandleFunc("/edge/client/v1/external-jwt-signers", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(signerResponse{Data: []signerEntry{}})
-	})
-	ctrlServer := httptest.NewServer(ctrlMux)
-	t.Cleanup(ctrlServer.Close)
-
-	cfg := Config{
-		Listen:      ":0",
-		ExternalURL: "https://zdas.test",
-		TLS:         TLSConfig{Mode: TLSModeNone},
-		Controller: ControllerConfig{
-			APIURL:       ctrlServer.URL,
-			PollInterval: 0,
-			SelfIssuer:   "https://zdas.test",
-		},
-		Providers: []ProviderConfig{
-			{
-				Type:          ProviderTypeOIDC,
-				Name:          "broken",
-				ClientID:      "c",
-				OIDCIssuerURL: "http://127.0.0.1:1", // unreachable
-			},
-		},
-		Claims: ClaimsConfig{
-			UsernameClaim:     "preferred_username",
-			NameTemplate:      "{username}-{device_name}",
-			IdentityNameClaim: "device_identity_name",
-			ExternalIDClaim:   "device_external_id",
-		},
-		Token: TokenConfig{
-			Issuer:   "https://zdas.test",
-			Audience: "ziti-enroll",
-			Expiry:   5 * time.Minute,
-		},
-		Session: SessionConfig{
-			Timeout:    10 * time.Minute,
-			CodeExpiry: 60 * time.Second,
+	cfg := replicaConfig(t)
+	cfg.Providers = []ProviderConfig{
+		{
+			Type:          ProviderTypeOIDC,
+			Name:          "broken",
+			ClientID:      "c",
+			OIDCIssuerURL: "http://127.0.0.1:1", // unreachable
 		},
 	}
 
@@ -214,7 +114,7 @@ func TestNewServerKeyOptions(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	t.Cleanup(func() { srv.Shutdown(context.Background()) })
-	if !strings.Contains(buf.String(), `msg="generated signing key" kid=`+srv.keys.KID()) {
+	if !strings.Contains(buf.String(), `msg="generated signing key" kid=`+srv.handlers.keys.KID()) {
 		t.Errorf("default path log = %q, want generated signing key", buf.String())
 	}
 
@@ -232,7 +132,7 @@ func TestNewServerKeyOptions(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	t.Cleanup(func() { injected.Shutdown(context.Background()) })
-	if injected.keys != active {
+	if injected.handlers.keys != active {
 		t.Error("NewServer did not use the injected key")
 	}
 	if got := buf.String(); strings.Contains(got, "generated signing key") ||
@@ -265,7 +165,7 @@ func TestNewServerRejectsNilOptions(t *testing.T) {
 }
 
 // TestNewServerInjectedStoreNotOwned verifies that a server given a Store
-// does not create, and so never stops, a SessionStore of its own.
+// does not create, and so never stops, a sessionStore of its own.
 func TestNewServerInjectedStoreNotOwned(t *testing.T) {
 	cfg := replicaConfig(t)
 	srv, err := NewServer(cfg, slog.Default(), WithStore(newJSONStore()))
@@ -273,7 +173,7 @@ func TestNewServerInjectedStoreNotOwned(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	if srv.store != nil {
-		t.Error("server created a SessionStore despite WithStore")
+		t.Error("server created a sessionStore despite WithStore")
 	}
 	if err := srv.Shutdown(context.Background()); err != nil {
 		t.Errorf("Shutdown: %v", err)

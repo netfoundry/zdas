@@ -111,7 +111,7 @@ func (s *jsonStore) ConsumePendingProvision(_ context.Context, key string) (*Pen
 
 // setupStoreHandlers returns handlers backed by store for issuer, wired the
 // way NewServer wires an injected store.
-func setupStoreHandlers(t *testing.T, store Store, issuer string) *Handlers {
+func setupStoreHandlers(t *testing.T, store Store, issuer string) *endpoints {
 	t.Helper()
 	ks, err := GenerateKeySet()
 	if err != nil {
@@ -138,7 +138,7 @@ func setupStoreHandlers(t *testing.T, store Store, issuer string) *Handlers {
 			CodeExpiry: 60 * time.Second,
 		},
 	}
-	return newHandlers(cfg, ks, nil, reg, store, nil, nil, nil, slog.Default())
+	return newEndpoints(cfg, ks, nil, reg, store, nil, nil, nil, slog.Default())
 }
 
 // mustID returns a fresh ID in the form ZDAS generates.
@@ -215,7 +215,7 @@ func TestStoreStaleEntriesAreMisses(t *testing.T) {
 				t.Fatal(err)
 			}
 			w = httptest.NewRecorder()
-			h.CompleteProvision(w, httptest.NewRequest(http.MethodPost, "/pick", nil), pid, map[string]any{"sub": "x"}, nil)
+			h.completeProvision(w, httptest.NewRequest(http.MethodPost, "/pick", nil), pid, map[string]any{"sub": "x"}, nil)
 			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "pending provision not found or expired") {
 				t.Errorf("provision: status = %d, body = %s; want 400 not found", w.Code, w.Body.String())
 			}
@@ -233,8 +233,8 @@ func TestStoreFailureIsServerError(t *testing.T) {
 	id := mustID(t)
 
 	w := postToken(mux, id)
-	if got := tokenErrorCode(t, w); got != "server_error" {
-		t.Errorf("token: error = %q, want server_error", got)
+	if got := tokenErrorCode(t, w); got != "server_error" || w.Code != http.StatusInternalServerError {
+		t.Errorf("token: error = %q, status %d; want server_error, 500", got, w.Code)
 	}
 
 	for _, target := range []string{
@@ -249,7 +249,7 @@ func TestStoreFailureIsServerError(t *testing.T) {
 	}
 
 	w = httptest.NewRecorder()
-	h.CompleteProvision(w, httptest.NewRequest(http.MethodPost, "/pick", nil), id, map[string]any{"sub": "x"}, nil)
+	h.completeProvision(w, httptest.NewRequest(http.MethodPost, "/pick", nil), id, map[string]any{"sub": "x"}, nil)
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("provision complete: status = %d, want 500", w.Code)
 	}
@@ -331,32 +331,4 @@ func TestStoreEntriesBoundToIssuer(t *testing.T) {
 	if ac, err := a.consumeCode(t.Context(), code); err != nil || ac == nil {
 		t.Errorf("consume on own issuer = %v, %v; want entry", ac, err)
 	}
-}
-
-// TestNewHandlersCompatibility verifies the guarantees NewHandlers keeps for
-// existing callers: entries expire by the SessionStore's TTLs rather than
-// cfg.Session, IDs returned by the SessionStore itself are accepted, and a
-// nil key or store does not fail construction.
-func TestNewHandlersCompatibility(t *testing.T) {
-	ks, err := GenerateKeySet()
-	if err != nil {
-		t.Fatalf("GenerateKeySet: %v", err)
-	}
-	store := NewSessionStore(time.Hour, 2*time.Minute)
-	t.Cleanup(store.Stop)
-	cfg := Config{Session: SessionConfig{Timeout: time.Second, CodeExpiry: time.Second}}
-	h := NewHandlers(cfg, ks, NewProviderRegistry(), store, nil, nil, nil, slog.Default())
-	if h.cfg.Session.Timeout != time.Hour || h.cfg.Session.CodeExpiry != 2*time.Minute {
-		t.Errorf("TTLs = %v, %v; want the store's 1h, 2m", h.cfg.Session.Timeout, h.cfg.Session.CodeExpiry)
-	}
-
-	code, err := store.CreateCode(&AuthCode{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ac, err := h.consumeCode(t.Context(), code); err != nil || ac == nil {
-		t.Errorf("consume of SessionStore-issued code = %v, %v; want entry", ac, err)
-	}
-
-	NewHandlers(cfg, nil, NewProviderRegistry(), nil, nil, nil, nil, slog.Default())
 }

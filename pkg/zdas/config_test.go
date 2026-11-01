@@ -1,6 +1,7 @@
 package zdas
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -136,7 +137,7 @@ providers:
 
 func TestValidateRequiresExternalURL(t *testing.T) {
 	cfg := &Config{Controller: ControllerConfig{APIURL: "https://c"}}
-	cfg.applyDefaults()
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "external_url") {
 		t.Errorf("expected external_url error, got %v", err)
 	}
@@ -144,7 +145,7 @@ func TestValidateRequiresExternalURL(t *testing.T) {
 
 func TestValidateRequiresControllerAPIURL(t *testing.T) {
 	cfg := &Config{ExternalURL: "https://das.example.com"}
-	cfg.applyDefaults()
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "controller.api_url") {
 		t.Errorf("expected controller.api_url error, got %v", err)
 	}
@@ -156,7 +157,7 @@ func TestValidateTLSStaticRequiresFiles(t *testing.T) {
 		TLS:         TLSConfig{Mode: TLSModeStatic},
 		Controller:  ControllerConfig{APIURL: "https://c"},
 	}
-	cfg.applyDefaults()
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cert_file") {
 		t.Errorf("expected static TLS file error, got %v", err)
 	}
@@ -168,7 +169,7 @@ func TestValidateTLSACMERequiresDomains(t *testing.T) {
 		TLS:         TLSConfig{Mode: TLSModeACME, ACME: ACMEConfig{CacheDir: "/tmp"}},
 		Controller:  ControllerConfig{APIURL: "https://c"},
 	}
-	cfg.applyDefaults()
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "domain") {
 		t.Errorf("expected acme domains error, got %v", err)
 	}
@@ -183,7 +184,7 @@ func TestValidateRejectsDuplicateProviderNames(t *testing.T) {
 			{Type: "github", Name: "dup", ClientID: "c", ClientSecret: "d"},
 		},
 	}
-	cfg.applyDefaults()
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Errorf("expected duplicate provider name error, got %v", err)
 	}
@@ -197,7 +198,7 @@ func TestValidateGithubRequiresSecret(t *testing.T) {
 			{Type: "github", Name: "gh", ClientID: "abc"},
 		},
 	}
-	cfg.applyDefaults()
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "client_secret") {
 		t.Errorf("expected github client_secret error, got %v", err)
 	}
@@ -219,7 +220,7 @@ func TestValidateOIDCRequiresIssuerAndClientID(t *testing.T) {
 				Controller:  ControllerConfig{APIURL: "https://c"},
 				Providers:   []ProviderConfig{tc.p},
 			}
-			cfg.applyDefaults()
+			cfg.ApplyDefaults()
 			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "oidc_issuer_url") {
 				t.Errorf("expected oidc_issuer_url error, got %v", err)
 			}
@@ -235,7 +236,7 @@ func TestValidateOIDCAccepts(t *testing.T) {
 			{Type: "oidc", Name: "kc", ClientID: "c", OIDCIssuerURL: "https://kc.example.com"},
 		},
 	}
-	cfg.applyDefaults()
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("valid oidc config rejected: %v", err)
 	}
@@ -249,7 +250,7 @@ func TestValidateRequireUserInfoNeedsFetch(t *testing.T) {
 			{Type: "oidc", Name: "kc", ClientID: "c", OIDCIssuerURL: "https://kc.example.com", RequireUserInfo: true},
 		},
 	}
-	cfg.applyDefaults()
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "fetch_userinfo") {
 		t.Errorf("expected require_userinfo error, got %v", err)
 	}
@@ -281,7 +282,7 @@ func TestValidateNameTemplateMustContainPlaceholders(t *testing.T) {
 		Controller:  ControllerConfig{APIURL: "https://c"},
 		Claims:      ClaimsConfig{NameTemplate: "{username}-only"},
 	}
-	cfg.applyDefaults()
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "device_name") {
 		t.Errorf("expected name_template placeholder error, got %v", err)
 	}
@@ -293,7 +294,7 @@ func TestValidateFallbackWithoutIdentityFile(t *testing.T) {
 		Controller:  ControllerConfig{APIURL: "https://c"},
 		Fallback:    FallbackConfig{Enabled: true},
 	}
-	cfg.applyDefaults()
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("fallback without identity_file should be valid, got %v", err)
 	}
@@ -305,7 +306,7 @@ func TestValidateFallbackTempTemplateMustContainUsername(t *testing.T) {
 		Controller:  ControllerConfig{APIURL: "https://c", IdentityFile: "/tmp/id.json"},
 		Fallback:    FallbackConfig{Enabled: true, TempNameTemplate: "no-username-{nonce_short}"},
 	}
-	cfg.applyDefaults()
+	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "temp_name_template") {
 		t.Errorf("expected temp_name_template error, got %v", err)
 	}
@@ -333,7 +334,7 @@ func TestValidateIDPSelectorURL(t *testing.T) {
 				Controller:     ControllerConfig{APIURL: "https://c"},
 				IDPSelectorURL: tc.url,
 			}
-			cfg.applyDefaults()
+			cfg.ApplyDefaults()
 			err := cfg.Validate()
 			if tc.wantErr && err == nil {
 				t.Errorf("expected error for %q, got nil", tc.url)
@@ -391,5 +392,59 @@ func TestEnvProviderKey(t *testing.T) {
 		if got := envProviderKey(in); got != want {
 			t.Errorf("envProviderKey(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestSetBool(t *testing.T) {
+	cases := []struct {
+		val     string
+		want    bool
+		wantErr bool
+	}{
+		{"true", true, false},
+		{"TRUE", true, false},
+		{"1", true, false},
+		{"yes", true, false},
+		{"Yes", true, false},
+		{"false", false, false},
+		{"0", false, false},
+		{"no", false, false},
+		{"on", false, true},
+		{"", false, true},
+	}
+	for _, tc := range cases {
+		t.Setenv("ZDAS_TEST_BOOL", tc.val)
+		got := !tc.want // so a no-op shows up
+		err := setBool(&got, "ZDAS_TEST_BOOL")
+		if (err != nil) != tc.wantErr {
+			t.Errorf("setBool(%q) err = %v, wantErr %v", tc.val, err, tc.wantErr)
+			continue
+		}
+		if err == nil && got != tc.want {
+			t.Errorf("setBool(%q) = %v, want %v", tc.val, got, tc.want)
+		}
+	}
+}
+
+// TestNewServerRequiresDefaults verifies that a config that skipped
+// ApplyDefaults is refused rather than minting tokens that are already
+// expired.
+func TestNewServerRequiresDefaults(t *testing.T) {
+	cfg := Config{
+		ExternalURL: "https://zdas.test",
+		Controller:  ControllerConfig{APIURL: "https://ctrl"},
+		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll"},
+	}
+	if _, err := NewServer(cfg, slog.Default()); err == nil || !strings.Contains(err.Error(), "token.expiry") {
+		t.Errorf("NewServer = %v, want a token.expiry error", err)
+	}
+
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate after ApplyDefaults: %v", err)
+	}
+	cfg.Session.Timeout = -time.Second
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate accepted a negative session timeout")
 	}
 }

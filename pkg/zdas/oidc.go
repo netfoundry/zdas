@@ -147,21 +147,15 @@ func NewOIDCProvider(ctx context.Context, cfg OIDCProviderConfig) (*OIDCProvider
 	}, nil
 }
 
-func (p *OIDCProvider) Name() string   { return p.name }
+// Name returns the provider's name.
+func (p *OIDCProvider) Name() string { return p.name }
+
+// Issuer returns the issuer URL the provider was configured with.
 func (p *OIDCProvider) Issuer() string { return p.issuer }
 
-// AuthorizeURL builds the upstream OIDC authorization URL with ZDAS's own PKCE
-// challenge. The verifier must be stored in the session before calling this.
+// AuthorizeURL builds the upstream OIDC authorization URL, without PKCE.
 func (p *OIDCProvider) AuthorizeURL(state, redirectURI string) string {
-	// Build URL manually to avoid oauth2 package's automatic params.
-	v := url.Values{
-		"client_id":     {p.clientID},
-		"response_type": {"code"},
-		"redirect_uri":  {redirectURI},
-		"state":         {state},
-		"scope":         {joinScopes(p.scopes)},
-	}
-	return p.authURL + "?" + v.Encode()
+	return p.authorizeURL(state, redirectURI, "")
 }
 
 // AuthorizeURLWithPKCE is like AuthorizeURL but includes PKCE parameters.
@@ -171,16 +165,25 @@ func (p *OIDCProvider) AuthorizeURLWithPKCE(state, redirectURI string) (authURL,
 	if err != nil {
 		return "", "", err
 	}
+	return p.authorizeURL(state, redirectURI, challenge), verifier, nil
+}
+
+// authorizeURL builds the authorization URL, with an S256 PKCE challenge when
+// challenge is not empty. It is built by hand to avoid the oauth2 package's
+// automatic parameters.
+func (p *OIDCProvider) authorizeURL(state, redirectURI, challenge string) string {
 	v := url.Values{
-		"client_id":             {p.clientID},
-		"response_type":         {"code"},
-		"redirect_uri":          {redirectURI},
-		"state":                 {state},
-		"scope":                 {joinScopes(p.scopes)},
-		"code_challenge":        {challenge},
-		"code_challenge_method": {"S256"},
+		"client_id":     {p.clientID},
+		"response_type": {"code"},
+		"redirect_uri":  {redirectURI},
+		"state":         {state},
+		"scope":         {joinScopes(p.scopes)},
 	}
-	return p.authURL + "?" + v.Encode(), verifier, nil
+	if challenge != "" {
+		v.Set("code_challenge", challenge)
+		v.Set("code_challenge_method", "S256")
+	}
+	return withQuery(p.authURL, v)
 }
 
 // ExchangeAndIdentify exchanges the authorization code for tokens via the
@@ -237,8 +240,10 @@ func (p *OIDCProvider) exchangeAndIdentify(ctx context.Context, code, redirectUR
 		return nil, fmt.Errorf("extract claims from %s: %w", p.name, err)
 	}
 
-	raw := make(map[string]interface{})
-	_ = idToken.Claims(&raw)
+	var raw map[string]any
+	if err := idToken.Claims(&raw); err != nil {
+		return nil, fmt.Errorf("extract claims from %s: %w", p.name, err)
+	}
 
 	if p.fetchUserInfo {
 		accessToken, _ := tokenResp["access_token"].(string)
@@ -279,7 +284,7 @@ func (p *OIDCProvider) exchangeAndIdentify(ctx context.Context, code, redirectUR
 // mergeUserInfo fetches the userinfo endpoint with accessToken and adds any
 // claims not already present in raw. The response is rejected when its sub
 // differs from the ID token's, per OIDC Core 5.3.2.
-func (p *OIDCProvider) mergeUserInfo(ctx context.Context, accessToken, idTokenSub string, raw map[string]interface{}) error {
+func (p *OIDCProvider) mergeUserInfo(ctx context.Context, accessToken, idTokenSub string, raw map[string]any) error {
 	if accessToken == "" {
 		return errors.New("no access_token in token response")
 	}
@@ -291,7 +296,7 @@ func (p *OIDCProvider) mergeUserInfo(ctx context.Context, accessToken, idTokenSu
 	if info.Subject != idTokenSub {
 		return errors.New("userinfo sub does not match id_token sub")
 	}
-	var extra map[string]interface{}
+	var extra map[string]any
 	if err := info.Claims(&extra); err != nil {
 		return fmt.Errorf("decode userinfo claims: %w", err)
 	}
@@ -316,7 +321,11 @@ func generatePKCE() (verifier, challenge string, err error) {
 		return "", "", fmt.Errorf("generate pkce verifier: %w", err)
 	}
 	verifier = base64.RawURLEncoding.EncodeToString(buf)
+	return verifier, pkceChallenge(verifier), nil
+}
+
+// pkceChallenge returns the S256 code challenge for verifier.
+func pkceChallenge(verifier string) string {
 	h := sha256.Sum256([]byte(verifier))
-	challenge = base64.RawURLEncoding.EncodeToString(h[:])
-	return verifier, challenge, nil
+	return base64.RawURLEncoding.EncodeToString(h[:])
 }

@@ -28,9 +28,10 @@ func bindingCookieScope(externalURL string) (path string, secure bool) {
 // sessionKey returns the store key for session id. A session /authorize
 // creates is stored under its ID and the nonce in the browser's binding
 // cookie together, so a /callback without that cookie misses and leaves the
-// session for the browser that has it. nonce is empty for a session stored
-// under its bare ID, such as one an embedder put in a SessionStore directly.
-func (h *Handlers) sessionKey(id, nonce string) string {
+// session for the browser that has it. With an empty nonce, as for a
+// /callback without the cookie, the key is the bare ID's, under which
+// /authorize stores nothing.
+func (h *endpoints) sessionKey(id, nonce string) string {
 	if nonce != "" {
 		id += "." + nonce
 	}
@@ -40,7 +41,7 @@ func (h *Handlers) sessionKey(id, nonce string) string {
 // startSession stores sess bound to a new nonce and sets a cookie holding
 // the nonce, so that only the browser that started the flow can complete or
 // cancel it at /callback. It returns the session ID.
-func (h *Handlers) startSession(w http.ResponseWriter, r *http.Request, sess *AuthSession) (string, error) {
+func (h *endpoints) startSession(w http.ResponseWriter, r *http.Request, sess *AuthSession) (string, error) {
 	nonce, err := randomID()
 	if err != nil {
 		return "", err
@@ -56,7 +57,7 @@ func (h *Handlers) startSession(w http.ResponseWriter, r *http.Request, sess *Au
 // consumeBoundSession consumes the session named by state, looked up with
 // the binding cookie r carries, and expires that cookie. It returns
 // (nil, nil) on a miss, including for a browser without the right cookie.
-func (h *Handlers) consumeBoundSession(w http.ResponseWriter, r *http.Request, state string) (*AuthSession, error) {
+func (h *endpoints) consumeBoundSession(w http.ResponseWriter, r *http.Request, state string) (*AuthSession, error) {
 	if !validID(state) {
 		return nil, nil
 	}
@@ -70,7 +71,7 @@ func (h *Handlers) consumeBoundSession(w http.ResponseWriter, r *http.Request, s
 	return h.consumeSession(r.Context(), state, nonce)
 }
 
-func (h *Handlers) setBindingCookie(w http.ResponseWriter, id, nonce string, maxAge int) {
+func (h *endpoints) setBindingCookie(w http.ResponseWriter, id, nonce string, maxAge int) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     bindingCookieName(id),
 		Value:    nonce,

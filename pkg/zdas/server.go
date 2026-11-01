@@ -14,12 +14,11 @@ import (
 // management, provider discovery, session storage, and HTTP serving.
 type Server struct {
 	cfg        Config
-	keys       *KeySet
 	registry   *ProviderRegistry
-	store      *SessionStore // nil with WithStore; ZDAS stops only a store it created
-	discovery  *Discovery
-	reconciler *Reconciler // nil when fallback is disabled
-	handlers   *Handlers
+	store      *sessionStore // nil with WithStore; ZDAS stops only a store it created
+	discovery  *signerDiscovery
+	reconciler *fallbackReconciler // nil when fallback is disabled
+	handlers   *endpoints
 	logger     *slog.Logger
 
 	mu       sync.Mutex
@@ -28,8 +27,13 @@ type Server struct {
 	chalSrv  *http.Server // ACME challenge listener (if separate from main)
 }
 
-// NewServer creates a fully-wired Server. Call Start to begin serving.
+// NewServer creates a fully-wired Server. Call Start to begin serving. cfg
+// must have its defaults applied, by LoadConfig or Config.ApplyDefaults;
+// NewServer fails if a setting it cannot do without is unset.
 func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, retErr error) {
+	if err := cfg.checkRequired(); err != nil {
+		return nil, fmt.Errorf("config: %w (was ApplyDefaults called?)", err)
+	}
 	var sopts serverOptions
 	for _, o := range opts {
 		o(&sopts)
@@ -56,9 +60,9 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 
 	registry := NewProviderRegistry()
 	store := sopts.store
-	var memStore *SessionStore
+	var memStore *sessionStore
 	if store == nil {
-		memStore = NewSessionStore(cfg.Session.Timeout, cfg.Session.CodeExpiry)
+		memStore = newSessionStore(cfg.Session.Timeout, cfg.Session.CodeExpiry)
 		store = sessionStoreAdapter{memStore}
 		// Stop the session store cleanup goroutine if NewServer fails
 		// partway through; on success the returned Server owns it.
@@ -112,34 +116,37 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 		}
 	}
 
-	disc, err := NewDiscovery(cfg.Controller, registry, configuredNames, logger)
-	if err != nil {
-		return nil, fmt.Errorf("create discovery: %w", err)
+	var id *parsedIdentity
+	if cfg.Controller.IdentityFile != "" {
+		var err error
+		if id, err = loadIdentityFile(cfg.Controller.IdentityFile); err != nil {
+			return nil, err
+		}
 	}
+	ctrlClient, err := controllerClient(cfg.Controller, id)
+	if err != nil {
+		return nil, fmt.Errorf("create controller client: %w", err)
+	}
+	disc := newSignerDiscovery(cfg.Controller, ctrlClient, registry, configuredNames, logger)
 	disc.upstreamClient = sopts.upstream
 
-	var reconciler *Reconciler
-	if cfg.Fallback.Enabled && cfg.Controller.IdentityFile != "" {
-		id, err := loadIdentityFile(cfg.Controller.IdentityFile)
-		if err != nil {
-			return nil, fmt.Errorf("load identity file for reconciler: %w", err)
-		}
+	var reconciler *fallbackReconciler
+	if cfg.Fallback.Enabled && id != nil {
 		mgmtClient := managementClientFromIdentity(id)
 		apiURL := cfg.Controller.APIURL
 		if id.APIURL != "" {
 			apiURL = id.APIURL
 		}
-		reconciler = NewReconciler(cfg.Fallback, cfg.Claims, mgmtClient, apiURL, logger)
+		reconciler = newFallbackReconciler(cfg.Fallback, cfg.Claims, mgmtClient, apiURL, logger)
 		logger.Info("fallback reconciler enabled", "poll_interval", cfg.Fallback.PollInterval)
 	} else if cfg.Fallback.Enabled {
 		logger.Info("fallback enrollment enabled without reconciler (no identity_file)")
 	}
 
-	handlers := newHandlers(cfg, keys, sopts.verifyKeys, registry, store, disc, reconciler, sopts.provisioner, logger)
+	handlers := newEndpoints(cfg, keys, sopts.verifyKeys, registry, store, disc, reconciler, sopts.provisioner, logger)
 
 	return &Server{
 		cfg:        cfg,
-		keys:       keys,
 		registry:   registry,
 		store:      memStore,
 		discovery:  disc,
@@ -167,9 +174,20 @@ func (h *Handler) Stop() {
 }
 
 // CompleteProvision finishes an enrollment that the provisioner sent to an
-// interactive page. See [Handlers.CompleteProvision].
+// interactive page with ProvisionResult.RedirectURL. The embedding
+// application calls it from its own handler for that page, with the
+// pending_id ZDAS added to the redirect URL and the outcome of its
+// provisioning: the claims to mint, or an error, which follows the same
+// rules as an error from Provision and takes precedence over claims. It
+// consumes the pending provision and redirects the browser back to the
+// tunneler, or responds 400 when the pending provision is missing or
+// expired.
+//
+// The claims must come from the application's own state, never from the
+// request: the user enrolling holds the pending ID, so claims taken from
+// the browser would let that user enroll as any identity.
 func (h *Handler) CompleteProvision(w http.ResponseWriter, r *http.Request, pendingID string, claims map[string]any, err error) {
-	h.srv.handlers.CompleteProvision(w, r, pendingID, claims, err)
+	h.srv.handlers.completeProvision(w, r, pendingID, claims, err)
 }
 
 // NewHandler returns a Handler for embedding ZDAS in another application.

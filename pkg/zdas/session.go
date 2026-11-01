@@ -22,23 +22,17 @@ type AuthSession struct {
 	ZDASCodeVerifier            string      // ZDAS's own PKCE verifier for upstream (empty for non-PKCE providers)
 	UpstreamProviderName        string
 	CreatedAt                   time.Time
-
-	// Deprecated: ZDAS no longer sets or reads this. The browser binding
-	// is part of the session's store key instead, so a callback from
-	// another browser cannot find, and so cannot use up, the session.
-	BrowserBindingHash string
 }
 
 // AuthCode holds composed claims alongside the metadata needed to validate the
 // tunneler's code exchange request.
 type AuthCode struct {
-	Claims              map[string]interface{}
+	Claims              map[string]any
 	RedirectURI         string
 	CodeChallenge       string
 	CodeChallengeMethod string
 	IsFallback          bool // true if enrolled via fallback path
 	CreatedAt           time.Time
-	Used                bool
 }
 
 // PendingProvision holds state for an interactive provisioning detour.
@@ -50,6 +44,7 @@ type PendingProvision struct {
 	TunnelerCodeChallenge       string
 	TunnelerCodeChallengeMethod string
 	IsFallback                  bool
+	FallbackNonce               string // set on the fallback path, for the reconciler
 	CreatedAt                   time.Time
 }
 
@@ -58,10 +53,13 @@ type PendingProvision struct {
 // beyond any realistic enrollment volume.
 const maxStoreEntries = 10_000
 
-// SessionStore is an in-memory store for auth sessions, authorization codes,
+// storeSweepInterval is how often the in-memory store drops expired entries.
+const storeSweepInterval = 30 * time.Second
+
+// sessionStore is an in-memory store for auth sessions, authorization codes,
 // and pending provisions with automatic expiration. It is safe for concurrent
 // use.
-type SessionStore struct {
+type sessionStore struct {
 	sessionTTL time.Duration
 	codeTTL    time.Duration
 
@@ -74,10 +72,10 @@ type SessionStore struct {
 	stopOnce    sync.Once
 }
 
-// NewSessionStore creates a store with the given TTLs and starts a background
+// newSessionStore creates a store with the given TTLs and starts a background
 // cleanup goroutine.
-func NewSessionStore(sessionTTL, codeTTL time.Duration) *SessionStore {
-	s := &SessionStore{
+func newSessionStore(sessionTTL, codeTTL time.Duration) *sessionStore {
+	s := &sessionStore{
 		sessionTTL:  sessionTTL,
 		codeTTL:     codeTTL,
 		sessions:    make(map[string]*AuthSession),
@@ -91,26 +89,15 @@ func NewSessionStore(sessionTTL, codeTTL time.Duration) *SessionStore {
 
 // Stop halts the background cleanup goroutine. It may be called more than
 // once.
-func (s *SessionStore) Stop() {
+func (s *sessionStore) Stop() {
 	s.stopOnce.Do(func() { close(s.stopCleanup) })
-}
-
-// CreateSession stores a new auth session and returns its ID.
-func (s *SessionStore) CreateSession(sess *AuthSession) (string, error) {
-	id, err := randomID()
-	if err != nil {
-		return "", err
-	}
-	sess.CreatedAt = time.Now()
-	s.putSession(id, sess)
-	return id, nil
 }
 
 // putSession stores sess under id as given, without stamping CreatedAt. When
 // the store is full it evicts the oldest session rather than refusing the new
 // one: sessions are created before anyone authenticates, so refusing them
 // would let anonymous /authorize requests lock every user out.
-func (s *SessionStore) putSession(id string, sess *AuthSession) {
+func (s *sessionStore) putSession(id string, sess *AuthSession) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.sessions) >= maxStoreEntries {
@@ -122,7 +109,7 @@ func (s *SessionStore) putSession(id string, sess *AuthSession) {
 // evictOldestSession removes the session with the earliest CreatedAt. s.mu
 // must be held. It scans every session, which happens only while the store
 // is full.
-func (s *SessionStore) evictOldestSession() {
+func (s *sessionStore) evictOldestSession() {
 	var oldestID string
 	var oldest time.Time
 	for id, sess := range s.sessions {
@@ -133,9 +120,9 @@ func (s *SessionStore) evictOldestSession() {
 	delete(s.sessions, oldestID)
 }
 
-// GetSession retrieves and deletes (consumes) an auth session by ID. Returns
-// nil if expired or not found.
-func (s *SessionStore) GetSession(id string) *AuthSession {
+// consumeSession removes and returns the session stored under id, or nil if
+// there is none or it has expired.
+func (s *sessionStore) consumeSession(id string) *AuthSession {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sess, ok := s.sessions[id]
@@ -149,22 +136,8 @@ func (s *SessionStore) GetSession(id string) *AuthSession {
 	return sess
 }
 
-// CreateCode stores composed claims under a new authorization code and returns
-// the code string.
-func (s *SessionStore) CreateCode(ac *AuthCode) (string, error) {
-	code, err := randomID()
-	if err != nil {
-		return "", err
-	}
-	ac.CreatedAt = time.Now()
-	if err := s.putCode(code, ac); err != nil {
-		return "", err
-	}
-	return code, nil
-}
-
 // putCode stores ac under code as given, without stamping CreatedAt.
-func (s *SessionStore) putCode(code string, ac *AuthCode) error {
+func (s *sessionStore) putCode(code string, ac *AuthCode) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.codes) >= maxStoreEntries {
@@ -174,40 +147,26 @@ func (s *SessionStore) putCode(code string, ac *AuthCode) error {
 	return nil
 }
 
-// ConsumeCode retrieves and marks an authorization code as used. Returns nil if
-// the code is expired, already used, or not found.
-func (s *SessionStore) ConsumeCode(code string) *AuthCode {
+// consumeCode removes and returns the authorization code stored under code,
+// or nil if there is none or it has expired. Removing it makes the code
+// single-use.
+func (s *sessionStore) consumeCode(code string) *AuthCode {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ac, ok := s.codes[code]
 	if !ok {
 		return nil
 	}
-	if ac.Used || time.Since(ac.CreatedAt) > s.codeTTL {
-		delete(s.codes, code)
+	delete(s.codes, code)
+	if time.Since(ac.CreatedAt) > s.codeTTL {
 		return nil
 	}
-	ac.Used = true
 	return ac
-}
-
-// CreatePendingProvision stores state for an interactive provisioning detour
-// and returns the pending ID.
-func (s *SessionStore) CreatePendingProvision(pp *PendingProvision) (string, error) {
-	id, err := randomID()
-	if err != nil {
-		return "", err
-	}
-	pp.CreatedAt = time.Now()
-	if err := s.putPendingProvision(id, pp); err != nil {
-		return "", err
-	}
-	return id, nil
 }
 
 // putPendingProvision stores pp under id as given, without stamping
 // CreatedAt.
-func (s *SessionStore) putPendingProvision(id string, pp *PendingProvision) error {
+func (s *sessionStore) putPendingProvision(id string, pp *PendingProvision) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.provisions) >= maxStoreEntries {
@@ -217,9 +176,9 @@ func (s *SessionStore) putPendingProvision(id string, pp *PendingProvision) erro
 	return nil
 }
 
-// ConsumePendingProvision retrieves and deletes a pending provision. Returns
-// nil if expired or not found.
-func (s *SessionStore) ConsumePendingProvision(id string) *PendingProvision {
+// consumePendingProvision removes and returns the pending provision stored
+// under id, or nil if there is none or it has expired.
+func (s *sessionStore) consumePendingProvision(id string) *PendingProvision {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pp, ok := s.provisions[id]
@@ -233,8 +192,8 @@ func (s *SessionStore) ConsumePendingProvision(id string) *PendingProvision {
 	return pp
 }
 
-func (s *SessionStore) cleanupLoop() {
-	ticker := time.NewTicker(30 * time.Second)
+func (s *sessionStore) cleanupLoop() {
+	ticker := time.NewTicker(storeSweepInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -246,7 +205,7 @@ func (s *SessionStore) cleanupLoop() {
 	}
 }
 
-func (s *SessionStore) cleanup() {
+func (s *sessionStore) cleanup() {
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -256,7 +215,7 @@ func (s *SessionStore) cleanup() {
 		}
 	}
 	for code, ac := range s.codes {
-		if ac.Used || now.Sub(ac.CreatedAt) > s.codeTTL {
+		if now.Sub(ac.CreatedAt) > s.codeTTL {
 			delete(s.codes, code)
 		}
 	}

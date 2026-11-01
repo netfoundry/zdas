@@ -24,7 +24,7 @@ func TestComposeClaimsBasic(t *testing.T) {
 		Subject:  "u42",
 		Username: "jsmith",
 		Issuer:   "https://keycloak.example.com",
-		Raw:      map[string]interface{}{"preferred_username": "jsmith", "sub": "u42"},
+		Raw:      map[string]any{"preferred_username": "jsmith", "sub": "u42"},
 	}
 	info := &DeviceInfo{DeviceName: "macbook-pro", Hostname: "macbook-pro", OS: "darwin", Arch: "arm64"}
 	claims := ComposeClaims(defaultClaimsConfig(), FallbackConfig{}, identity, info, "")
@@ -51,7 +51,7 @@ func TestComposeClaimsUsernameFallback(t *testing.T) {
 		Subject:  "sub1",
 		Username: "fallback-user",
 		Issuer:   "https://idp",
-		Raw:      map[string]interface{}{},
+		Raw:      map[string]any{},
 	}
 	claims := ComposeClaims(defaultClaimsConfig(), FallbackConfig{}, identity, &DeviceInfo{DeviceName: "laptop"}, "")
 	if got := claims["device_identity_name"]; got != "fallback-user-laptop" {
@@ -63,7 +63,7 @@ func TestComposeClaimsSubjectFallback(t *testing.T) {
 	identity := &UpstreamIdentity{
 		Subject: "anon-sub",
 		Issuer:  "https://idp",
-		Raw:     map[string]interface{}{},
+		Raw:     map[string]any{},
 	}
 	claims := ComposeClaims(defaultClaimsConfig(), FallbackConfig{}, identity, &DeviceInfo{DeviceName: "phone"}, "")
 	if got := claims["device_identity_name"]; got != "anon-sub-phone" {
@@ -76,7 +76,7 @@ func TestComposeClaimsFallback(t *testing.T) {
 		Subject:  "u42",
 		Username: "jsmith",
 		Issuer:   "https://keycloak",
-		Raw:      map[string]interface{}{"preferred_username": "jsmith"},
+		Raw:      map[string]any{"preferred_username": "jsmith"},
 	}
 	fbCfg := FallbackConfig{
 		Enabled:          true,
@@ -100,7 +100,7 @@ func TestComposeClaimsFallbackWithPartialDeviceInfo(t *testing.T) {
 		Subject:  "u42",
 		Username: "jsmith",
 		Issuer:   "https://keycloak",
-		Raw:      map[string]interface{}{"preferred_username": "jsmith"},
+		Raw:      map[string]any{"preferred_username": "jsmith"},
 	}
 	fbCfg := FallbackConfig{
 		Enabled:          true,
@@ -183,7 +183,7 @@ func TestMintTokenRoundtrip(t *testing.T) {
 		Subject:  "u1",
 		Username: "alice",
 		Issuer:   "https://idp",
-		Raw:      map[string]interface{}{"preferred_username": "alice"},
+		Raw:      map[string]any{"preferred_username": "alice"},
 	}
 	cfg := defaultClaimsConfig()
 	claims := ComposeClaims(cfg, FallbackConfig{}, identity, &DeviceInfo{DeviceName: "laptop"}, "")
@@ -198,7 +198,7 @@ func TestMintTokenRoundtrip(t *testing.T) {
 		t.Fatalf("MintToken: %v", err)
 	}
 
-	jwksBytes, _ := ks.PublicJWKS()
+	jwksBytes, _ := JWKS(ks)
 	pubSet, _ := jwk.Parse(jwksBytes)
 	tok, err := jwt.Parse([]byte(signed), jwt.WithKeySet(pubSet, jws.WithInferAlgorithmFromKey(true)))
 	if err != nil {
@@ -233,12 +233,12 @@ func TestClaimsSurviveJSONRoundTrip(t *testing.T) {
 		Subject:  "u1",
 		Username: "alice",
 		Issuer:   "https://idp",
-		Raw:      map[string]interface{}{"preferred_username": "alice"},
+		Raw:      map[string]any{"preferred_username": "alice"},
 	}
 	fbCfg := FallbackConfig{Enabled: true}
 	tokenCfg := TokenConfig{Issuer: "https://zdas.test", Audience: "ziti", Expiry: time.Minute}
 
-	for name, claims := range map[string]map[string]interface{}{
+	for name, claims := range map[string]map[string]any{
 		"composed":         ComposeClaims(defaultClaimsConfig(), fbCfg, identity, &DeviceInfo{DeviceName: "laptop", OS: "darwin"}, ""),
 		"composedFallback": ComposeClaims(defaultClaimsConfig(), fbCfg, identity, &DeviceInfo{}, "0123456789abcdef"),
 		"provisioner": {
@@ -249,7 +249,7 @@ func TestClaimsSurviveJSONRoundTrip(t *testing.T) {
 			"ratio":     0.5,
 			"groups":    []string{"a", "b"},
 			"enabled":   true,
-			"structure": map[string]interface{}{"k": []int{1, 2}},
+			"structure": map[string]any{"k": []int{1, 2}},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -257,7 +257,7 @@ func TestClaimsSurviveJSONRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatalf("marshal claims: %v", err)
 			}
-			var decoded map[string]interface{}
+			var decoded map[string]any
 			if err := json.Unmarshal(data, &decoded); err != nil {
 				t.Fatalf("unmarshal claims: %v", err)
 			}
@@ -272,7 +272,7 @@ func TestClaimsSurviveJSONRoundTrip(t *testing.T) {
 
 // mintedClaims mints a token from claims and returns its payload as JSON,
 // without iat and exp, which differ between calls.
-func mintedClaims(t *testing.T, cfg TokenConfig, claims map[string]interface{}, ks *KeySet) string {
+func mintedClaims(t *testing.T, cfg TokenConfig, claims map[string]any, ks *KeySet) string {
 	t.Helper()
 	signed, err := MintToken(cfg, claims, ks)
 	if err != nil {
@@ -282,7 +282,7 @@ func mintedClaims(t *testing.T, cfg TokenConfig, claims map[string]interface{}, 
 	if err != nil {
 		t.Fatalf("parse jws: %v", err)
 	}
-	var m map[string]interface{}
+	var m map[string]any
 	if err := json.Unmarshal(payload.Payload(), &m); err != nil {
 		t.Fatalf("unmarshal payload: %v", err)
 	}
@@ -293,4 +293,29 @@ func mintedClaims(t *testing.T, cfg TokenConfig, claims map[string]interface{}, 
 		t.Fatalf("marshal payload: %v", err)
 	}
 	return string(out)
+}
+
+// TestMintTokenRejectsMistypedClaim verifies that a registered claim with a
+// value of the wrong type fails the mint instead of vanishing from the token.
+func TestMintTokenRejectsMistypedClaim(t *testing.T) {
+	ks, err := GenerateKeySet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: time.Minute}
+	if _, err := MintToken(cfg, map[string]any{"sub": 123}, ks); err == nil {
+		t.Error("MintToken accepted a numeric sub")
+	}
+}
+
+// TestExpandTemplateSinglePass verifies that a value containing a
+// placeholder is inserted as is, not expanded again.
+func TestExpandTemplateSinglePass(t *testing.T) {
+	got := expandTemplate("{username}-{device_name}", "{hostname}", &DeviceInfo{DeviceName: "laptop", Hostname: "secret-host"})
+	if got != "{hostname}-laptop" {
+		t.Errorf("expandTemplate = %q, want %q", got, "{hostname}-laptop")
+	}
+	if got := expandFallbackTemplate("{username}-{nonce_short}", "{nonce_short}", "abc"); got != "{nonce_short}-abc" {
+		t.Errorf("expandFallbackTemplate = %q, want %q", got, "{nonce_short}-abc")
+	}
 }

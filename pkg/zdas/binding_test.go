@@ -1,7 +1,6 @@
 package zdas
 
 import (
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -36,14 +35,14 @@ func bindingHandlers(t *testing.T, externalURL string) http.Handler {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	store := NewSessionStore(10*time.Minute, 60*time.Second)
+	store := newSessionStore(10*time.Minute, 60*time.Second)
 	t.Cleanup(store.Stop)
 	cfg := Config{
 		ExternalURL: externalURL,
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: externalURL, Audience: "ziti-enrolltocert", Expiry: 5 * time.Minute},
 	}
-	return NewHandlers(cfg, ks, reg, store, nil, nil, nil, slog.Default()).Mux()
+	return newTestEndpoints(cfg, ks, reg, store, nil).Mux()
 }
 
 // startAuthorize runs /authorize and returns its response and the session

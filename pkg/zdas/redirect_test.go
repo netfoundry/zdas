@@ -1,6 +1,7 @@
 package zdas
 
 import (
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,7 +11,7 @@ import (
 // allowed runs raw through the same checks /authorize applies.
 func allowed(raw string, allowList []string) bool {
 	u, err := parseRedirectURI(raw)
-	return err == nil && redirectAllowed(u, allowList)
+	return err == nil && redirectAllowed(u, parseAllowList(allowList, slog.Default()))
 }
 
 func TestRedirectAllowedLoopbackDefault(t *testing.T) {
@@ -119,7 +120,7 @@ func TestValidateAllowedRedirectURIs(t *testing.T) {
 			Controller:          ControllerConfig{APIURL: "https://c"},
 			AllowedRedirectURIs: []string{tc.entry},
 		}
-		cfg.applyDefaults()
+		cfg.ApplyDefaults()
 		if err := cfg.Validate(); (err != nil) != tc.wantErr {
 			t.Errorf("Validate with entry %q: err = %v, wantErr %v", tc.entry, err, tc.wantErr)
 		}
@@ -157,5 +158,36 @@ func TestAuthorizeRejectsRemoteRedirect(t *testing.T) {
 		if c := w.Result().Cookies(); len(c) != 0 {
 			t.Errorf("%s: set %d cookies, want none", redirect, len(c))
 		}
+	}
+}
+
+// TestRedirectAllowListAllInvalid verifies that a list whose entries all
+// fail to parse allows nothing, rather than falling back to the loopback
+// default an empty list gets.
+func TestRedirectAllowListAllInvalid(t *testing.T) {
+	if allowed("http://localhost:20314/auth/callback", []string{"not a url", "ftp://x"}) {
+		t.Error("loopback callback accepted under an allow list with no valid entries")
+	}
+}
+
+func TestAuthorizeRejectsColonInDeviceName(t *testing.T) {
+	h, _ := setupHandlers(t)
+	_, challenge := generateTestPKCE(t)
+	reqURL := "/authorize?" + url.Values{
+		"redirect_uri":          {"http://localhost:20314/auth/callback"},
+		"state":                 {"s1"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"device_name":           {"1:laptop"},
+	}.Encode()
+	w := httptest.NewRecorder()
+	h.Mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, reqURL, nil))
+
+	loc, err := url.Parse(w.Header().Get("Location"))
+	if err != nil || loc.Query().Get("error") != "invalid_request" {
+		t.Errorf("status = %d, Location = %q; want an invalid_request redirect", w.Code, w.Header().Get("Location"))
+	}
+	if len(w.Result().Cookies()) != 0 {
+		t.Error("session started for a device_name containing ':'")
 	}
 }

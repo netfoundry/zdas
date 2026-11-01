@@ -16,7 +16,8 @@ import (
 // TestStore runs a conformance suite against a zdas.Store implementation.
 // newStore must return an empty store; it is called once per subtest. The
 // suite checks the contract documented on zdas.Store: entries survive a
-// round trip with CreatedAt intact, consume is single use for every kind of
+// round trip with CreatedAt intact, consume returns the entry stored under
+// the key it is given and no other, consume is single use for every kind of
 // entry, including under concurrency, and a missing key is (nil, nil).
 func TestStore(t *testing.T, newStore func(t *testing.T) zdas.Store) {
 	t.Run("SessionRoundTrip", func(t *testing.T) {
@@ -60,12 +61,12 @@ func TestStore(t *testing.T, newStore func(t *testing.T) zdas.Store) {
 	t.Run("CodeRoundTrip", func(t *testing.T) {
 		s := newStore(t)
 		want := &zdas.AuthCode{
-			Claims: map[string]interface{}{
+			Claims: map[string]any{
 				"sub":                  "ext-1",
 				"device_identity_name": "alice-laptop",
-				"groups":               []interface{}{"a", "b"},
+				"groups":               []any{"a", "b"},
 				"level":                float64(3),
-				"nested":               map[string]interface{}{"k": "v"},
+				"nested":               map[string]any{"k": "v"},
 			},
 			RedirectURI:         "https://tunneler/cb",
 			CodeChallenge:       "challenge",
@@ -85,9 +86,7 @@ func TestStore(t *testing.T, newStore func(t *testing.T) zdas.Store) {
 			t.Fatal("ConsumeCode returned a miss for a fresh code")
 		}
 		checkCreatedAt(t, got.CreatedAt, want.CreatedAt)
-		// Used is an in-memory detail outside the Store contract.
 		got.CreatedAt, want.CreatedAt = time.Time{}, time.Time{}
-		got.Used, want.Used = false, false
 		checkJSONEqual(t, got, want)
 	})
 
@@ -121,28 +120,61 @@ func TestStore(t *testing.T, newStore func(t *testing.T) zdas.Store) {
 		t.Run(k.name+"ConsumeIsSingleUse", func(t *testing.T) {
 			s := newStore(t)
 			key := newKey(t)
-			if err := k.create(t.Context(), s, key); err != nil {
+			if err := k.create(t.Context(), s, key, "a"); err != nil {
 				t.Fatalf("create: %v", err)
 			}
-			if found, err := k.consume(t.Context(), s, key); err != nil || !found {
+			if _, found, err := k.consume(t.Context(), s, key); err != nil || !found {
 				t.Fatalf("first consume = %v, %v; want entry", found, err)
 			}
-			if found, err := k.consume(t.Context(), s, key); err != nil || found {
+			if _, found, err := k.consume(t.Context(), s, key); err != nil || found {
 				t.Errorf("second consume = %v, %v; want miss", found, err)
 			}
 		})
 
 		t.Run(k.name+"UnknownKeyIsMiss", func(t *testing.T) {
 			s := newStore(t)
-			if found, err := k.consume(t.Context(), s, newKey(t)); err != nil || found {
+			if _, found, err := k.consume(t.Context(), s, newKey(t)); err != nil || found {
 				t.Errorf("consume = %v, %v; want miss", found, err)
+			}
+		})
+
+		// A store that ignores the key, such as a DELETE ... RETURNING
+		// without its WHERE clause, passes every single-entry test but
+		// hands one user's entry to another.
+		t.Run(k.name+"ConsumeReturnsEntryForKey", func(t *testing.T) {
+			s := newStore(t)
+			a, b := newKey(t), newKey(t)
+			for key, tag := range map[string]string{a: "a", b: "b"} {
+				if err := k.create(t.Context(), s, key, tag); err != nil {
+					t.Fatalf("create %s: %v", tag, err)
+				}
+			}
+			if tag, found, err := k.consume(t.Context(), s, b); err != nil || !found || tag != "b" {
+				t.Errorf("consume b = %q, %v, %v; want entry b", tag, found, err)
+			}
+			if tag, found, err := k.consume(t.Context(), s, a); err != nil || !found || tag != "a" {
+				t.Errorf("consume a = %q, %v, %v; want entry a", tag, found, err)
+			}
+		})
+
+		t.Run(k.name+"UnknownKeyLeavesOtherEntries", func(t *testing.T) {
+			s := newStore(t)
+			key := newKey(t)
+			if err := k.create(t.Context(), s, key, "a"); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			if _, found, err := k.consume(t.Context(), s, newKey(t)); err != nil || found {
+				t.Errorf("consume unknown key = %v, %v; want miss", found, err)
+			}
+			if tag, found, err := k.consume(t.Context(), s, key); err != nil || !found || tag != "a" {
+				t.Errorf("consume = %q, %v, %v; want the entry, untouched by the miss", tag, found, err)
 			}
 		})
 
 		t.Run(k.name+"ConcurrentConsumeHasOneWinner", func(t *testing.T) {
 			s := newStore(t)
 			key := newKey(t)
-			if err := k.create(t.Context(), s, key); err != nil {
+			if err := k.create(t.Context(), s, key, "a"); err != nil {
 				t.Fatalf("create: %v", err)
 			}
 			const workers = 16
@@ -155,7 +187,7 @@ func TestStore(t *testing.T, newStore func(t *testing.T) zdas.Store) {
 			for range workers {
 				wg.Go(func() {
 					<-start
-					found, err := k.consume(t.Context(), s, key)
+					_, found, err := k.consume(t.Context(), s, key)
 					if err != nil {
 						t.Errorf("consume: %v", err)
 						return
@@ -176,42 +208,53 @@ func TestStore(t *testing.T, newStore func(t *testing.T) zdas.Store) {
 	}
 }
 
-// kind drives the per-kind subtests through one kind of Store entry.
+// kind drives the per-kind subtests through one kind of Store entry. create
+// stores an entry carrying tag, and consume returns the tag of the entry it
+// got, or found false on a miss.
 type kind struct {
 	name    string
-	create  func(ctx context.Context, s zdas.Store, key string) error
-	consume func(ctx context.Context, s zdas.Store, key string) (found bool, err error)
+	create  func(ctx context.Context, s zdas.Store, key, tag string) error
+	consume func(ctx context.Context, s zdas.Store, key string) (tag string, found bool, err error)
 }
 
 var kinds = []kind{
 	{
 		name: "Session",
-		create: func(ctx context.Context, s zdas.Store, key string) error {
-			return s.CreateSession(ctx, key, &zdas.AuthSession{DeviceInfo: &zdas.DeviceInfo{}, CreatedAt: time.Now()})
+		create: func(ctx context.Context, s zdas.Store, key, tag string) error {
+			return s.CreateSession(ctx, key, &zdas.AuthSession{TunnelerState: tag, DeviceInfo: &zdas.DeviceInfo{}, CreatedAt: time.Now()})
 		},
-		consume: func(ctx context.Context, s zdas.Store, key string) (bool, error) {
+		consume: func(ctx context.Context, s zdas.Store, key string) (string, bool, error) {
 			v, err := s.ConsumeSession(ctx, key)
-			return v != nil, err
+			if v == nil {
+				return "", false, err
+			}
+			return v.TunnelerState, true, err
 		},
 	},
 	{
 		name: "Code",
-		create: func(ctx context.Context, s zdas.Store, key string) error {
-			return s.CreateCode(ctx, key, &zdas.AuthCode{CreatedAt: time.Now()})
+		create: func(ctx context.Context, s zdas.Store, key, tag string) error {
+			return s.CreateCode(ctx, key, &zdas.AuthCode{RedirectURI: tag, CreatedAt: time.Now()})
 		},
-		consume: func(ctx context.Context, s zdas.Store, key string) (bool, error) {
+		consume: func(ctx context.Context, s zdas.Store, key string) (string, bool, error) {
 			v, err := s.ConsumeCode(ctx, key)
-			return v != nil, err
+			if v == nil {
+				return "", false, err
+			}
+			return v.RedirectURI, true, err
 		},
 	},
 	{
 		name: "PendingProvision",
-		create: func(ctx context.Context, s zdas.Store, key string) error {
-			return s.CreatePendingProvision(ctx, key, &zdas.PendingProvision{CreatedAt: time.Now()})
+		create: func(ctx context.Context, s zdas.Store, key, tag string) error {
+			return s.CreatePendingProvision(ctx, key, &zdas.PendingProvision{TunnelerState: tag, CreatedAt: time.Now()})
 		},
-		consume: func(ctx context.Context, s zdas.Store, key string) (bool, error) {
+		consume: func(ctx context.Context, s zdas.Store, key string) (string, bool, error) {
 			v, err := s.ConsumePendingProvision(ctx, key)
-			return v != nil, err
+			if v == nil {
+				return "", false, err
+			}
+			return v.TunnelerState, true, err
 		},
 	},
 }

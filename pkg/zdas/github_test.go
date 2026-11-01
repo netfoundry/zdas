@@ -3,6 +3,8 @@ package zdas
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,7 +15,7 @@ import (
 // mockGitHubServer returns a test server that simulates GitHub's OAuth and API
 // endpoints. It accepts any code as valid and returns the provided user data.
 // emails is optional - when non-nil, it's served from /user/emails.
-func mockGitHubServer(t *testing.T, user map[string]interface{}, orgs []map[string]interface{}, emails []map[string]interface{}) *httptest.Server {
+func mockGitHubServer(t *testing.T, user map[string]any, orgs []map[string]any, emails []map[string]any) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 
@@ -43,7 +45,7 @@ func mockGitHubServer(t *testing.T, user map[string]interface{}, orgs []map[stri
 		if emails != nil {
 			json.NewEncoder(w).Encode(emails)
 		} else {
-			json.NewEncoder(w).Encode([]interface{}{})
+			json.NewEncoder(w).Encode([]any{})
 		}
 	})
 
@@ -73,7 +75,7 @@ func newTestGitHubProvider(t *testing.T, server *httptest.Server, allowedOrgs []
 	})
 	p.authBaseURL = server.URL + "/login/oauth/authorize"
 	p.tokenBaseURL = server.URL + "/login/oauth/access_token"
-	p.apiBaseURL = server.URL + "/user"
+	p.userURL = server.URL + "/user"
 	return p
 }
 
@@ -110,7 +112,7 @@ func TestGitHubProviderAuthorizeURL(t *testing.T) {
 }
 
 func TestGitHubProviderExchangeAndIdentify(t *testing.T) {
-	user := map[string]interface{}{
+	user := map[string]any{
 		"id":    float64(12345),
 		"login": "jsmith",
 		"name":  "John Smith",
@@ -118,7 +120,7 @@ func TestGitHubProviderExchangeAndIdentify(t *testing.T) {
 	}
 	// /user/emails must provide the primary+verified address - the /user
 	// profile email is no longer trusted.
-	emails := []map[string]interface{}{
+	emails := []map[string]any{
 		{"email": "j@example.com", "primary": true, "verified": true},
 	}
 	server := mockGitHubServer(t, user, nil, emails)
@@ -146,12 +148,12 @@ func TestGitHubProviderUnverifiedProfileEmailDropped(t *testing.T) {
 	// /user profile has a public email but /user/emails has no verified
 	// entries (or none match this address). The profile email must not
 	// leak through - Email should be empty.
-	user := map[string]interface{}{
+	user := map[string]any{
 		"id":    float64(99),
 		"login": "attacker",
 		"email": "victim@example.com", // attacker set this publicly but never verified
 	}
-	emails := []map[string]interface{}{
+	emails := []map[string]any{
 		{"email": "victim@example.com", "primary": true, "verified": false},
 	}
 	server := mockGitHubServer(t, user, nil, emails)
@@ -170,11 +172,11 @@ func TestGitHubProviderUnverifiedProfileEmailDropped(t *testing.T) {
 }
 
 func TestGitHubProviderOrgCheckPass(t *testing.T) {
-	user := map[string]interface{}{
+	user := map[string]any{
 		"id":    float64(1),
 		"login": "dev",
 	}
-	orgs := []map[string]interface{}{
+	orgs := []map[string]any{
 		{"login": "mycompany"},
 		{"login": "other-org"},
 	}
@@ -188,24 +190,68 @@ func TestGitHubProviderOrgCheckPass(t *testing.T) {
 }
 
 func TestGitHubProviderOrgCheckFail(t *testing.T) {
-	user := map[string]interface{}{
+	user := map[string]any{
 		"id":    float64(1),
 		"login": "outsider",
 	}
-	orgs := []map[string]interface{}{
+	orgs := []map[string]any{
 		{"login": "some-other-org"},
 	}
 	server := mockGitHubServer(t, user, orgs, nil)
 	p := newTestGitHubProvider(t, server, []string{"mycompany"})
 
 	_, err := p.ExchangeAndIdentify(context.Background(), "code", "https://zdas/callback")
-	if err == nil || !strings.Contains(err.Error(), "not in allowed organization") {
-		t.Errorf("expected org check failure, got %v", err)
+	if !errors.Is(err, ErrAccessDenied) {
+		t.Errorf("expected an error wrapping ErrAccessDenied, got %v", err)
+	}
+}
+
+// TestGitHubProviderOrgCheckPaginates verifies that an allowed organization
+// on a later page of the user's organizations is found.
+func TestGitHubProviderOrgCheckPaginates(t *testing.T) {
+	var pages []string
+	server := mockGitHubServer(t, map[string]any{"id": float64(1), "login": "member"}, nil, nil)
+	orgs := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		pages = append(pages, page)
+		var out []map[string]string
+		if page == "1" {
+			for i := range gitHubOrgsPageSize {
+				out = append(out, map[string]string{"login": fmt.Sprintf("org-%d", i)})
+			}
+		} else {
+			out = []map[string]string{{"login": "mycompany"}}
+		}
+		json.NewEncoder(w).Encode(out)
+	})
+	paged := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user/orgs" {
+			orgs(w, r)
+			return
+		}
+		server.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(paged.Close)
+	p := newTestGitHubProvider(t, paged, []string{"mycompany"})
+
+	if _, err := p.ExchangeAndIdentify(context.Background(), "code", "https://zdas/callback"); err != nil {
+		t.Fatalf("ExchangeAndIdentify: %v", err)
+	}
+	if len(pages) != 2 {
+		t.Errorf("read org pages %v, want 2", pages)
+	}
+}
+
+func TestGitHubProviderRejectsMissingSubject(t *testing.T) {
+	server := mockGitHubServer(t, map[string]any{"login": "no-id"}, nil, nil)
+	p := newTestGitHubProvider(t, server, nil)
+	if _, err := p.ExchangeAndIdentify(context.Background(), "code", "https://zdas/callback"); err == nil {
+		t.Error("user without an id accepted")
 	}
 }
 
 func TestGitHubProviderFieldMapping(t *testing.T) {
-	user := map[string]interface{}{
+	user := map[string]any{
 		"id":    float64(99),
 		"login": "handle",
 		"name":  "Full Name",
@@ -229,11 +275,11 @@ func TestGitHubProviderFieldMapping(t *testing.T) {
 
 func TestGitHubProviderEmailFromUserEmails(t *testing.T) {
 	// User profile has no public email - should fetch from /user/emails.
-	user := map[string]interface{}{
+	user := map[string]any{
 		"id":    float64(55),
 		"login": "noemail",
 	}
-	emails := []map[string]interface{}{
+	emails := []map[string]any{
 		{"email": "secondary@example.com", "primary": false, "verified": true},
 		{"email": "primary@example.com", "primary": true, "verified": true},
 	}
@@ -250,7 +296,7 @@ func TestGitHubProviderEmailFromUserEmails(t *testing.T) {
 }
 
 func TestExtractField(t *testing.T) {
-	data := map[string]interface{}{
+	data := map[string]any{
 		"str":     "hello",
 		"num":     float64(42),
 		"missing": nil,
