@@ -1,14 +1,17 @@
 package zdas
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -225,5 +228,52 @@ func TestDiscoveredProviderUsesUpstreamClient(t *testing.T) {
 	}
 	if _, err := srv.registry.Resolve("discovered"); err == nil {
 		t.Error("the discovered provider was registered past a refusing client")
+	}
+}
+
+// TestHTTPClientCapsResponseBody verifies that ZDAS's own client truncates
+// response bodies, which protects readers that have no cap of their own.
+func TestHTTPClientCapsResponseBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(bytes.Repeat([]byte("x"), maxResponseBytes+1<<20))
+	}))
+	t.Cleanup(srv.Close)
+
+	resp, err := httpClient.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != maxResponseBytes {
+		t.Errorf("read %d bytes, want %d", len(body), maxResponseBytes)
+	}
+}
+
+// TestOIDCProviderDefaultClientCapsDiscovery verifies that, without
+// OIDCProviderConfig.HTTPClient, discovery goes through ZDAS's own client
+// rather than http.DefaultClient: an oversized discovery document is
+// truncated and rejected instead of read whole.
+func TestOIDCProviderDefaultClientCapsDiscovery(t *testing.T) {
+	var issuer string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"padding":                strings.Repeat("x", maxResponseBytes),
+			"issuer":                 issuer,
+			"authorization_endpoint": issuer + "/authorize",
+			"token_endpoint":         issuer + "/token",
+			"jwks_uri":               issuer + "/jwks",
+		})
+	}))
+	t.Cleanup(srv.Close)
+	issuer = srv.URL
+
+	_, err := NewOIDCProvider(context.Background(), OIDCProviderConfig{Name: "big", Issuer: issuer, ClientID: "c"})
+	if err == nil {
+		t.Fatal("oversized discovery document accepted")
 	}
 }

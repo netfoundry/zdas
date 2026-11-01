@@ -156,8 +156,9 @@ func WithKeySet(active *KeySet, verifyOnly ...*KeySet) Option {
 // the controller's signers, and GitHub's OAuth and API calls. Requests to the
 // Ziti controller do not use it. An embedder whose issuers are chosen by
 // someone it does not fully trust uses it to control where those requests
-// may go, e.g. with a dialer that refuses internal addresses. NewServer
-// fails if c is nil.
+// may go, e.g. with a dialer that refuses internal addresses; c should also
+// bound response sizes, since go-oidc reads discovery documents and key sets
+// whole. NewServer fails if c is nil.
 func WithUpstreamHTTPClient(c *http.Client) Option {
 	return func(o *serverOptions) {
 		if c == nil {

@@ -8,10 +8,24 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	// providerSetupTimeout bounds building one OIDC provider, which fetches
+	// the issuer's discovery document.
+	providerSetupTimeout = 30 * time.Second
+	// signerPageSize is the page size requested from the controller, the
+	// largest it allows on public list endpoints.
+	signerPageSize = 500
+	// maxSignerPages bounds the pages fetched per poll, so that a
+	// controller reporting a wrong total cannot keep a poll going forever.
+	maxSignerPages = 20
 )
 
 // Discovery polls the Ziti controller's public ext-jwt-signers endpoint and
@@ -24,7 +38,12 @@ type Discovery struct {
 	configuredNames map[string]struct{}
 	client          *http.Client // reaches the controller
 	upstreamClient  *http.Client // reaches discovered issuers; nil uses the defaults
+	setupTimeout    time.Duration
+	pageSize        int
 	logger          *slog.Logger
+
+	pollMu sync.Mutex               // serializes polls
+	built  map[string]builtProvider // by name, from the last poll; guarded by pollMu
 
 	mu                sync.Mutex
 	cancel            context.CancelFunc
@@ -46,6 +65,8 @@ func NewDiscovery(cfg ControllerConfig, registry *ProviderRegistry, configuredNa
 		registry:        registry,
 		configuredNames: configuredNames,
 		client:          client,
+		setupTimeout:    providerSetupTimeout,
+		pageSize:        signerPageSize,
 		logger:          logger,
 	}, nil
 }
@@ -107,10 +128,20 @@ func (d *Discovery) loop(ctx context.Context) {
 	}
 }
 
-// signerResponse matches the relevant fields from the controller's
-// GET /edge/client/v1/external-jwt-signers response.
-type signerResponse struct {
-	Data []signerEntry `json:"data"`
+// signerPage is one page of the controller's response to
+// GET /edge/client/v1/external-jwt-signers. Entries are kept as sent so that
+// a merged list re-serves every field.
+type signerPage struct {
+	Data []json.RawMessage `json:"data"`
+	Meta struct {
+		Pagination signerPagination `json:"pagination"`
+	} `json:"meta"`
+}
+
+type signerPagination struct {
+	Limit      int `json:"limit"`
+	Offset     int `json:"offset"`
+	TotalCount int `json:"totalCount"`
 }
 
 type signerEntry struct {
@@ -139,6 +170,9 @@ func (d *Discovery) ExtJWTSignersBody() []byte {
 }
 
 func (d *Discovery) poll(ctx context.Context) error {
+	d.pollMu.Lock()
+	defer d.pollMu.Unlock()
+
 	rawSigners, signers, err := d.fetchSigners(ctx)
 	if err != nil {
 		return err
@@ -158,70 +192,184 @@ func (d *Discovery) poll(ctx context.Context) error {
 	d.extJWTSignersBody = rawSigners
 	d.mu.Unlock()
 
-	var providers []UpstreamProvider
-	for _, s := range signers {
-		if !s.EnrollToCertEnabled && !s.EnrollToTokenEnabled {
-			continue
-		}
-		// Exclude self. Match on issuer or externalAuthUrl (the public API
-		// may return an empty issuer for newly created signers).
-		if s.Issuer == d.cfg.SelfIssuer ||
-			(s.ExternalAuthURL != "" && strings.HasPrefix(s.ExternalAuthURL, d.cfg.SelfIssuer)) {
-			d.logger.Debug("excluding self from discovered signers", "name", s.Name, "issuer", s.Issuer)
-			continue
-		}
-		if s.Issuer == "" {
-			d.logger.Debug("skipping signer with empty issuer", "name", s.Name)
-			continue
-		}
-		p, err := NewOIDCProvider(ctx, OIDCProviderConfig{
-			Name:       s.Name,
-			Issuer:     s.Issuer,
-			ClientID:   s.ClientID,
-			AuthURL:    s.ExternalAuthURL,
-			HTTPClient: d.upstreamClient,
-			Logger:     d.logger,
-		})
-		if err != nil {
-			d.logger.Warn("failed to create oidc provider from signer, skipping", "name", s.Name, "error", err)
-			continue
-		}
-		d.logger.Info("discovered oidc provider", "name", s.Name, "issuer", s.Issuer)
-		providers = append(providers, p)
+	// Build providers in parallel, so that one slow issuer delays the poll
+	// by at most setupTimeout rather than holding up every other signer.
+	usable := d.usableSigners(signers)
+	built := make([]*OIDCProvider, len(usable))
+	var wg sync.WaitGroup
+	for i, s := range usable {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			built[i] = d.buildProvider(ctx, s)
+		}()
 	}
+	wg.Wait()
 
+	providers := make([]UpstreamProvider, 0, len(built))
+	d.built = make(map[string]builtProvider, len(built))
+	for i, p := range built {
+		if p != nil {
+			providers = append(providers, p)
+			d.built[p.Name()] = builtProvider{signer: usable[i], provider: p}
+		}
+	}
 	if err := d.registry.SetOIDCProviders(providers, d.configuredNames); err != nil {
 		return fmt.Errorf("update provider registry: %w", err)
 	}
 	return nil
 }
 
+// usableSigners returns the signers to build providers for: those with
+// enrollment enabled, other than ZDAS itself, that have an issuer, and whose
+// name, ignoring case, is not already taken by a configured provider or an
+// earlier signer. A signer whose name is taken is skipped rather than
+// failing the poll, so that one misnamed signer cannot stop discovery.
+func (d *Discovery) usableSigners(signers []signerEntry) []signerEntry {
+	taken := make(map[string]bool, len(d.configuredNames)+len(signers))
+	for name := range d.configuredNames {
+		taken[strings.ToLower(name)] = true
+	}
+	var usable []signerEntry
+	for _, s := range signers {
+		switch {
+		case !s.EnrollToCertEnabled && !s.EnrollToTokenEnabled:
+			continue
+		case d.isSelf(s):
+			d.logger.Debug("excluding self from discovered signers", "name", s.Name, "issuer", s.Issuer)
+			continue
+		case s.Issuer == "":
+			d.logger.Debug("skipping signer with empty issuer", "name", s.Name)
+			continue
+		case taken[strings.ToLower(s.Name)]:
+			d.logger.Warn("skipping signer whose name is already taken by another provider", "name", s.Name, "issuer", s.Issuer)
+			continue
+		}
+		taken[strings.ToLower(s.Name)] = true
+		usable = append(usable, s)
+	}
+	return usable
+}
+
+// isSelf reports whether s is ZDAS's own signer: its issuer is SelfIssuer,
+// or, since the public API may return an empty issuer for a new signer, its
+// externalAuthUrl is SelfIssuer or a path under it.
+func (d *Discovery) isSelf(s signerEntry) bool {
+	self := strings.TrimSuffix(d.cfg.SelfIssuer, "/")
+	if self == "" {
+		return false
+	}
+	return s.Issuer == d.cfg.SelfIssuer ||
+		s.ExternalAuthURL == self ||
+		strings.HasPrefix(s.ExternalAuthURL, self+"/")
+}
+
+// builtProvider is a provider discovery built and the signer it was built
+// from.
+type builtProvider struct {
+	signer   signerEntry
+	provider *OIDCProvider
+}
+
+// buildProvider builds the provider for s, allowing setupTimeout for its
+// discovery document. If that fails and the last poll built a provider from
+// identical signer settings, it returns that one, so that an issuer that is
+// briefly unreachable does not break sign-ins already under way. It returns
+// nil if there is neither.
+func (d *Discovery) buildProvider(ctx context.Context, s signerEntry) *OIDCProvider {
+	setupCtx, cancel := context.WithTimeout(ctx, d.setupTimeout)
+	defer cancel()
+	p, err := NewOIDCProvider(setupCtx, OIDCProviderConfig{
+		Name:       s.Name,
+		Issuer:     s.Issuer,
+		ClientID:   s.ClientID,
+		AuthURL:    s.ExternalAuthURL,
+		HTTPClient: d.upstreamClient,
+		Logger:     d.logger,
+	})
+	if err == nil {
+		d.logger.Info("discovered oidc provider", "name", s.Name, "issuer", s.Issuer)
+		return p
+	}
+	if prev, ok := d.built[s.Name]; ok && prev.signer == s {
+		d.logger.Warn("failed to refresh oidc provider from signer, keeping previous", "name", s.Name, "error", err)
+		return prev.provider
+	}
+	d.logger.Warn("failed to create oidc provider from signer, skipping", "name", s.Name, "error", err)
+	return nil
+}
+
+// fetchSigners fetches every page of the controller's signer list. It
+// returns the body to re-serve, which is the controller's own response when
+// the list fits on one page, and the parsed entries.
 func (d *Discovery) fetchSigners(ctx context.Context) (rawBody []byte, entries []signerEntry, err error) {
-	url := d.cfg.APIURL + "/edge/client/v1/external-jwt-signers"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	var all []json.RawMessage
+	for page := 1; ; page++ {
+		body, err := d.fetchSignerPage(ctx, len(all))
+		if err != nil {
+			return nil, nil, err
+		}
+		var resp signerPage
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return nil, nil, fmt.Errorf("parse signers response: %w", err)
+		}
+		if page == 1 {
+			rawBody = body
+		}
+		all = append(all, resp.Data...)
+		// Stop at the last page. A controller that ignores limit sends more
+		// than a page at once, and one that sends no total doesn't page.
+		total := resp.Meta.Pagination.TotalCount
+		if len(resp.Data) == 0 || len(resp.Data) > d.pageSize || len(all) >= total {
+			break
+		}
+		if page == maxSignerPages {
+			d.logger.Warn("signer list longer than the page limit, ignoring the rest",
+				"pages", maxSignerPages, "fetched", len(all), "total", total)
+			break
+		}
+		rawBody = nil // more than one page: re-serve the merged list
+	}
+
+	entries = make([]signerEntry, len(all))
+	for i, raw := range all {
+		if err := json.Unmarshal(raw, &entries[i]); err != nil {
+			return nil, nil, fmt.Errorf("parse signer %d: %w", i, err)
+		}
+	}
+	if rawBody == nil {
+		var merged signerPage
+		merged.Data = all
+		merged.Meta.Pagination = signerPagination{Limit: len(all), TotalCount: len(all)}
+		if rawBody, err = json.Marshal(merged); err != nil {
+			return nil, nil, fmt.Errorf("merge signer pages: %w", err)
+		}
+	}
+	return rawBody, entries, nil
+}
+
+func (d *Discovery) fetchSignerPage(ctx context.Context, offset int) ([]byte, error) {
+	q := url.Values{"limit": {strconv.Itoa(d.pageSize)}, "offset": {strconv.Itoa(offset)}}
+	reqURL := d.cfg.APIURL + "/edge/client/v1/external-jwt-signers?" + q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("build signers request: %w", err)
+		return nil, fmt.Errorf("build signers request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := d.client.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("fetch signers: %w", err)
+		return nil, fmt.Errorf("fetch signers: %w", err)
 	}
 	defer resp.Body.Close()
 	body, err := readResponseBody(resp)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read signers response: %w", err)
+		return nil, fmt.Errorf("read signers response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("signers endpoint returned %d: %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("signers endpoint returned %d: %s", resp.StatusCode, body)
 	}
-
-	var result signerResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, nil, fmt.Errorf("parse signers response: %w", err)
-	}
-	return body, result.Data, nil
+	return body, nil
 }
 
 // controllerClient builds an HTTP client for controller communication.

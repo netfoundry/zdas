@@ -281,3 +281,90 @@ func TestNewServerInjectedStoreNotOwned(t *testing.T) {
 	h := &Handler{srv: srv}
 	h.Stop() // must not panic on the nil store
 }
+
+// TestServerStartShutdown verifies that Start returns nil, not an error,
+// when Shutdown stops it, and that Shutdown can be called again.
+func TestServerStartShutdown(t *testing.T) {
+	srv, err := NewServer(replicaConfig(t), slog.Default())
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	started := make(chan error, 1)
+	go func() { started <- srv.Start(context.Background()) }()
+
+	// Wait until Start has its HTTP server, then stop it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		srv.mu.Lock()
+		serving := srv.httpSrv != nil
+		srv.mu.Unlock()
+		if serving {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Start did not begin serving")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case err := <-started:
+		if err != nil {
+			t.Errorf("Start after Shutdown = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after Shutdown")
+	}
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Errorf("second Shutdown: %v", err)
+	}
+}
+
+// TestServerShutdownBeforeStart verifies that a Shutdown that arrives
+// before Start begins serving, such as a signal during startup, keeps Start
+// from serving instead of being lost.
+func TestServerShutdownBeforeStart(t *testing.T) {
+	srv, err := NewServer(replicaConfig(t), slog.Default())
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Start(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Start = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start served after Shutdown")
+	}
+}
+
+// TestServerStartCanceledDuringDiscovery verifies that a ctx canceled
+// before serving makes Start return nil rather than a discovery error.
+func TestServerStartCanceledDuringDiscovery(t *testing.T) {
+	srv, err := NewServer(replicaConfig(t), slog.Default())
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	t.Cleanup(func() { srv.Shutdown(context.Background()) })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Errorf("Start with canceled ctx = %v, want nil", err)
+	}
+}
+
+func TestHandlerStopTwice(t *testing.T) {
+	h, err := NewHandler(replicaConfig(t), slog.Default())
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	h.Stop()
+	h.Stop()
+}

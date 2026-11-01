@@ -11,9 +11,34 @@ import (
 	"time"
 )
 
-// httpClient is the shared HTTP client for outbound requests (token exchanges,
-// GitHub API calls, etc.) with a sensible timeout.
-var httpClient = &http.Client{Timeout: 15 * time.Second}
+// httpClient is the shared HTTP client for requests to upstream identity
+// providers (OIDC discovery and keys, token exchanges, GitHub API calls,
+// etc.), with a timeout and a cap on response size.
+var httpClient = &http.Client{
+	Timeout:   15 * time.Second,
+	Transport: limitedBodyTransport{base: http.DefaultTransport},
+}
+
+// limitedBodyTransport truncates response bodies at maxResponseBytes, for
+// readers such as go-oidc's that read a whole body without a cap of their
+// own.
+type limitedBodyTransport struct {
+	base http.RoundTripper
+}
+
+func (t limitedBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = limitedBody{Reader: io.LimitReader(resp.Body, maxResponseBytes), Closer: resp.Body}
+	return resp, nil
+}
+
+type limitedBody struct {
+	io.Reader
+	io.Closer
+}
 
 // maxResponseBytes is the cap on outbound response body reads. Prevents a
 // compromised upstream or MITM from exhausting memory. 2 MB is generous for

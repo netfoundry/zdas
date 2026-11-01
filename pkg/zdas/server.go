@@ -2,9 +2,11 @@ package zdas
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -18,9 +20,12 @@ type Server struct {
 	discovery  *Discovery
 	reconciler *Reconciler // nil when fallback is disabled
 	handlers   *Handlers
-	httpSrv    *http.Server
-	chalSrv    *http.Server // ACME challenge listener (if separate from main)
 	logger     *slog.Logger
+
+	mu       sync.Mutex
+	stopping bool         // Shutdown has been called
+	httpSrv  *http.Server // nil until Start begins serving
+	chalSrv  *http.Server // ACME challenge listener (if separate from main)
 }
 
 // NewServer creates a fully-wired Server. Call Start to begin serving.
@@ -82,7 +87,7 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 		case ProviderTypeOIDC:
 			// Bound the OIDC discovery call so an unresponsive IdP can't
 			// hang startup indefinitely.
-			discoCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			discoCtx, cancel := context.WithTimeout(context.Background(), providerSetupTimeout)
 			oidcProv, err := NewOIDCProvider(discoCtx, OIDCProviderConfig{
 				Name:            pc.Name,
 				Issuer:          pc.OIDCIssuerURL,
@@ -177,6 +182,7 @@ func NewHandler(cfg Config, logger *slog.Logger, opts ...Option) (*Handler, erro
 	}
 	ctx := context.Background()
 	if err := srv.discovery.Start(ctx); err != nil {
+		srv.stopStore()
 		return nil, fmt.Errorf("start discovery: %w", err)
 	}
 	if srv.reconciler != nil {
@@ -186,23 +192,33 @@ func NewHandler(cfg Config, logger *slog.Logger, opts ...Option) (*Handler, erro
 }
 
 // Start performs initial discovery and begins serving HTTP(S). It blocks until
-// the server shuts down.
+// the server stops, and returns nil when that is because Shutdown was called,
+// including before serving began. A ctx canceled during initial discovery
+// also makes it return nil without serving; the caller still calls Shutdown.
 func (s *Server) Start(ctx context.Context) error {
 	if err := s.discovery.Start(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return fmt.Errorf("start discovery: %w", err)
 	}
 	if s.reconciler != nil {
 		s.reconciler.Start(ctx)
 	}
 
-	mux := s.handlers.Mux()
-	s.httpSrv = &http.Server{
-		Addr:         s.cfg.Listen,
-		Handler:      mux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+	srv := newHTTPServer(s.cfg.Listen, s.handlers.Mux())
+	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		// Shutdown may have run before the background work above started.
+		s.discovery.Stop()
+		if s.reconciler != nil {
+			s.reconciler.Stop()
+		}
+		return nil
 	}
+	s.httpSrv = srv
+	s.mu.Unlock()
 
 	s.logger.Info("starting zdas",
 		"listen", s.cfg.Listen,
@@ -211,32 +227,56 @@ func (s *Server) Start(ctx context.Context) error {
 		"providers", s.registry.Len(),
 	)
 
+	var err error
 	switch s.cfg.TLS.Mode {
 	case TLSModeNone:
-		return s.httpSrv.ListenAndServe()
+		err = srv.ListenAndServe()
 	case TLSModeStatic:
-		return s.httpSrv.ListenAndServeTLS(s.cfg.TLS.CertFile, s.cfg.TLS.KeyFile)
+		err = srv.ListenAndServeTLS(s.cfg.TLS.CertFile, s.cfg.TLS.KeyFile)
 	case TLSModeACME:
-		return s.listenACME()
+		err = s.listenACME(srv)
 	default:
-		return fmt.Errorf("unknown tls mode: %s", s.cfg.TLS.Mode)
+		err = fmt.Errorf("unknown tls mode: %s", s.cfg.TLS.Mode)
+	}
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+// newHTTPServer returns a server for addr with ZDAS's timeouts.
+func newHTTPServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:         addr,
+		Handler:      h,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 }
 
-// Shutdown gracefully shuts down the server.
+// Shutdown gracefully shuts down the server: it stops accepting connections,
+// waits for in-flight requests until ctx is done, then stops background
+// work. It may be called more than once, and before or during Start.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	s.stopping = true
+	httpSrv, chalSrv := s.httpSrv, s.chalSrv
+	s.mu.Unlock()
+
+	var errs []error
+	if chalSrv != nil {
+		errs = append(errs, chalSrv.Shutdown(ctx))
+	}
+	if httpSrv != nil {
+		errs = append(errs, httpSrv.Shutdown(ctx))
+	}
 	s.discovery.Stop()
 	if s.reconciler != nil {
 		s.reconciler.Stop()
 	}
 	s.stopStore()
-	if s.chalSrv != nil {
-		s.chalSrv.Shutdown(ctx)
-	}
-	if s.httpSrv != nil {
-		return s.httpSrv.Shutdown(ctx)
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // stopStore stops the session store cleanup goroutine if ZDAS created the

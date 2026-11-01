@@ -3,12 +3,22 @@ package zdas
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
+
+// signerResponse is the controller's signer list as a mock controller sends
+// it.
+type signerResponse struct {
+	Data []signerEntry `json:"data"`
+}
 
 // mockControllerAndIDPs sets up:
 //   - a mock Ziti controller that returns the given signer entries
@@ -126,24 +136,203 @@ func TestDiscoveryFiltersNonEnrollToCert(t *testing.T) {
 	}
 }
 
-func TestDiscoveryNameCollisionWithConfigured(t *testing.T) {
+// TestDiscoveryNameCollisionSkipsSigner verifies that a signer whose name is
+// taken, ignoring case, by a configured provider or an earlier signer is
+// skipped without failing the poll, so later polls still pick up removals.
+func TestDiscoveryNameCollisionSkipsSigner(t *testing.T) {
 	signers := []signerEntry{
-		{Name: "github", ClientID: "c", EnrollToCertEnabled: true},
+		{Name: "GitHub", ClientID: "c", EnrollToCertEnabled: true},
+		{Name: "kc", ClientID: "c", EnrollToCertEnabled: true},
+		{Name: "KC", ClientID: "c2", EnrollToCertEnabled: true},
 	}
 	ctrl, _ := mockControllerAndIDPs(t, signers)
 
 	reg := NewProviderRegistry()
 	configured := map[string]struct{}{"github": {}}
-	// Pre-register the configured provider.
-	_ = reg.Register(&stubProvider{name: "github", issuer: "https://github.com"})
+	gh := &stubProvider{name: "github", issuer: "https://github.com"}
+	_ = reg.Register(gh)
 
 	d, err := NewDiscovery(ControllerConfig{APIURL: ctrl.URL}, reg, configured, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = d.RunOnce(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "collides") {
-		t.Errorf("expected collision error, got %v", err)
+	if err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	names := reg.Names()
+	slices.Sort(names)
+	if !slices.Equal(names, []string{"github", "kc"}) {
+		t.Fatalf("providers = %v, want [github kc]", names)
+	}
+	if p, _ := reg.Resolve("github"); p != gh {
+		t.Error("configured provider was replaced")
+	}
+
+	// The signer is removed on the controller; the colliding signer must not
+	// keep the poll from applying that.
+	signers2 := []signerEntry{{Name: "GitHub", ClientID: "c", EnrollToCertEnabled: true}}
+	ctrl2, _ := mockControllerAndIDPs(t, signers2)
+	d.cfg.APIURL = ctrl2.URL
+	if err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("second RunOnce: %v", err)
+	}
+	if _, err := reg.Resolve("kc"); err == nil {
+		t.Error("signer removed on the controller is still registered")
+	}
+}
+
+func TestDiscoveryIsSelf(t *testing.T) {
+	cases := []struct {
+		self string
+		s    signerEntry
+		want bool
+	}{
+		{"https://zdas.example.com", signerEntry{Issuer: "https://zdas.example.com"}, true},
+		{"https://zdas.example.com", signerEntry{ExternalAuthURL: "https://zdas.example.com/authorize"}, true},
+		{"https://zdas.example.com/", signerEntry{ExternalAuthURL: "https://zdas.example.com/authorize"}, true},
+		{"https://zdas.example.com", signerEntry{ExternalAuthURL: "https://zdas.example.com"}, true},
+		{"https://zdas.example.com", signerEntry{ExternalAuthURL: "https://zdas.example.com.evil/authorize"}, false},
+		{"https://zdas.example.com", signerEntry{Issuer: "https://idp.example.com"}, false},
+		{"", signerEntry{Issuer: "https://idp.example.com", ExternalAuthURL: "https://idp.example.com/auth"}, false},
+	}
+	for _, tc := range cases {
+		d := &Discovery{cfg: ControllerConfig{SelfIssuer: tc.self}}
+		if got := d.isSelf(tc.s); got != tc.want {
+			t.Errorf("isSelf(%+v) with SelfIssuer %q = %v, want %v", tc.s, tc.self, got, tc.want)
+		}
+	}
+}
+
+// TestDiscoveryUnresponsiveIssuer verifies that an issuer that never answers
+// delays a poll by at most the setup timeout and does not keep other
+// signers' providers from being registered.
+func TestDiscoveryUnresponsiveIssuer(t *testing.T) {
+	release := make(chan struct{})
+	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	t.Cleanup(hung.Close)
+	t.Cleanup(func() { close(release) })
+
+	signers := []signerEntry{
+		{Name: "hung", Issuer: hung.URL, ClientID: "c", EnrollToCertEnabled: true},
+		{Name: "kc", ClientID: "c", EnrollToCertEnabled: true},
+	}
+	ctrl, _ := mockControllerAndIDPs(t, signers)
+
+	reg := NewProviderRegistry()
+	d, err := NewDiscovery(ControllerConfig{APIURL: ctrl.URL}, reg, nil, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.setupTimeout = 200 * time.Millisecond
+
+	start := time.Now()
+	if err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("poll took %v with one unresponsive issuer", elapsed)
+	}
+	if names := reg.Names(); !slices.Equal(names, []string{"kc"}) {
+		t.Errorf("providers = %v, want [kc]", names)
+	}
+}
+
+// TestDiscoveryKeepsProviderWhenRefreshFails verifies that a signer whose
+// issuer is briefly unreachable keeps the provider the last poll built, but
+// only while the signer's settings are unchanged.
+func TestDiscoveryKeepsProviderWhenRefreshFails(t *testing.T) {
+	signers := []signerEntry{{Name: "kc", ClientID: "c", EnrollToCertEnabled: true}}
+	ctrl, idps := mockControllerAndIDPs(t, signers)
+
+	reg := NewProviderRegistry()
+	d, err := NewDiscovery(ControllerConfig{APIURL: ctrl.URL}, reg, nil, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	first, err := reg.Resolve("kc")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	idps[0].Close()
+	if err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce with issuer down: %v", err)
+	}
+	if p, err := reg.Resolve("kc"); err != nil || p != first {
+		t.Errorf("provider after failed refresh = %v, %v; want the previous one", p, err)
+	}
+
+	signers[0].ClientID = "changed"
+	if err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce with changed signer: %v", err)
+	}
+	if _, err := reg.Resolve("kc"); err == nil {
+		t.Error("provider kept although the signer's settings changed")
+	}
+}
+
+// TestDiscoveryPaginates verifies that discovery follows the controller's
+// pagination, registers signers from every page, and re-serves the merged
+// list with each entry as the controller sent it.
+func TestDiscoveryPaginates(t *testing.T) {
+	var entries []string
+	for i := range 3 {
+		idp, _ := mockOIDCServer(t, map[string]interface{}{"sub": "u"})
+		entries = append(entries, fmt.Sprintf(
+			`{"id":"id%d","name":"kc%d","issuer":%q,"clientId":"c","enrollToCertEnabled":true}`, i, i, idp.URL))
+	}
+	var offsets []string
+	ctrlMux := http.NewServeMux()
+	ctrlMux.HandleFunc("/edge/client/v1/external-jwt-signers", func(w http.ResponseWriter, r *http.Request) {
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+		offsets = append(offsets, r.URL.Query().Get("offset"))
+		end := min(offset+limit, len(entries))
+		fmt.Fprintf(w, `{"data":[%s],"meta":{"pagination":{"limit":%d,"offset":%d,"totalCount":%d}}}`,
+			strings.Join(entries[offset:end], ","), limit, offset, len(entries))
+	})
+	ctrl := httptest.NewServer(ctrlMux)
+	t.Cleanup(ctrl.Close)
+
+	reg := NewProviderRegistry()
+	d, err := NewDiscovery(ControllerConfig{APIURL: ctrl.URL}, reg, nil, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.pageSize = 2
+	if err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if !slices.Equal(offsets, []string{"0", "2"}) {
+		t.Errorf("requested offsets %v, want [0 2]", offsets)
+	}
+	names := reg.Names()
+	slices.Sort(names)
+	if !slices.Equal(names, []string{"kc0", "kc1", "kc2"}) {
+		t.Errorf("providers = %v, want [kc0 kc1 kc2]", names)
+	}
+	var served struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+		Meta struct {
+			Pagination signerPagination `json:"pagination"`
+		} `json:"meta"`
+	}
+	if err := json.Unmarshal(d.ExtJWTSignersBody(), &served); err != nil {
+		t.Fatalf("parse served signers: %v", err)
+	}
+	if len(served.Data) != 3 || served.Data[2].ID != "id2" {
+		t.Errorf("served signers = %+v, want all three with their ids", served.Data)
+	}
+	if served.Meta.Pagination.TotalCount != 3 {
+		t.Errorf("served totalCount = %d, want 3", served.Meta.Pagination.TotalCount)
 	}
 }
 

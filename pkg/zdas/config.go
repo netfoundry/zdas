@@ -66,11 +66,20 @@ type Config struct {
 	RateLimit           RateLimitConfig `yaml:"rate_limit"`
 }
 
-// RateLimitConfig controls per-IP rate limiting on the /authorize endpoint.
-// When AuthorizePerSecond is zero (the default), rate limiting is disabled.
+// RateLimitConfig controls per-client rate limiting on the /authorize
+// endpoint. When AuthorizePerSecond is zero (the default), rate limiting is
+// disabled.
+//
+// A client is the peer address of the connection: an IPv4 address, or an
+// IPv6 /64. Behind a reverse proxy, list the proxy in TrustedProxies so that
+// requests are counted against the address the proxy reports in
+// X-Forwarded-For; otherwise every request counts against the proxy.
+// X-Forwarded-For is ignored from peers that are not listed, since any
+// client can send it.
 type RateLimitConfig struct {
-	AuthorizePerSecond float64 `yaml:"authorize_per_second"` // sustained rate per IP; 0 = disabled
-	AuthorizeBurst     int     `yaml:"authorize_burst"`      // peak burst per IP
+	AuthorizePerSecond float64  `yaml:"authorize_per_second"` // sustained rate per client; 0 = disabled
+	AuthorizeBurst     int      `yaml:"authorize_burst"`      // peak burst per client
+	TrustedProxies     []string `yaml:"trusted_proxies"`      // IP addresses or CIDR prefixes
 }
 
 // TLSConfig selects and configures the TLS serving mode.
@@ -321,6 +330,11 @@ func (c *Config) Validate() error {
 	for i, raw := range c.AllowedRedirectURIs {
 		if _, err := parseRedirectURI(raw); err != nil {
 			return fmt.Errorf("allowed_redirect_uris[%d] %q: %w", i, raw, err)
+		}
+	}
+	for i, raw := range c.RateLimit.TrustedProxies {
+		if _, err := parseTrustedProxy(raw); err != nil {
+			return fmt.Errorf("rate_limit.trusted_proxies[%d]: %w", i, err)
 		}
 	}
 	return nil
