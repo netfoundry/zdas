@@ -11,8 +11,8 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwk"
+	"github.com/lestrrat-go/jwx/v3/jwa"
+	"github.com/lestrrat-go/jwx/v3/jwk"
 )
 
 // KeySet is an EC P-256 signing key pair plus its public JWK representation.
@@ -64,7 +64,7 @@ func NewKeySet(priv *ecdsa.PrivateKey) (*KeySet, error) {
 		return nil, errors.New("public key does not match private key")
 	}
 
-	pub, err := jwk.FromRaw(priv.Public())
+	pub, err := jwk.Import(priv.Public())
 	if err != nil {
 		return nil, fmt.Errorf("wrap public key as jwk: %w", err)
 	}
@@ -76,20 +76,20 @@ func NewKeySet(priv *ecdsa.PrivateKey) (*KeySet, error) {
 	if err := pub.Set(jwk.KeyIDKey, kid); err != nil {
 		return nil, fmt.Errorf("set kid: %w", err)
 	}
-	if err := pub.Set(jwk.AlgorithmKey, jwa.ES256); err != nil {
+	if err := pub.Set(jwk.AlgorithmKey, jwa.ES256()); err != nil {
 		return nil, fmt.Errorf("set alg: %w", err)
 	}
 	if err := pub.Set(jwk.KeyUsageKey, "sig"); err != nil {
 		return nil, fmt.Errorf("set use: %w", err)
 	}
-	signing, err := jwk.FromRaw(priv)
+	signing, err := jwk.Import(priv)
 	if err != nil {
 		return nil, fmt.Errorf("wrap private key as jwk: %w", err)
 	}
 	if err := signing.Set(jwk.KeyIDKey, kid); err != nil {
 		return nil, fmt.Errorf("set signing kid: %w", err)
 	}
-	if err := signing.Set(jwk.AlgorithmKey, jwa.ES256); err != nil {
+	if err := signing.Set(jwk.AlgorithmKey, jwa.ES256()); err != nil {
 		return nil, fmt.Errorf("set signing alg: %w", err)
 	}
 	return &KeySet{private: priv, privateJWK: signing, publicJWK: pub, kid: kid}, nil

@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwk"
-	"github.com/lestrrat-go/jwx/v2/jws"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v3/jwa"
+	"github.com/lestrrat-go/jwx/v3/jwk"
+	"github.com/lestrrat-go/jwx/v3/jws"
+	"github.com/lestrrat-go/jwx/v3/jwt"
 )
 
 func TestGenerateKeySet(t *testing.T) {
@@ -35,16 +35,16 @@ func TestGenerateKeySet(t *testing.T) {
 	if k.KeyType().String() != "EC" {
 		t.Errorf("key type = %q, want EC", k.KeyType())
 	}
-	if k.Algorithm().String() != jwa.ES256.String() {
-		t.Errorf("algorithm = %q, want ES256", k.Algorithm())
+	if alg, _ := k.Algorithm(); alg.String() != jwa.ES256().String() {
+		t.Errorf("algorithm = %q, want ES256", alg)
 	}
-	if k.KeyID() != ks.KID() {
-		t.Errorf("kid on jwk = %q, want %q", k.KeyID(), ks.KID())
+	if kid, _ := k.KeyID(); kid != ks.KID() {
+		t.Errorf("kid on jwk = %q, want %q", kid, ks.KID())
 	}
 
 	// Should not contain private material.
 	var raw ecdsa.PublicKey
-	if err := k.Raw(&raw); err != nil {
+	if err := jwk.Export(k, &raw); err != nil {
 		t.Fatalf("extract raw public key: %v", err)
 	}
 }
@@ -79,18 +79,18 @@ func TestSignAndVerifyRoundtrip(t *testing.T) {
 	payload := []byte(`{"sub":"test"}`)
 
 	// Sign with private key using ES256.
-	privJWK, err := jwk.FromRaw(ks.Private())
+	privJWK, err := jwk.Import(ks.Private())
 	if err != nil {
 		t.Fatalf("wrap private key: %v", err)
 	}
 	if err := privJWK.Set(jwk.KeyIDKey, ks.KID()); err != nil {
 		t.Fatalf("set kid on private jwk: %v", err)
 	}
-	if err := privJWK.Set(jwk.AlgorithmKey, jwa.ES256); err != nil {
+	if err := privJWK.Set(jwk.AlgorithmKey, jwa.ES256()); err != nil {
 		t.Fatalf("set alg on private jwk: %v", err)
 	}
 
-	signed, err := jws.Sign(payload, jws.WithKey(jwa.ES256, privJWK))
+	signed, err := jws.Sign(payload, jws.WithKey(jwa.ES256(), privJWK))
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestNewKeySetKIDIsThumbprint(t *testing.T) {
 	}
 
 	// Compute the RFC 7638 thumbprint independently of NewKeySet.
-	pub, err := jwk.FromRaw(priv.Public())
+	pub, err := jwk.Import(priv.Public())
 	if err != nil {
 		t.Fatalf("wrap public key: %v", err)
 	}
@@ -176,12 +176,14 @@ func TestNewKeySetRejectsInvalidKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate key b: %v", err)
 	}
-	mismatched := &ecdsa.PrivateKey{PublicKey: b.PublicKey, D: a.D}
+	// a's private key with b's public half.
+	mismatched := *a
+	mismatched.PublicKey = b.PublicKey
 
 	for name, priv := range map[string]*ecdsa.PrivateKey{
 		"nil":        nil,
 		"P-384":      p384,
-		"mismatched": mismatched,
+		"mismatched": &mismatched,
 	} {
 		if _, err := NewKeySet(priv); err == nil {
 			t.Errorf("%s: NewKeySet succeeded, want error", name)
@@ -214,7 +216,7 @@ func TestNewKeySetJWKSRoundTrip(t *testing.T) {
 		t.Fatalf("kid %q not in JWKS", ks.KID())
 	}
 	var raw ecdsa.PublicKey
-	if err := key.Raw(&raw); err != nil {
+	if err := jwk.Export(key, &raw); err != nil {
 		t.Fatalf("extract raw public key: %v", err)
 	}
 	if !raw.Equal(&priv.PublicKey) {

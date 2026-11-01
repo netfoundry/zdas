@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwk"
-	"github.com/lestrrat-go/jwx/v2/jws"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v3/jwk"
+	"github.com/lestrrat-go/jwx/v3/jws"
+	"github.com/lestrrat-go/jwx/v3/jwt"
 )
 
 func defaultClaimsConfig() ClaimsConfig {
@@ -205,19 +205,19 @@ func TestMintTokenRoundtrip(t *testing.T) {
 		t.Fatalf("parse+verify: %v", err)
 	}
 
-	if tok.Issuer() != "https://zdas.example.com" {
-		t.Errorf("issuer = %q", tok.Issuer())
+	if stringClaim(tok, "iss") != "https://zdas.example.com" {
+		t.Errorf("issuer = %q", stringClaim(tok, "iss"))
 	}
-	idName, _ := tok.Get("device_identity_name")
+	idName := claim(tok, "device_identity_name")
 	if idName != "alice-laptop" {
 		t.Errorf("device_identity_name = %v", idName)
 	}
-	extID, _ := tok.Get("device_external_id")
+	extID := claim(tok, "device_external_id")
 	if extID == nil || extID == "" {
 		t.Error("device_external_id missing from token")
 	}
-	if tok.Subject() != extID {
-		t.Errorf("sub = %q, device_external_id = %q, want equal", tok.Subject(), extID)
+	if stringClaim(tok, "sub") != extID {
+		t.Errorf("sub = %q, device_external_id = %q, want equal", stringClaim(tok, "sub"), extID)
 	}
 }
 
@@ -318,4 +318,20 @@ func TestExpandTemplateSinglePass(t *testing.T) {
 	if got := expandFallbackTemplate("{username}-{nonce_short}", "{nonce_short}", "abc"); got != "{nonce_short}-abc" {
 		t.Errorf("expandFallbackTemplate = %q, want %q", got, "{nonce_short}-abc")
 	}
+}
+
+// claim returns the value of the named claim in tok, or nil if it has none.
+func claim(tok jwt.Token, name string) any {
+	var v any
+	if err := tok.Get(name, &v); err != nil {
+		return nil
+	}
+	return v
+}
+
+// stringClaim returns the named claim in tok as a string, or "" if it has
+// none or it is not a string.
+func stringClaim(tok jwt.Token, name string) string {
+	s, _ := claim(tok, name).(string)
+	return s
 }
