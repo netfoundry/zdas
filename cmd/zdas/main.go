@@ -45,7 +45,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		logger.Info("shutting down")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -59,4 +61,7 @@ func main() {
 		logger.Error("server exited", "error", err)
 		os.Exit(1)
 	}
+	// Start returns nil only once a signal has started the shutdown; wait
+	// for in-flight requests to drain.
+	<-shutdownDone
 }

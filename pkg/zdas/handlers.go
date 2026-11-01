@@ -70,16 +70,7 @@ func newHandlers(cfg Config, keys *KeySet, verifyKeys []*KeySet, registry *Provi
 		logger:      logger,
 	}
 	h.cookiePath, h.cookieSecure = bindingCookieScope(cfg.ExternalURL)
-	if cfg.RateLimit.AuthorizePerSecond > 0 {
-		burst := cfg.RateLimit.AuthorizeBurst
-		if burst == 0 {
-			burst = int(cfg.RateLimit.AuthorizePerSecond) * 2
-			if burst < 1 {
-				burst = 1
-			}
-		}
-		h.rateLimiter = newIPRateLimiter(cfg.RateLimit.AuthorizePerSecond, burst)
-	}
+	h.rateLimiter = newIPRateLimiter(cfg.RateLimit, logger)
 	return h
 }
 
@@ -153,7 +144,7 @@ func (h *Handlers) handleJWKS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleAuthorize(w http.ResponseWriter, r *http.Request) {
-	if h.rateLimiter != nil && !h.rateLimiter.allow(extractIP(r)) {
+	if h.rateLimiter != nil && !h.rateLimiter.allow(r) {
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return

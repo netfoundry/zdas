@@ -1,6 +1,7 @@
 package zdas
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -118,4 +119,39 @@ func TestRandomIDUniqueness(t *testing.T) {
 		}
 		seen[id] = struct{}{}
 	}
+}
+
+// TestSessionStoreFullEvictsOldest verifies that a full store makes room for
+// a new session by evicting the oldest, so a flood of anonymous /authorize
+// requests cannot lock out every user.
+func TestSessionStoreFullEvictsOldest(t *testing.T) {
+	s := NewSessionStore(10*time.Minute, time.Minute)
+	t.Cleanup(s.Stop)
+	start := time.Now().Add(-time.Minute)
+	for i := range maxStoreEntries {
+		s.putSession(fmt.Sprintf("s%d", i), &AuthSession{CreatedAt: start.Add(time.Duration(i) * time.Millisecond)})
+	}
+
+	id, err := s.CreateSession(&AuthSession{})
+	if err != nil {
+		t.Fatalf("CreateSession on a full store: %v", err)
+	}
+	if len(s.sessions) != maxStoreEntries {
+		t.Errorf("store holds %d sessions, want %d", len(s.sessions), maxStoreEntries)
+	}
+	if _, ok := s.sessions["s0"]; ok {
+		t.Error("oldest session was not evicted")
+	}
+	if _, ok := s.sessions["s1"]; !ok {
+		t.Error("second-oldest session was evicted")
+	}
+	if s.GetSession(id) == nil {
+		t.Error("new session not stored")
+	}
+}
+
+func TestSessionStoreStopTwice(t *testing.T) {
+	s := NewSessionStore(time.Minute, time.Minute)
+	s.Stop()
+	s.Stop()
 }

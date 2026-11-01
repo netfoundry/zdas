@@ -72,9 +72,11 @@ type OIDCProviderConfig struct {
 	// the signing keys, the token exchange and userinfo. An embedder whose
 	// issuers are chosen by someone it does not fully trust uses it to
 	// control where those requests may go, e.g. with a dialer that refuses
-	// internal addresses. nil keeps the defaults: discovery and keys use
-	// the client in ctx (oidc.ClientContext) or http.DefaultClient, and the
-	// token exchange and userinfo use ZDAS's own client.
+	// internal addresses. go-oidc reads discovery documents and key sets
+	// whole, so the client should also bound response sizes. nil uses
+	// ZDAS's own client, which has a timeout and caps responses at 2 MB,
+	// except that discovery and keys use the client in ctx
+	// (oidc.ClientContext) if there is one.
 	HTTPClient *http.Client
 
 	// Logger receives userinfo fetch warnings. nil uses slog.Default().
@@ -84,12 +86,15 @@ type OIDCProviderConfig struct {
 // NewOIDCProvider creates an OIDCProvider from the given config. It creates an
 // ID token verifier bound to the provider's OIDC discovery data.
 func NewOIDCProvider(ctx context.Context, cfg OIDCProviderConfig) (*OIDCProvider, error) {
+	// go-oidc keeps the client it finds in ctx for later key fetches.
 	client := cfg.HTTPClient
 	if client != nil {
-		// go-oidc keeps the client it finds here for later key fetches.
 		ctx = oidc.ClientContext(ctx, client)
 	} else {
 		client = httpClient
+		if _, ok := ctx.Value(oauth2.HTTPClient).(*http.Client); !ok {
+			ctx = oidc.ClientContext(ctx, httpClient)
+		}
 	}
 	provider, err := oidc.NewProvider(ctx, cfg.Issuer)
 	if err != nil {

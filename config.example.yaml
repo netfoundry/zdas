@@ -89,12 +89,20 @@ session:
   timeout: "10m"
   code_expiry: "60s"
 
-# Per-IP rate limiting on /authorize. Disabled by default (0).
-# When enabled, each client IP gets a token bucket with the configured
-# sustained rate and burst. Requests over the limit get 429 Too Many Requests.
+# Per-client rate limiting on /authorize. Disabled by default (0). Every
+# /authorize request creates a session before anyone signs in, so enable this
+# when ZDAS is reachable from the internet, unless something in front of it
+# already limits /authorize. A client is the connection's peer address (an
+# IPv4 address or an IPv6 /64), and requests over the limit get 429.
+#
+# Behind a reverse proxy, list it in trusted_proxies (IP addresses or CIDR
+# prefixes) so requests count against the client address it reports in
+# X-Forwarded-For. Without that, every request counts against the proxy.
+# X-Forwarded-For from any other peer is ignored, since clients can set it.
 # rate_limit:
 #   authorize_per_second: 10
 #   authorize_burst: 20
+#   trusted_proxies: ["10.0.0.0/8"]
 
 # Where /authorize may send the browser back with a code. Unset (the
 # default) accepts only loopback callbacks - http(s) to localhost or a

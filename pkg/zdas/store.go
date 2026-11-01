@@ -37,9 +37,12 @@ import (
 // numbers in AuthCode.Claims come back as float64, so integers beyond 2^53
 // lose precision. Provisioners should send large numeric claims as strings.
 //
-// The in-memory default caps each kind at 10,000 entries. ZDAS imposes no
-// cap on a Store, and every /authorize request creates an entry, so bound
-// /authorize with Config.RateLimit or in front of ZDAS.
+// The in-memory default holds at most 10,000 entries of each kind. When
+// sessions reach that, it evicts the oldest, since anyone can create one;
+// codes and pending provisions, which need an upstream login, are refused
+// instead. ZDAS imposes no cap on a Store, and every /authorize request
+// creates an entry, so bound /authorize with Config.RateLimit or in front of
+// ZDAS.
 //
 // AuthCode.Used is an in-memory detail and not part of this contract.
 type Store interface {
@@ -71,7 +74,8 @@ type sessionStoreAdapter struct {
 }
 
 func (a sessionStoreAdapter) CreateSession(_ context.Context, key string, sess *AuthSession) error {
-	return a.s.putSession(key, sess)
+	a.s.putSession(key, sess)
+	return nil
 }
 
 func (a sessionStoreAdapter) ConsumeSession(_ context.Context, key string) (*AuthSession, error) {

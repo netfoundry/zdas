@@ -53,14 +53,14 @@ type PendingProvision struct {
 	CreatedAt                   time.Time
 }
 
-// SessionStore is an in-memory store for auth sessions, authorization codes,
-// and pending provisions with automatic expiration. It is safe for concurrent
-// use.
 // maxStoreEntries is a per-map capacity cap to prevent memory exhaustion from
 // a flood of /authorize requests. 10,000 concurrent in-flight sessions is far
 // beyond any realistic enrollment volume.
 const maxStoreEntries = 10_000
 
+// SessionStore is an in-memory store for auth sessions, authorization codes,
+// and pending provisions with automatic expiration. It is safe for concurrent
+// use.
 type SessionStore struct {
 	sessionTTL time.Duration
 	codeTTL    time.Duration
@@ -71,6 +71,7 @@ type SessionStore struct {
 	provisions map[string]*PendingProvision
 
 	stopCleanup chan struct{}
+	stopOnce    sync.Once
 }
 
 // NewSessionStore creates a store with the given TTLs and starts a background
@@ -88,9 +89,10 @@ func NewSessionStore(sessionTTL, codeTTL time.Duration) *SessionStore {
 	return s
 }
 
-// Stop halts the background cleanup goroutine.
+// Stop halts the background cleanup goroutine. It may be called more than
+// once.
 func (s *SessionStore) Stop() {
-	close(s.stopCleanup)
+	s.stopOnce.Do(func() { close(s.stopCleanup) })
 }
 
 // CreateSession stores a new auth session and returns its ID.
@@ -100,21 +102,35 @@ func (s *SessionStore) CreateSession(sess *AuthSession) (string, error) {
 		return "", err
 	}
 	sess.CreatedAt = time.Now()
-	if err := s.putSession(id, sess); err != nil {
-		return "", err
-	}
+	s.putSession(id, sess)
 	return id, nil
 }
 
-// putSession stores sess under id as given, without stamping CreatedAt.
-func (s *SessionStore) putSession(id string, sess *AuthSession) error {
+// putSession stores sess under id as given, without stamping CreatedAt. When
+// the store is full it evicts the oldest session rather than refusing the new
+// one: sessions are created before anyone authenticates, so refusing them
+// would let anonymous /authorize requests lock every user out.
+func (s *SessionStore) putSession(id string, sess *AuthSession) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.sessions) >= maxStoreEntries {
-		return fmt.Errorf("session store full (%d entries)", maxStoreEntries)
+		s.evictOldestSession()
 	}
 	s.sessions[id] = sess
-	return nil
+}
+
+// evictOldestSession removes the session with the earliest CreatedAt. s.mu
+// must be held. It scans every session, which happens only while the store
+// is full.
+func (s *SessionStore) evictOldestSession() {
+	var oldestID string
+	var oldest time.Time
+	for id, sess := range s.sessions {
+		if oldestID == "" || sess.CreatedAt.Before(oldest) {
+			oldestID, oldest = id, sess.CreatedAt
+		}
+	}
+	delete(s.sessions, oldestID)
 }
 
 // GetSession retrieves and deletes (consumes) an auth session by ID. Returns
