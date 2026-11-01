@@ -166,8 +166,13 @@ pkg/zdas/
   redirect.go      redirect_uri validation (loopback by default)
   binding.go       cookie binding /callback to the browser that started /authorize
   store.go         Store interface for in-flight enrollment state
-  session.go       in-memory session and auth code store (the default Store)
+  session.go       the entries a Store holds
+  memstore.go      in-memory Store (the default)
   zdastest/        conformance suite for Store implementations
+  provisioner.go   EnrollmentProvisioner hook for embedders
+  options.go       NewServer / NewHandler options
+  ratelimit.go     per-client rate limiting on /authorize
+  httpclient.go    outbound HTTP clients and response limits
   identity.go      OpenZiti identity file parsing and management API auth
   reconciler.go    fallback identity reconciliation
   server.go        server assembly and TLS modes

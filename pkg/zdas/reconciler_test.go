@@ -94,6 +94,13 @@ func (m *mockManagementAPI) handler() http.Handler {
 	return mux
 }
 
+// pendingCount returns the number of identities awaiting reconciliation.
+func (r *fallbackReconciler) pendingCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.pending)
+}
+
 func TestReconcilerTrack(t *testing.T) {
 	r := newFallbackReconciler(
 		FallbackConfig{PollInterval: 10 * time.Second, Timeout: 1 * time.Hour},
@@ -102,13 +109,13 @@ func TestReconcilerTrack(t *testing.T) {
 		"https://ctrl",
 		slog.Default(),
 	)
-	r.Track("ext-id-1", "alice", "abc123")
-	if r.PendingCount() != 1 {
-		t.Fatalf("PendingCount = %d, want 1", r.PendingCount())
+	r.track("ext-id-1", "alice", "abc123")
+	if r.pendingCount() != 1 {
+		t.Fatalf("PendingCount = %d, want 1", r.pendingCount())
 	}
-	r.Track("ext-id-2", "bob", "def456")
-	if r.PendingCount() != 2 {
-		t.Fatalf("PendingCount = %d, want 2", r.PendingCount())
+	r.track("ext-id-2", "bob", "def456")
+	if r.pendingCount() != 2 {
+		t.Fatalf("PendingCount = %d, want 2", r.pendingCount())
 	}
 }
 
@@ -222,13 +229,13 @@ func TestReconcilerTimeout(t *testing.T) {
 	r.sessionToken = "mock-zt-session"
 	r.sessionExpires = time.Now().Add(30 * time.Minute)
 
-	r.Track("ext-timeout", "alice", "nonce")
+	r.track("ext-timeout", "alice", "nonce")
 	time.Sleep(5 * time.Millisecond)
 
 	r.poll(t.Context())
 
-	if r.PendingCount() != 0 {
-		t.Errorf("expected timed-out entry to be removed, count = %d", r.PendingCount())
+	if r.pendingCount() != 0 {
+		t.Errorf("expected timed-out entry to be removed, count = %d", r.pendingCount())
 	}
 }
 
@@ -247,7 +254,7 @@ func TestReconcilerSessionRefresh(t *testing.T) {
 	// Session is expired.
 	r.sessionExpires = time.Now().Add(-1 * time.Minute)
 
-	r.Track("ext-1", "alice", "nonce")
+	r.track("ext-1", "alice", "nonce")
 	r.poll(t.Context()) // Should trigger refresh.
 
 	if r.sessionToken != "mock-zt-session" {
@@ -266,19 +273,42 @@ func testReconciler(apiURL string, timeout time.Duration) *fallbackReconciler {
 	)
 }
 
-// TestReconcilerRefusesUnsupportedExternalID verifies that an external ID
-// that could break out of the management API filter is never tracked.
-func TestReconcilerRefusesUnsupportedExternalID(t *testing.T) {
-	r := testReconciler("https://ctrl", time.Hour)
-	for _, id := range []string{`x" or name = "edge-router-1`, "", "a b", "a\\b"} {
-		r.Track(id, "alice", "n")
+// TestReconcilerExternalIDFilter verifies that an external ID reaches the
+// management API filter as one escaped string literal, so it cannot add
+// conditions, and that one ZitiQL cannot express is never tracked.
+func TestReconcilerExternalIDFilter(t *testing.T) {
+	var filter string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		filter = r.URL.Query().Get("filter")
+		fmt.Fprint(w, `{"data":[]}`)
+	}))
+	t.Cleanup(srv.Close)
+	r := testReconciler(srv.URL, time.Hour)
+
+	cases := map[string]string{
+		`x" or name = "edge-router-1`: `externalId="x\" or name = \"edge-router-1"`,
+		`a\b`:                         `externalId="a\\b"`,
+		"alice+laptop@example.com":    `externalId="alice+laptop@example.com"`,
+		"line\nbreak":                 `externalId="line\nbreak"`,
 	}
-	if n := r.PendingCount(); n != 0 {
-		t.Errorf("PendingCount = %d, want 0", n)
+	for id, want := range cases {
+		if _, _, err := r.findIdentity(t.Context(), id); err != nil {
+			t.Errorf("findIdentity(%q): %v", id, err)
+		}
+		if filter != want {
+			t.Errorf("filter for %q = %s, want %s", id, filter, want)
+		}
 	}
-	r.Track("0123abcdef", "alice", "n")
-	if n := r.PendingCount(); n != 1 {
-		t.Errorf("PendingCount after a hex ID = %d, want 1", n)
+
+	for _, id := range []string{"", "bell\a", strings.Repeat("a", 257)} {
+		r.track(id, "alice", "n")
+	}
+	if n := r.pendingCount(); n != 0 {
+		t.Errorf("pendingCount = %d, want 0 for IDs ZitiQL cannot express", n)
+	}
+	r.track("alice@example.com", "alice", "n")
+	if n := r.pendingCount(); n != 1 {
+		t.Errorf("pendingCount after an email ID = %d, want 1", n)
 	}
 }
 
@@ -319,10 +349,10 @@ func TestReconcilerFindIdentityRequiresOneMatch(t *testing.T) {
 // are dropped even when the reconciler cannot authenticate.
 func TestReconcilerPrunesWhileControllerDown(t *testing.T) {
 	r := testReconciler("http://127.0.0.1:1", time.Millisecond)
-	r.Track("ext-1", "alice", "n")
+	r.track("ext-1", "alice", "n")
 	time.Sleep(5 * time.Millisecond)
 	r.poll(t.Context())
-	if n := r.PendingCount(); n != 0 {
+	if n := r.pendingCount(); n != 0 {
 		t.Errorf("PendingCount = %d, want 0", n)
 	}
 }
@@ -335,7 +365,7 @@ func TestReconcilerRefreshesRejectedSession(t *testing.T) {
 	srv := httptest.NewServer(api.handler())
 	t.Cleanup(srv.Close)
 	r := testReconciler(srv.URL, time.Hour)
-	r.Track("ext-1", "alice", "n")
+	r.track("ext-1", "alice", "n")
 
 	r.poll(t.Context())
 	r.sessMu.RLock()
@@ -344,7 +374,35 @@ func TestReconcilerRefreshesRejectedSession(t *testing.T) {
 	if !expires.IsZero() {
 		t.Errorf("session still valid until %v after a 401", expires)
 	}
-	if n := r.PendingCount(); n != 1 {
+	if n := r.pendingCount(); n != 1 {
 		t.Errorf("PendingCount = %d, want the entry kept for retry", n)
+	}
+}
+
+// TestReconcilerLoop verifies that start polls on its own, renaming a
+// tracked identity, and that stop ends the loop.
+func TestReconcilerLoop(t *testing.T) {
+	api := newMockManagementAPI([]mockIdentity{{ID: "id-1", ExternalID: "ext-1", Hostname: "laptop"}})
+	srv := httptest.NewServer(api.handler())
+	t.Cleanup(srv.Close)
+	r := newFallbackReconciler(
+		FallbackConfig{PollInterval: time.Millisecond, Timeout: time.Hour},
+		defaultClaimsConfig(), srv.Client(), srv.URL, slog.Default())
+	r.track("ext-1", "alice", "n")
+	r.start(t.Context())
+
+	deadline := time.Now().Add(5 * time.Second)
+	for r.pendingCount() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("tracked identity never reconciled")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	r.stop()
+	r.stop()
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if api.renamed["id-1"] != "alice-laptop" {
+		t.Errorf("renamed = %v, want id-1 -> alice-laptop", api.renamed)
 	}
 }

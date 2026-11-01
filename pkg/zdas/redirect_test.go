@@ -129,7 +129,7 @@ func TestValidateAllowedRedirectURIs(t *testing.T) {
 
 func TestAuthorizeRejectsRemoteRedirect(t *testing.T) {
 	h, _ := setupHandlers(t)
-	mux := h.Mux()
+	mux := h.mux()
 	_, challenge := generateTestPKCE(t)
 
 	for _, redirect := range []string{
@@ -181,7 +181,7 @@ func TestAuthorizeRejectsColonInDeviceName(t *testing.T) {
 		"device_name":           {"1:laptop"},
 	}.Encode()
 	w := httptest.NewRecorder()
-	h.Mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, reqURL, nil))
+	h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, reqURL, nil))
 
 	loc, err := url.Parse(w.Header().Get("Location"))
 	if err != nil || loc.Query().Get("error") != "invalid_request" {

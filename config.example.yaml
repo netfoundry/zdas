@@ -36,7 +36,7 @@ controller:
   # PEM CA bundle for controllers using a private CA (when no identity file).
   # Not needed when the controller has a publicly-trusted cert.
   # ca_bundle: "/path/to/controller-ca.pem"
-  poll_interval: "5m"                          # 0 = startup only
+  poll_interval: "5m"                          # how often to re-read signers from the controller
 
 # Fallback for unmodified tunnelers that don't send device_name.
 # When enabled, ZDAS allows enrollment without device info and reconciles

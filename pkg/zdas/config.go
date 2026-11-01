@@ -11,6 +11,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// defaultFallbackPollInterval is how often the reconciler polls when
+// fallback.poll_interval is unset.
+const defaultFallbackPollInterval = 10 * time.Second
+
 // TLS modes.
 const (
 	TLSModeNone   = "none"
@@ -232,7 +236,7 @@ func (c *Config) ApplyDefaults() {
 		c.Session.CodeExpiry = 60 * time.Second
 	}
 	if c.Fallback.PollInterval == 0 {
-		c.Fallback.PollInterval = 10 * time.Second
+		c.Fallback.PollInterval = defaultFallbackPollInterval
 	}
 	if c.Fallback.TempNameTemplate == "" {
 		c.Fallback.TempNameTemplate = "{username}-pending-{nonce_short}"

@@ -16,6 +16,9 @@ import (
 
 var version = "dev"
 
+// shutdownTimeout bounds how long a signal waits for in-flight requests.
+const shutdownTimeout = 10 * time.Second
+
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	configPath := flag.String("config", "", "path to config file (YAML)")
@@ -36,6 +39,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	if cfg.RateLimit.AuthorizePerSecond <= 0 {
+		// Every /authorize request creates server state before anyone
+		// signs in. Embedders usually limit requests in front of ZDAS;
+		// the binary usually faces clients directly.
+		logger.Warn("rate limiting on /authorize is off; set rate_limit.authorize_per_second " +
+			"unless something in front of zdas limits requests")
+	}
+
 	srv, err := zdas.NewServer(*cfg, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "server setup error: %v\n", err)
@@ -50,7 +61,7 @@ func main() {
 		defer close(shutdownDone)
 		<-ctx.Done()
 		logger.Info("shutting down")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			logger.Error("shutdown error", "error", err)

@@ -1,6 +1,7 @@
 package zdas
 
 import (
+	"container/list"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -13,31 +14,42 @@ import (
 )
 
 const (
-	// rateLimitIdle is how long a client's bucket outlives its last request.
+	// rateLimitIdle is how long a bucket outlives its last request.
 	rateLimitIdle = 5 * time.Minute
-	// rateLimitSweep is how often allow removes idle buckets.
-	rateLimitSweep = time.Minute
-	// maxRateLimitClients caps the number of buckets. Clients are keyed by
-	// addresses they cannot choose, so reaching the cap takes that many real
-	// addresses; until idle buckets expire, new clients are refused.
-	maxRateLimitClients = 100_000
+	// maxRateLimitBuckets caps the number of buckets. At the cap the least
+	// recently used bucket is evicted, so a flood of new addresses cannot
+	// lock out other clients; the per-site buckets keep those addresses
+	// from getting around the limit.
+	maxRateLimitBuckets = 100_000
+	// siteRateMultiplier is how many clients' worth of requests one IPv6
+	// /48 may make in total. A /48 holds 65,536 /64s, and someone with one
+	// could otherwise cycle through them for a fresh bucket each time.
+	siteRateMultiplier = 16
 )
 
-// ipRateLimiter tracks per-client token buckets for rate limiting the
-// /authorize endpoint. A client is an IPv4 address or an IPv6 /64, since one
-// IPv6 host usually controls a whole /64.
+// ipRateLimiter tracks token buckets for rate limiting the /authorize
+// endpoint. A client is an IPv4 address or an IPv6 /64, since one IPv6 host
+// usually controls a whole /64. An IPv6 client is also counted against its
+// /48, with siteRateMultiplier times the client limit.
 type ipRateLimiter struct {
 	rate    rate.Limit
 	burst   int
 	trusted []netip.Prefix // proxies whose X-Forwarded-For entries are believed
 	now     func() time.Time
+	logger  *slog.Logger
 
-	mu        sync.Mutex
-	clients   map[netip.Prefix]*rateLimitEntry
-	lastSweep time.Time
+	// untrustedXFF logs, once, X-Forwarded-For from a peer that is not a
+	// trusted proxy: behind an unlisted proxy every client shares one
+	// bucket, which is easy to miss.
+	untrustedXFF sync.Once
+
+	mu      sync.Mutex
+	buckets map[netip.Prefix]*list.Element // of *rateLimitBucket
+	lru     *list.List                     // most recently used at the front
 }
 
-type rateLimitEntry struct {
+type rateLimitBucket struct {
+	key      netip.Prefix
 	limiter  *rate.Limiter
 	lastSeen time.Time
 }
@@ -67,7 +79,9 @@ func newIPRateLimiter(cfg RateLimitConfig, logger *slog.Logger) *ipRateLimiter {
 		burst:   burst,
 		trusted: trusted,
 		now:     time.Now,
-		clients: make(map[netip.Prefix]*rateLimitEntry),
+		logger:  logger,
+		buckets: make(map[netip.Prefix]*list.Element),
+		lru:     list.New(),
 	}
 }
 
@@ -92,36 +106,58 @@ func parseTrustedProxy(raw string) (netip.Prefix, error) {
 	return netip.PrefixFrom(a, a.BitLen()), nil
 }
 
-// allow reports whether the client r comes from is within its rate limit.
+// allow reports whether the client r comes from is within its rate limit,
+// and for IPv6, whether its /48 is within the site limit.
 func (rl *ipRateLimiter) allow(r *http.Request) bool {
-	key := clientKey(rl.clientAddr(r))
+	addr := rl.clientAddr(r)
 	now := rl.now()
 
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	if now.Sub(rl.lastSweep) >= rateLimitSweep {
-		rl.removeIdle(now)
-	}
-	entry, ok := rl.clients[key]
-	if !ok {
-		if len(rl.clients) >= maxRateLimitClients {
+	rl.removeIdle(now)
+	if site, ok := siteKey(addr); ok {
+		if !rl.bucket(site, now, siteRateMultiplier).AllowN(now, 1) {
 			return false
 		}
-		entry = &rateLimitEntry{limiter: rate.NewLimiter(rl.rate, rl.burst)}
-		rl.clients[key] = entry
 	}
-	entry.lastSeen = now
-	return entry.limiter.AllowN(now, 1)
+	return rl.bucket(clientKey(addr), now, 1).AllowN(now, 1)
 }
 
-// removeIdle drops buckets unused for rateLimitIdle. rl.mu must be held.
-func (rl *ipRateLimiter) removeIdle(now time.Time) {
-	for key, entry := range rl.clients {
-		if now.Sub(entry.lastSeen) > rateLimitIdle {
-			delete(rl.clients, key)
-		}
+// bucket returns the limiter for key, creating it with multiplier times the
+// configured rate and burst, and marks it most recently used. At the cap it
+// evicts the least recently used bucket to make room. rl.mu must be held.
+func (rl *ipRateLimiter) bucket(key netip.Prefix, now time.Time, multiplier int) *rate.Limiter {
+	if e, ok := rl.buckets[key]; ok {
+		b := e.Value.(*rateLimitBucket)
+		b.lastSeen = now
+		rl.lru.MoveToFront(e)
+		return b.limiter
 	}
-	rl.lastSweep = now
+	if rl.lru.Len() >= maxRateLimitBuckets {
+		oldest := rl.lru.Back()
+		delete(rl.buckets, oldest.Value.(*rateLimitBucket).key)
+		rl.lru.Remove(oldest)
+	}
+	b := &rateLimitBucket{
+		key:      key,
+		limiter:  rate.NewLimiter(rl.rate*rate.Limit(multiplier), rl.burst*multiplier),
+		lastSeen: now,
+	}
+	rl.buckets[key] = rl.lru.PushFront(b)
+	return b.limiter
+}
+
+// removeIdle drops buckets unused for rateLimitIdle, oldest first. rl.mu
+// must be held.
+func (rl *ipRateLimiter) removeIdle(now time.Time) {
+	for e := rl.lru.Back(); e != nil; e = rl.lru.Back() {
+		b := e.Value.(*rateLimitBucket)
+		if now.Sub(b.lastSeen) <= rateLimitIdle {
+			return
+		}
+		delete(rl.buckets, b.key)
+		rl.lru.Remove(e)
+	}
 }
 
 // clientAddr returns the address r is counted against: the peer address,
@@ -130,19 +166,30 @@ func (rl *ipRateLimiter) removeIdle(now time.Time) {
 // are ignored. It returns the zero Addr when RemoteAddr is not an address,
 // so such requests share one bucket.
 func (rl *ipRateLimiter) clientAddr(r *http.Request) netip.Addr {
-	addr, ok := parseRemoteAddr(r.RemoteAddr)
-	if !ok || !rl.isTrusted(addr) {
+	addr, ok := parseHostAddr(r.RemoteAddr)
+	if !ok {
+		return netip.Addr{}
+	}
+	xff := r.Header.Values("X-Forwarded-For")
+	if !rl.isTrusted(addr) {
+		if len(xff) > 0 {
+			rl.untrustedXFF.Do(func() {
+				rl.logger.Warn("ignoring X-Forwarded-For from a peer that is not a trusted proxy; "+
+					"if ZDAS is behind a proxy, list it in rate_limit.trusted_proxies, or every client shares its bucket",
+					"peer", addr)
+			})
+		}
 		return addr
 	}
-	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	hops := strings.Split(strings.Join(xff, ","), ",")
 	for i := len(hops) - 1; i >= 0; i-- {
-		hop, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
-		if err != nil {
+		hop, ok := parseHostAddr(strings.TrimSpace(hops[i]))
+		if !ok {
 			// A trusted proxy wrote something unparsable, or none wrote
 			// anything; count the request against the proxy.
 			return addr
 		}
-		addr = hop.Unmap()
+		addr = hop
 		if !rl.isTrusted(addr) {
 			return addr
 		}
@@ -159,16 +206,24 @@ func (rl *ipRateLimiter) isTrusted(a netip.Addr) bool {
 	return false
 }
 
-// parseRemoteAddr parses an http.Request RemoteAddr, with or without a port.
-func parseRemoteAddr(remote string) (netip.Addr, bool) {
-	if ap, err := netip.ParseAddrPort(remote); err == nil {
+// parseHostAddr parses an address as RemoteAddr or an X-Forwarded-For entry
+// gives it: bare ("192.0.2.1", "2001:db8::1"), with a port ("192.0.2.1:80",
+// "[2001:db8::1]:80"), or bracketed without one ("[2001:db8::1]").
+func parseHostAddr(s string) (netip.Addr, bool) {
+	if a, err := netip.ParseAddr(s); err == nil {
+		return a.Unmap(), true
+	}
+	if ap, err := netip.ParseAddrPort(s); err == nil {
 		return ap.Addr().Unmap(), true
 	}
-	a, err := netip.ParseAddr(remote)
-	if err != nil {
-		return netip.Addr{}, false
+	if inner, ok := strings.CutPrefix(s, "["); ok {
+		if inner, ok := strings.CutSuffix(inner, "]"); ok {
+			if a, err := netip.ParseAddr(inner); err == nil {
+				return a.Unmap(), true
+			}
+		}
 	}
-	return a.Unmap(), true
+	return netip.Addr{}, false
 }
 
 // clientKey returns the bucket key for a: the address itself for IPv4, its
@@ -179,4 +234,14 @@ func clientKey(a netip.Addr) netip.Prefix {
 	}
 	p, _ := a.Prefix(64)
 	return p
+}
+
+// siteKey returns the /48 an IPv6 address belongs to, and false for any
+// other address.
+func siteKey(a netip.Addr) (netip.Prefix, bool) {
+	if !a.Is6() {
+		return netip.Prefix{}, false
+	}
+	p, err := a.Prefix(48)
+	return p, err == nil
 }

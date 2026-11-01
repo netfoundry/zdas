@@ -65,37 +65,6 @@ const (
 // with their own clocks, so small skew is expected.
 const maxClockSkew = time.Minute
 
-// sessionStoreAdapter exposes a sessionStore as a Store. The in-memory store
-// cannot fail on consume, so every consume error is nil.
-type sessionStoreAdapter struct {
-	s *sessionStore
-}
-
-func (a sessionStoreAdapter) CreateSession(_ context.Context, key string, sess *AuthSession) error {
-	a.s.putSession(key, sess)
-	return nil
-}
-
-func (a sessionStoreAdapter) ConsumeSession(_ context.Context, key string) (*AuthSession, error) {
-	return a.s.consumeSession(key), nil
-}
-
-func (a sessionStoreAdapter) CreateCode(_ context.Context, key string, ac *AuthCode) error {
-	return a.s.putCode(key, ac)
-}
-
-func (a sessionStoreAdapter) ConsumeCode(_ context.Context, key string) (*AuthCode, error) {
-	return a.s.consumeCode(key), nil
-}
-
-func (a sessionStoreAdapter) CreatePendingProvision(_ context.Context, key string, pp *PendingProvision) error {
-	return a.s.putPendingProvision(key, pp)
-}
-
-func (a sessionStoreAdapter) ConsumePendingProvision(_ context.Context, key string) (*PendingProvision, error) {
-	return a.s.consumePendingProvision(key), nil
-}
-
 // hashStoreKey derives the key an entry with the given kind and ID is stored
 // under for issuer. The NUL separators keep distinct inputs from colliding.
 func hashStoreKey(kind, issuer, id string) string {

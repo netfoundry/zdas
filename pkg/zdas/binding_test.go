@@ -35,14 +35,14 @@ func bindingHandlers(t *testing.T, externalURL string) http.Handler {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	store := newSessionStore(10*time.Minute, 60*time.Second)
-	t.Cleanup(store.Stop)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
 	cfg := Config{
 		ExternalURL: externalURL,
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: externalURL, Audience: "ziti-enrolltocert", Expiry: 5 * time.Minute},
 	}
-	return newTestEndpoints(cfg, ks, reg, store, nil).Mux()
+	return newTestEndpoints(cfg, ks, reg, store, nil).mux()
 }
 
 // startAuthorize runs /authorize and returns its response and the session

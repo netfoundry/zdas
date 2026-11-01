@@ -26,6 +26,9 @@ const (
 	// maxSignerPages bounds the pages fetched per poll, so that a
 	// controller reporting a wrong total cannot keep a poll going forever.
 	maxSignerPages = 20
+	// maxParallelProviderBuilds bounds how many issuers a poll contacts at
+	// once.
+	maxParallelProviderBuilds = 16
 )
 
 // signerDiscovery polls the Ziti controller's public ext-jwt-signers endpoint and
@@ -53,30 +56,27 @@ type signerDiscovery struct {
 }
 
 // newSignerDiscovery creates a signerDiscovery poller that reaches the
-// controller with client. configuredNames is the set of provider names that
-// come from the ZDAS config (GitHub, etc.) and must not collide with
-// discovered signers.
-func newSignerDiscovery(cfg ControllerConfig, client *http.Client, registry *ProviderRegistry, configuredNames map[string]struct{}, logger *slog.Logger) *signerDiscovery {
+// controller with client and discovered issuers with upstream, or with
+// ZDAS's own client when upstream is nil. configuredNames is the set of
+// provider names that come from the ZDAS config (GitHub, etc.) and must not
+// collide with discovered signers.
+func newSignerDiscovery(cfg ControllerConfig, client, upstream *http.Client, registry *ProviderRegistry, configuredNames map[string]struct{}, logger *slog.Logger) *signerDiscovery {
 	return &signerDiscovery{
 		cfg:             cfg,
 		registry:        registry,
 		configuredNames: configuredNames,
 		client:          client,
+		upstreamClient:  upstream,
 		setupTimeout:    providerSetupTimeout,
 		pageSize:        signerPageSize,
 		logger:          logger,
 	}
 }
 
-// runOnce performs a single discovery poll. Suitable for startup.
-func (d *signerDiscovery) runOnce(ctx context.Context) error {
-	return d.poll(ctx)
-}
-
-// Start begins periodic polling at the configured PollInterval. It runs the
+// start begins periodic polling at the configured PollInterval. It runs the
 // first poll synchronously and returns an error if it fails. Subsequent poll
 // failures are logged but non-fatal.
-func (d *signerDiscovery) Start(ctx context.Context) error {
+func (d *signerDiscovery) start(ctx context.Context) error {
 	if err := d.poll(ctx); err != nil {
 		return fmt.Errorf("initial discovery poll: %w", err)
 	}
@@ -85,17 +85,17 @@ func (d *signerDiscovery) Start(ctx context.Context) error {
 	}
 
 	pollCtx, cancel := context.WithCancel(ctx)
+	stopped := make(chan struct{})
 	d.mu.Lock()
-	d.cancel = cancel
-	d.stopped = make(chan struct{})
+	d.cancel, d.stopped = cancel, stopped
 	d.mu.Unlock()
 
-	go d.loop(pollCtx)
+	go d.loop(pollCtx, stopped)
 	return nil
 }
 
-// Stop cancels the background poll loop and waits for it to exit.
-func (d *signerDiscovery) Stop() {
+// stop cancels the background poll loop and waits for it to exit.
+func (d *signerDiscovery) stop() {
 	d.mu.Lock()
 	cancel := d.cancel
 	stopped := d.stopped
@@ -109,8 +109,9 @@ func (d *signerDiscovery) Stop() {
 	}
 }
 
-func (d *signerDiscovery) loop(ctx context.Context) {
-	defer close(d.stopped)
+// loop polls every PollInterval until ctx is done, then closes stopped.
+func (d *signerDiscovery) loop(ctx context.Context, stopped chan<- struct{}) {
+	defer close(stopped)
 	ticker := time.NewTicker(d.cfg.PollInterval)
 	defer ticker.Stop()
 	for {
@@ -150,17 +151,17 @@ type signerEntry struct {
 	EnrollToTokenEnabled bool   `json:"enrollToTokenEnabled"`
 }
 
-// NetworkJWTsBody returns the cached response from the controller's
+// cachedNetworkJWTs returns the cached response from the controller's
 // /network-jwts endpoint, or nil if not yet fetched.
-func (d *signerDiscovery) NetworkJWTsBody() []byte {
+func (d *signerDiscovery) cachedNetworkJWTs() []byte {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.networkJWTsBody
 }
 
-// ExtJWTSignersBody returns the cached response from the controller's
+// cachedExtJWTSigners returns the cached response from the controller's
 // /edge/client/v1/external-jwt-signers endpoint, or nil if not yet fetched.
-func (d *signerDiscovery) ExtJWTSignersBody() []byte {
+func (d *signerDiscovery) cachedExtJWTSigners() []byte {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.extJWTSignersBody
@@ -193,11 +194,13 @@ func (d *signerDiscovery) poll(ctx context.Context) error {
 	// by at most setupTimeout rather than holding up every other signer.
 	usable := d.usableSigners(signers)
 	built := make([]*OIDCProvider, len(usable))
+	sem := make(chan struct{}, maxParallelProviderBuilds)
 	var wg sync.WaitGroup
 	for i, s := range usable {
 		wg.Add(1)
+		sem <- struct{}{}
 		go func() {
-			defer wg.Done()
+			defer func() { <-sem; wg.Done() }()
 			built[i] = d.buildProvider(ctx, s)
 		}()
 	}
@@ -256,7 +259,7 @@ func (d *signerDiscovery) isSelf(s signerEntry) bool {
 	if self == "" {
 		return false
 	}
-	return s.Issuer == d.cfg.SelfIssuer ||
+	return strings.TrimSuffix(s.Issuer, "/") == self ||
 		s.ExternalAuthURL == self ||
 		strings.HasPrefix(s.ExternalAuthURL, self+"/")
 }

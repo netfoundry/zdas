@@ -180,7 +180,7 @@ func TestWithUpstreamHTTPClient(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	t.Cleanup(func() { srv.Shutdown(context.Background()) })
-	if err := srv.discovery.runOnce(context.Background()); err != nil {
+	if err := srv.discovery.poll(context.Background()); err != nil {
 		t.Fatalf("discovery: %v", err)
 	}
 	seen := rt.seen()
@@ -223,7 +223,7 @@ func TestDiscoveredProviderUsesUpstreamClient(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	t.Cleanup(func() { srv.Shutdown(context.Background()) })
-	if err := srv.discovery.runOnce(context.Background()); err != nil {
+	if err := srv.discovery.poll(context.Background()); err != nil {
 		t.Fatalf("discovery: %v", err)
 	}
 	if _, err := srv.registry.Resolve("discovered"); err == nil {

@@ -188,7 +188,7 @@ func TestStoreStaleEntriesAreMisses(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			store := newJSONStore()
 			h := setupStoreHandlers(t, store, "https://zdas.example.com")
-			mux := h.Mux()
+			mux := h.mux()
 			ctx := t.Context()
 
 			code := mustID(t)
@@ -228,7 +228,7 @@ func TestStoreStaleEntriesAreMisses(t *testing.T) {
 func TestStoreFailureIsServerError(t *testing.T) {
 	store := newJSONStore()
 	h := setupStoreHandlers(t, store, "https://zdas.example.com")
-	mux := h.Mux()
+	mux := h.mux()
 	store.failWith(errors.New("database unavailable"))
 	id := mustID(t)
 
@@ -261,7 +261,7 @@ func TestStoreFailureIsServerError(t *testing.T) {
 func TestStoreMalformedIDSkipsStore(t *testing.T) {
 	store := newJSONStore()
 	h := setupStoreHandlers(t, store, "https://zdas.example.com")
-	mux := h.Mux()
+	mux := h.mux()
 	store.failWith(errors.New("database unavailable"))
 
 	for _, id := range []string{"", "short", strings.Repeat("A", 32), strings.Repeat("0", 31) + "g", strings.Repeat("0", 33)} {
@@ -282,7 +282,7 @@ func TestStoreMalformedIDSkipsStore(t *testing.T) {
 func TestStoreKeysAreHashedAndStamped(t *testing.T) {
 	store := newJSONStore()
 	h := setupStoreHandlers(t, store, "https://zdas.example.com")
-	mux := h.Mux()
+	mux := h.mux()
 	_, challenge := generateTestPKCE(t)
 
 	reqURL := "/authorize?redirect_uri=http://localhost:20314/auth/callback&response_type=code&state=s1" +

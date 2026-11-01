@@ -46,7 +46,8 @@ type pendingReconciliation struct {
 	TrackedAt  time.Time
 }
 
-// newFallbackReconciler creates a fallbackReconciler. Call Start to begin background polling.
+// newFallbackReconciler creates a fallbackReconciler. Call start to begin
+// background polling.
 func newFallbackReconciler(cfg FallbackConfig, claimsCfg ClaimsConfig, client *http.Client, apiURL string, logger *slog.Logger) *fallbackReconciler {
 	return &fallbackReconciler{
 		cfg:       cfg,
@@ -58,10 +59,9 @@ func newFallbackReconciler(cfg FallbackConfig, claimsCfg ClaimsConfig, client *h
 	}
 }
 
-// Track adds a fallback-enrolled identity to the reconciliation queue. The
-// external ID goes into a management API filter, so one with characters
-// outside validExternalID is refused rather than escaped.
-func (r *fallbackReconciler) Track(externalID, username, nonce string) {
+// track adds a fallback-enrolled identity to the reconciliation queue. An
+// external ID validExternalID rejects is logged and not tracked.
+func (r *fallbackReconciler) track(externalID, username, nonce string) {
 	if !validExternalID(externalID) {
 		r.logger.Warn("not tracking fallback identity with an unsupported external ID", "external_id", externalID)
 		return
@@ -77,24 +77,24 @@ func (r *fallbackReconciler) Track(externalID, username, nonce string) {
 	r.logger.Info("tracking fallback identity for reconciliation", "external_id", externalID, "username", username)
 }
 
-// Start authenticates with the controller and begins the background polling
+// start authenticates with the controller and begins the background polling
 // loop. The initial authentication failure is non-fatal (logged as warning)
 // since the reconciler can retry on each poll cycle.
-func (r *fallbackReconciler) Start(ctx context.Context) {
+func (r *fallbackReconciler) start(ctx context.Context) {
 	if err := r.refreshSession(ctx); err != nil {
 		r.logger.Warn("initial reconciler authentication failed, will retry", "error", err)
 	}
 
 	pollCtx, cancel := context.WithCancel(ctx)
+	stopped := make(chan struct{})
 	r.mu.Lock()
-	r.cancel = cancel
-	r.stopped = make(chan struct{})
+	r.cancel, r.stopped = cancel, stopped
 	r.mu.Unlock()
-	go r.loop(pollCtx)
+	go r.loop(pollCtx, stopped)
 }
 
-// Stop cancels the background poll loop and waits for it to exit.
-func (r *fallbackReconciler) Stop() {
+// stop cancels the background poll loop and waits for it to exit.
+func (r *fallbackReconciler) stop() {
 	r.mu.Lock()
 	cancel := r.cancel
 	stopped := r.stopped
@@ -107,18 +107,12 @@ func (r *fallbackReconciler) Stop() {
 	}
 }
 
-// PendingCount returns the number of identities awaiting reconciliation.
-func (r *fallbackReconciler) PendingCount() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.pending)
-}
-
-func (r *fallbackReconciler) loop(ctx context.Context) {
-	defer close(r.stopped)
+// loop polls every PollInterval until ctx is done, then closes stopped.
+func (r *fallbackReconciler) loop(ctx context.Context, stopped chan<- struct{}) {
+	defer close(stopped)
 	interval := r.cfg.PollInterval
 	if interval <= 0 {
-		interval = 10 * time.Second
+		interval = defaultFallbackPollInterval
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -156,7 +150,7 @@ func (r *fallbackReconciler) poll(ctx context.Context) {
 
 	// Ensure we have a valid session.
 	r.sessMu.RLock()
-	expired := time.Now().Add(5 * time.Minute).After(r.sessionExpires)
+	expired := time.Now().Add(sessionRefreshMargin).After(r.sessionExpires)
 	r.sessMu.RUnlock()
 	if expired {
 		if err := r.refreshSession(ctx); err != nil {
@@ -217,25 +211,54 @@ func (r *fallbackReconciler) reconcileOne(ctx context.Context, p *pendingReconci
 	return true, nil
 }
 
+// sessionRefreshMargin is how long before its management API session
+// expires the reconciler authenticates again.
+const sessionRefreshMargin = 5 * time.Minute
+
 // errSessionRejected reports a management API call the controller refused
 // with 401, meaning the session is no longer valid.
 var errSessionRejected = errors.New("management API session rejected")
 
-// validExternalID reports whether id is non-empty and uses only characters
-// that need no escaping inside a quoted management API filter string. The
-// external IDs ZDAS composes are hex.
+// zitiqlString returns s as a quoted ZitiQL string literal. ZitiQL strings
+// take any character but the double quote, the backslash and control
+// characters, which must be escaped; it reports false for a control
+// character ZitiQL has no escape for.
+func zitiqlString(s string) (string, bool) {
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+	for _, c := range s {
+		switch c {
+		case '"', '\\':
+			b.WriteByte('\\')
+			b.WriteRune(c)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\f':
+			b.WriteString(`\f`)
+		default:
+			if c < 0x20 {
+				return "", false
+			}
+			b.WriteRune(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String(), true
+}
+
+// validExternalID reports whether id can be tracked: not empty, not over
+// 256 bytes, and expressible as a ZitiQL string.
 func validExternalID(id string) bool {
 	if id == "" || len(id) > 256 {
 		return false
 	}
-	for _, c := range id {
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-', c == ':':
-		default:
-			return false
-		}
-	}
-	return true
+	_, ok := zitiqlString(id)
+	return ok
 }
 
 // findIdentity queries the management API for an identity by externalId.
@@ -245,7 +268,8 @@ func (r *fallbackReconciler) findIdentity(ctx context.Context, externalID string
 	if !validExternalID(externalID) {
 		return "", "", fmt.Errorf("unsupported external ID %q", externalID)
 	}
-	filter := fmt.Sprintf(`externalId="%s"`, externalID)
+	quoted, _ := zitiqlString(externalID)
+	filter := "externalId=" + quoted
 	reqURL := r.apiURL + "/edge/management/v1/identities?filter=" + url.QueryEscape(filter)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)

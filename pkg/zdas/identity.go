@@ -93,6 +93,10 @@ func managementClientFromIdentity(id *parsedIdentity) *http.Client {
 	})
 }
 
+// defaultAPISessionLifetime is how long an API session is assumed to last
+// when the controller does not say.
+const defaultAPISessionLifetime = 25 * time.Minute
+
 // apiSession holds the result of a POST /authenticate call.
 type apiSession struct {
 	Token     string
@@ -138,7 +142,7 @@ func authenticateSession(ctx context.Context, client *http.Client, apiURL string
 		return nil, errors.New("api session token was empty")
 	}
 
-	expiresAt := time.Now().Add(25 * time.Minute) // default
+	expiresAt := time.Now().Add(defaultAPISessionLifetime)
 	if result.Data.ExpirationSeconds != nil && *result.Data.ExpirationSeconds > 0 {
 		expiresAt = time.Now().Add(time.Duration(*result.Data.ExpirationSeconds) * time.Second)
 	} else if result.Data.ExpiresAt != "" {

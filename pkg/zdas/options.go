@@ -13,15 +13,22 @@ type serverOptions struct {
 	provisioner EnrollmentProvisioner
 	keys        *KeySet      // nil generates a key at startup
 	verifyKeys  []*KeySet    // published in the JWKS alongside keys
-	store       Store        // nil uses an in-memory sessionStore
+	store       Store        // nil uses the in-memory memStore
 	upstream    *http.Client // nil uses each provider's default clients
 	err         error        // misuse of an option, reported by NewServer
 }
 
 // WithProvisioner sets an EnrollmentProvisioner hook. When set, ZDAS calls
-// it after upstream authentication instead of using built-in claim composition.
+// it after upstream authentication instead of using built-in claim
+// composition. NewServer fails if p is nil.
 func WithProvisioner(p EnrollmentProvisioner) Option {
-	return func(o *serverOptions) { o.provisioner = p }
+	return func(o *serverOptions) {
+		if p == nil {
+			o.err = errors.Join(o.err, errors.New("WithProvisioner: nil provisioner"))
+			return
+		}
+		o.provisioner = p
+	}
 }
 
 // WithKeySet makes ZDAS sign tokens with active instead of a key generated at

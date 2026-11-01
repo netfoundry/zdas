@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -59,7 +60,7 @@ func mockControllerAndIDPs(t *testing.T, signers []signerEntry) (*httptest.Serve
 	return ctrlServer, idpServers
 }
 
-func TestDiscoveryRunOnce(t *testing.T) {
+func TestDiscoveryPoll(t *testing.T) {
 	signers := []signerEntry{
 		{Name: "keycloak", ClientID: "kc-client", EnrollToCertEnabled: true},
 	}
@@ -69,10 +70,10 @@ func TestDiscoveryRunOnce(t *testing.T) {
 	d := newSignerDiscovery(ControllerConfig{
 		APIURL:     ctrl.URL,
 		SelfIssuer: "https://zdas.example.com",
-	}, http.DefaultClient, reg, nil, slog.Default())
+	}, http.DefaultClient, nil, reg, nil, slog.Default())
 
-	if err := d.runOnce(context.Background()); err != nil {
-		t.Fatalf("runOnce: %v", err)
+	if err := d.poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
 	}
 
 	if reg.Len() != 1 {
@@ -100,9 +101,9 @@ func TestDiscoveryExcludesSelf(t *testing.T) {
 	d := newSignerDiscovery(ControllerConfig{
 		APIURL:     ctrl.URL,
 		SelfIssuer: selfIssuer,
-	}, http.DefaultClient, reg, nil, slog.Default())
-	if err := d.runOnce(context.Background()); err != nil {
-		t.Fatalf("runOnce: %v", err)
+	}, http.DefaultClient, nil, reg, nil, slog.Default())
+	if err := d.poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
 	}
 
 	if reg.Len() != 1 {
@@ -121,8 +122,8 @@ func TestDiscoveryFiltersNonEnrollToCert(t *testing.T) {
 	ctrl, _ := mockControllerAndIDPs(t, signers)
 
 	reg := NewProviderRegistry()
-	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, reg, nil, slog.Default())
-	if err := d.runOnce(context.Background()); err != nil {
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, nil, reg, nil, slog.Default())
+	if err := d.poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if reg.Len() != 1 {
@@ -146,9 +147,9 @@ func TestDiscoveryNameCollisionSkipsSigner(t *testing.T) {
 	gh := &stubProvider{name: "github", issuer: "https://github.com"}
 	_ = reg.Register(gh)
 
-	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, reg, configured, slog.Default())
-	if err := d.runOnce(context.Background()); err != nil {
-		t.Fatalf("runOnce: %v", err)
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, nil, reg, configured, slog.Default())
+	if err := d.poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
 	}
 	names := reg.Names()
 	slices.Sort(names)
@@ -164,8 +165,8 @@ func TestDiscoveryNameCollisionSkipsSigner(t *testing.T) {
 	signers2 := []signerEntry{{Name: "GitHub", ClientID: "c", EnrollToCertEnabled: true}}
 	ctrl2, _ := mockControllerAndIDPs(t, signers2)
 	d.cfg.APIURL = ctrl2.URL
-	if err := d.runOnce(context.Background()); err != nil {
-		t.Fatalf("second runOnce: %v", err)
+	if err := d.poll(context.Background()); err != nil {
+		t.Fatalf("second poll: %v", err)
 	}
 	if _, err := reg.Resolve("kc"); err == nil {
 		t.Error("signer removed on the controller is still registered")
@@ -179,6 +180,7 @@ func TestDiscoveryIsSelf(t *testing.T) {
 		want bool
 	}{
 		{"https://zdas.example.com", signerEntry{Issuer: "https://zdas.example.com"}, true},
+		{"https://zdas.example.com", signerEntry{Issuer: "https://zdas.example.com/"}, true},
 		{"https://zdas.example.com", signerEntry{ExternalAuthURL: "https://zdas.example.com/authorize"}, true},
 		{"https://zdas.example.com/", signerEntry{ExternalAuthURL: "https://zdas.example.com/authorize"}, true},
 		{"https://zdas.example.com", signerEntry{ExternalAuthURL: "https://zdas.example.com"}, true},
@@ -194,9 +196,9 @@ func TestDiscoveryIsSelf(t *testing.T) {
 	}
 }
 
-// TestDiscoveryUnresponsiveIssuer verifies that an issuer that never answers
-// delays a poll by at most the setup timeout and does not keep other
-// signers' providers from being registered.
+// TestDiscoveryUnresponsiveIssuer verifies that issuers that never answer
+// delay a poll by about the setup timeout, not by that once per issuer, and
+// do not keep other signers' providers from being registered.
 func TestDiscoveryUnresponsiveIssuer(t *testing.T) {
 	release := make(chan struct{})
 	hung := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -206,21 +208,24 @@ func TestDiscoveryUnresponsiveIssuer(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 
 	signers := []signerEntry{
-		{Name: "hung", Issuer: hung.URL, ClientID: "c", EnrollToCertEnabled: true},
+		{Name: "hung-1", Issuer: hung.URL + "/a", ClientID: "c", EnrollToCertEnabled: true},
+		{Name: "hung-2", Issuer: hung.URL + "/b", ClientID: "c", EnrollToCertEnabled: true},
+		{Name: "hung-3", Issuer: hung.URL + "/c", ClientID: "c", EnrollToCertEnabled: true},
 		{Name: "kc", ClientID: "c", EnrollToCertEnabled: true},
 	}
 	ctrl, _ := mockControllerAndIDPs(t, signers)
 
 	reg := NewProviderRegistry()
-	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, reg, nil, slog.Default())
-	d.setupTimeout = 200 * time.Millisecond
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, nil, reg, nil, slog.Default())
+	d.setupTimeout = 500 * time.Millisecond
 
 	start := time.Now()
-	if err := d.runOnce(context.Background()); err != nil {
-		t.Fatalf("runOnce: %v", err)
+	if err := d.poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("poll took %v with one unresponsive issuer", elapsed)
+	// Built one after another, three hung issuers would take 1.5s.
+	if elapsed := time.Since(start); elapsed > 1200*time.Millisecond {
+		t.Errorf("poll took %v with three unresponsive issuers", elapsed)
 	}
 	if names := reg.Names(); !slices.Equal(names, []string{"kc"}) {
 		t.Errorf("providers = %v, want [kc]", names)
@@ -235,9 +240,9 @@ func TestDiscoveryKeepsProviderWhenRefreshFails(t *testing.T) {
 	ctrl, idps := mockControllerAndIDPs(t, signers)
 
 	reg := NewProviderRegistry()
-	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, reg, nil, slog.Default())
-	if err := d.runOnce(context.Background()); err != nil {
-		t.Fatalf("runOnce: %v", err)
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, nil, reg, nil, slog.Default())
+	if err := d.poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
 	}
 	first, err := reg.Resolve("kc")
 	if err != nil {
@@ -245,16 +250,16 @@ func TestDiscoveryKeepsProviderWhenRefreshFails(t *testing.T) {
 	}
 
 	idps[0].Close()
-	if err := d.runOnce(context.Background()); err != nil {
-		t.Fatalf("runOnce with issuer down: %v", err)
+	if err := d.poll(context.Background()); err != nil {
+		t.Fatalf("poll with issuer down: %v", err)
 	}
 	if p, err := reg.Resolve("kc"); err != nil || p != first {
 		t.Errorf("provider after failed refresh = %v, %v; want the previous one", p, err)
 	}
 
 	signers[0].ClientID = "changed"
-	if err := d.runOnce(context.Background()); err != nil {
-		t.Fatalf("runOnce with changed signer: %v", err)
+	if err := d.poll(context.Background()); err != nil {
+		t.Fatalf("poll with changed signer: %v", err)
 	}
 	if _, err := reg.Resolve("kc"); err == nil {
 		t.Error("provider kept although the signer's settings changed")
@@ -285,10 +290,10 @@ func TestDiscoveryPaginates(t *testing.T) {
 	t.Cleanup(ctrl.Close)
 
 	reg := NewProviderRegistry()
-	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, reg, nil, slog.Default())
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, nil, reg, nil, slog.Default())
 	d.pageSize = 2
-	if err := d.runOnce(context.Background()); err != nil {
-		t.Fatalf("runOnce: %v", err)
+	if err := d.poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
 	}
 
 	if !slices.Equal(offsets, []string{"0", "2"}) {
@@ -307,7 +312,7 @@ func TestDiscoveryPaginates(t *testing.T) {
 			Pagination signerPagination `json:"pagination"`
 		} `json:"meta"`
 	}
-	if err := json.Unmarshal(d.ExtJWTSignersBody(), &served); err != nil {
+	if err := json.Unmarshal(d.cachedExtJWTSigners(), &served); err != nil {
 		t.Fatalf("parse served signers: %v", err)
 	}
 	if len(served.Data) != 3 || served.Data[2].ID != "id2" {
@@ -325,14 +330,14 @@ func TestDiscoveryCachesNetworkJWTs(t *testing.T) {
 	ctrl, _ := mockControllerAndIDPs(t, signers)
 
 	reg := NewProviderRegistry()
-	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, reg, nil, slog.Default())
-	if d.NetworkJWTsBody() != nil {
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, nil, reg, nil, slog.Default())
+	if d.cachedNetworkJWTs() != nil {
 		t.Error("expected nil before first poll")
 	}
-	if err := d.runOnce(t.Context()); err != nil {
+	if err := d.poll(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	body := d.NetworkJWTsBody()
+	body := d.cachedNetworkJWTs()
 	if body == nil {
 		t.Fatal("expected cached network JWTs after poll")
 	}
@@ -348,14 +353,14 @@ func TestDiscoveryCachesExtJWTSigners(t *testing.T) {
 	ctrl, _ := mockControllerAndIDPs(t, signers)
 
 	reg := NewProviderRegistry()
-	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, reg, nil, slog.Default())
-	if d.ExtJWTSignersBody() != nil {
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, nil, reg, nil, slog.Default())
+	if d.cachedExtJWTSigners() != nil {
 		t.Error("expected nil before first poll")
 	}
-	if err := d.runOnce(t.Context()); err != nil {
+	if err := d.poll(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	body := d.ExtJWTSignersBody()
+	body := d.cachedExtJWTSigners()
 	if body == nil {
 		t.Fatal("expected cached ext-jwt-signers after poll")
 	}
@@ -365,7 +370,7 @@ func TestDiscoveryCachesExtJWTSigners(t *testing.T) {
 		t.Fatalf("unmarshal cached body: %v", err)
 	}
 	if len(got.Data) == 0 {
-		t.Error("expected at least one signer in cached body")
+		t.Fatal("expected at least one signer in cached body")
 	}
 	if got.Data[0].Name != "kc" {
 		t.Errorf("signer name = %q, want kc", got.Data[0].Name)
@@ -374,8 +379,8 @@ func TestDiscoveryCachesExtJWTSigners(t *testing.T) {
 
 func TestDiscoveryControllerUnreachable(t *testing.T) {
 	reg := NewProviderRegistry()
-	d := newSignerDiscovery(ControllerConfig{APIURL: "http://127.0.0.1:1"}, http.DefaultClient, reg, nil, slog.Default())
-	err := d.runOnce(context.Background())
+	d := newSignerDiscovery(ControllerConfig{APIURL: "http://127.0.0.1:1"}, http.DefaultClient, nil, reg, nil, slog.Default())
+	err := d.poll(context.Background())
 	if err == nil {
 		t.Error("expected error for unreachable controller")
 	}
@@ -389,8 +394,8 @@ func TestDiscoveryRefreshReplacesOIDCProviders(t *testing.T) {
 	ctrl1, _ := mockControllerAndIDPs(t, signers1)
 
 	reg := NewProviderRegistry()
-	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl1.URL}, http.DefaultClient, reg, nil, slog.Default())
-	if err := d.runOnce(context.Background()); err != nil {
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl1.URL}, http.DefaultClient, nil, reg, nil, slog.Default())
+	if err := d.poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if reg.Len() != 1 {
@@ -404,7 +409,7 @@ func TestDiscoveryRefreshReplacesOIDCProviders(t *testing.T) {
 	ctrl2, _ := mockControllerAndIDPs(t, signers2)
 	d.cfg.APIURL = ctrl2.URL
 
-	if err := d.runOnce(context.Background()); err != nil {
+	if err := d.poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if reg.Len() != 1 {
@@ -448,4 +453,98 @@ func TestClientFromCABundle(t *testing.T) {
 	if _, err := clientFromCABundle(path); err == nil {
 		t.Error("clientFromCABundle accepted a file with no certificates")
 	}
+}
+
+// pagedController returns a controller whose signer list is n entries
+// without enrollment enabled, paged by limit and offset when honorLimit is
+// set and sent whole otherwise. It records each request's offset.
+func pagedController(t *testing.T, n int, honorLimit bool) (*httptest.Server, *[]string) {
+	t.Helper()
+	var offsets []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/edge/client/v1/external-jwt-signers", func(w http.ResponseWriter, r *http.Request) {
+		offsets = append(offsets, r.URL.Query().Get("offset"))
+		offset, end := 0, n
+		if honorLimit {
+			limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+			offset, _ = strconv.Atoi(r.URL.Query().Get("offset"))
+			end = min(offset+limit, n)
+		}
+		var entries []string
+		for i := offset; i < end; i++ {
+			entries = append(entries, fmt.Sprintf(`{"name":"s%d"}`, i))
+		}
+		fmt.Fprintf(w, `{"data":[%s],"meta":{"pagination":{"totalCount":%d}}}`, strings.Join(entries, ","), n)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &offsets
+}
+
+// TestDiscoveryPageLimit verifies that a poll stops after maxSignerPages
+// even when the controller reports more.
+func TestDiscoveryPageLimit(t *testing.T) {
+	ctrl, offsets := pagedController(t, 1000, true)
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, nil, NewProviderRegistry(), nil, slog.Default())
+	d.pageSize = 2
+	if err := d.poll(t.Context()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if len(*offsets) != maxSignerPages {
+		t.Errorf("fetched %d pages, want %d", len(*offsets), maxSignerPages)
+	}
+}
+
+// TestDiscoveryControllerIgnoresLimit verifies that a controller that sends
+// more than a page at once is read once, not asked again at an offset.
+func TestDiscoveryControllerIgnoresLimit(t *testing.T) {
+	ctrl, offsets := pagedController(t, 5, false)
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, nil, NewProviderRegistry(), nil, slog.Default())
+	d.pageSize = 2
+	if err := d.poll(t.Context()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if len(*offsets) != 1 {
+		t.Errorf("fetched %d pages, want 1", len(*offsets))
+	}
+	var served signerPage
+	if err := json.Unmarshal(d.cachedExtJWTSigners(), &served); err != nil || len(served.Data) != 5 {
+		t.Errorf("served %d signers, %v; want all 5", len(served.Data), err)
+	}
+}
+
+// TestDiscoveryLoop verifies that start keeps polling every PollInterval
+// and that stop ends the loop.
+func TestDiscoveryLoop(t *testing.T) {
+	var mu sync.Mutex
+	polls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/edge/client/v1/external-jwt-signers", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		polls++
+		mu.Unlock()
+		fmt.Fprint(w, `{"data":[]}`)
+	})
+	ctrl := httptest.NewServer(mux)
+	t.Cleanup(ctrl.Close)
+	count := func() int { mu.Lock(); defer mu.Unlock(); return polls }
+
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL, PollInterval: time.Millisecond}, http.DefaultClient, nil, NewProviderRegistry(), nil, slog.Default())
+	if err := d.start(t.Context()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for count() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d polls", count())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	d.stop()
+	after := count()
+	time.Sleep(20 * time.Millisecond)
+	if n := count(); n != after {
+		t.Errorf("%d polls after stop", n-after)
+	}
+	d.stop()
 }
