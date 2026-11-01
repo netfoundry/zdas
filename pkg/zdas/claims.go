@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v3/jwa"
+	"github.com/lestrrat-go/jwx/v3/jwt"
 )
 
 // DeviceInfo holds device metadata collected from the tunneler's query
@@ -86,7 +86,7 @@ func MintToken(cfg TokenConfig, claims map[string]any, ks *KeySet) (string, erro
 		return "", err
 	}
 
-	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256, ks.privateJWK))
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), ks.privateJWK))
 	if err != nil {
 		return "", fmt.Errorf("sign jwt: %w", err)
 	}

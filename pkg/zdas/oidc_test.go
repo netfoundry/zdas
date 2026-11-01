@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwk"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v3/jwa"
+	"github.com/lestrrat-go/jwx/v3/jwk"
+	"github.com/lestrrat-go/jwx/v3/jwt"
 )
 
 // mockOIDCServer stands up an httptest.Server that serves:
@@ -39,19 +39,19 @@ func mockOIDCServerWithUserInfo(t *testing.T, claims map[string]any, userInfo ht
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
-	privJWK, err := jwk.FromRaw(privKey)
+	privJWK, err := jwk.Import(privKey)
 	if err != nil {
 		t.Fatalf("wrap private key: %v", err)
 	}
 	_ = privJWK.Set(jwk.KeyIDKey, "test-kid")
-	_ = privJWK.Set(jwk.AlgorithmKey, jwa.ES256)
+	_ = privJWK.Set(jwk.AlgorithmKey, jwa.ES256())
 
-	pubJWK, err := jwk.FromRaw(privKey.Public())
+	pubJWK, err := jwk.Import(privKey.Public())
 	if err != nil {
 		t.Fatalf("wrap public key: %v", err)
 	}
 	_ = pubJWK.Set(jwk.KeyIDKey, "test-kid")
-	_ = pubJWK.Set(jwk.AlgorithmKey, jwa.ES256)
+	_ = pubJWK.Set(jwk.AlgorithmKey, jwa.ES256())
 
 	// We need a mux that knows its own URL, which is a chicken-and-egg problem
 	// with httptest. We'll use a handler that reads the Host header.
@@ -98,7 +98,7 @@ func mockOIDCServerWithUserInfo(t *testing.T, claims map[string]any, userInfo ht
 			_ = tok.Set(k, v)
 		}
 
-		signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256, privJWK))
+		signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), privJWK))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwk"
-	"github.com/lestrrat-go/jwx/v2/jws"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v3/jwk"
+	"github.com/lestrrat-go/jwx/v3/jws"
+	"github.com/lestrrat-go/jwx/v3/jwt"
 )
 
 // TestIntegrationOIDCFlow tests the complete authorize -> callback -> token
@@ -175,21 +175,21 @@ func TestIntegrationOIDCFlow(t *testing.T) {
 		t.Fatalf("verify jwt: %v", err)
 	}
 
-	if tok.Issuer() != "https://zdas.test" {
-		t.Errorf("issuer = %q", tok.Issuer())
+	if stringClaim(tok, "iss") != "https://zdas.test" {
+		t.Errorf("issuer = %q", stringClaim(tok, "iss"))
 	}
-	idName, _ := tok.Get("device_identity_name")
+	idName := claim(tok, "device_identity_name")
 	if idName != "alice-macbook-pro" {
 		t.Errorf("device_identity_name = %v", idName)
 	}
-	extID, _ := tok.Get("device_external_id")
+	extID := claim(tok, "device_external_id")
 	if extID == nil || extID == "" {
 		t.Error("device_external_id missing")
 	}
-	if tok.Subject() != extID {
-		t.Errorf("sub (%q) should equal device_external_id (%q)", tok.Subject(), extID)
+	if stringClaim(tok, "sub") != extID {
+		t.Errorf("sub (%q) should equal device_external_id (%q)", stringClaim(tok, "sub"), extID)
 	}
-	devName, _ := tok.Get("device_name")
+	devName := claim(tok, "device_name")
 	if devName != "macbook-pro" {
 		t.Errorf("device_name = %v", devName)
 	}
@@ -327,11 +327,11 @@ func TestIntegrationGitHubFlow(t *testing.T) {
 		t.Fatalf("verify jwt: %v", err)
 	}
 
-	idName, _ := tok.Get("device_identity_name")
+	idName := claim(tok, "device_identity_name")
 	if idName != "bobdev-linux-desktop" {
 		t.Errorf("device_identity_name = %v, want bobdev-linux-desktop", idName)
 	}
-	upSub, _ := tok.Get("upstream_sub")
+	upSub := claim(tok, "upstream_sub")
 	if upSub != "77777" {
 		t.Errorf("upstream_sub = %v, want 77777", upSub)
 	}
@@ -470,16 +470,16 @@ func TestIntegrationFallbackFlow(t *testing.T) {
 	}
 
 	// Verify fallback claims.
-	idName, _ := tok.Get("device_identity_name")
+	idName := claim(tok, "device_identity_name")
 	name := idName.(string)
 	if !strings.HasPrefix(name, "charlie-pending-") {
 		t.Errorf("device_identity_name = %q, want charlie-pending-*", name)
 	}
-	extID, _ := tok.Get("device_external_id")
+	extID := claim(tok, "device_external_id")
 	if extID == nil || extID == "" {
 		t.Error("device_external_id missing")
 	}
-	devName, _ := tok.Get("device_name")
+	devName := claim(tok, "device_name")
 	if devName != "" {
 		t.Errorf("device_name should be empty for fallback, got %v", devName)
 	}
@@ -637,7 +637,7 @@ func TestIntegrationMultiReplicaFlow(t *testing.T) {
 
 	rawJWT := enrollAcross(t, a, b, a)
 	tok := verifyWithJWKSFrom(t, b, rawJWT)
-	if name, _ := tok.Get("device_identity_name"); name != "alice-laptop" {
+	if name := claim(tok, "device_identity_name"); name != "alice-laptop" {
 		t.Errorf("device_identity_name = %v", name)
 	}
 }
@@ -738,7 +738,7 @@ func TestIntegrationProvisionCompleteAcrossReplicas(t *testing.T) {
 		t.Fatalf("unmarshal token response: %v", err)
 	}
 	tok := verifyWithJWKSFrom(t, b, resp.IDToken)
-	if ext, _ := tok.Get("device_external_id"); ext != "ext-from-embedder" {
+	if ext := claim(tok, "device_external_id"); ext != "ext-from-embedder" {
 		t.Errorf("device_external_id = %v, want ext-from-embedder", ext)
 	}
 }
