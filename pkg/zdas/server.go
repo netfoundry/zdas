@@ -278,21 +278,26 @@ func (s *Server) Start(ctx context.Context) error {
 	return err
 }
 
-// Timeouts for ZDAS's HTTP servers.
+// Timeouts and limits for ZDAS's HTTP servers.
 const (
 	serverReadTimeout  = 15 * time.Second
 	serverWriteTimeout = 15 * time.Second
 	serverIdleTimeout  = 60 * time.Second
+	// serverMaxHeaderBytes caps the request line and headers, which Go
+	// otherwise allows up to 1 MB. An /authorize request is well under
+	// 4 KB.
+	serverMaxHeaderBytes = 32 << 10
 )
 
-// newHTTPServer returns a server for addr with ZDAS's timeouts.
+// newHTTPServer returns a server for addr with ZDAS's timeouts and limits.
 func newHTTPServer(addr string, h http.Handler) *http.Server {
 	return &http.Server{
-		Addr:         addr,
-		Handler:      h,
-		ReadTimeout:  serverReadTimeout,
-		WriteTimeout: serverWriteTimeout,
-		IdleTimeout:  serverIdleTimeout,
+		Addr:           addr,
+		Handler:        h,
+		ReadTimeout:    serverReadTimeout,
+		WriteTimeout:   serverWriteTimeout,
+		IdleTimeout:    serverIdleTimeout,
+		MaxHeaderBytes: serverMaxHeaderBytes,
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -306,5 +307,26 @@ func TestServerShutdownCancelsInitialPoll(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Start still in its initial poll after Shutdown")
+	}
+}
+
+// TestHTTPServerLimitsHeaderSize verifies that ZDAS's server refuses a
+// request line and headers far larger than any real request.
+func TestHTTPServerLimitsHeaderSize(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newHTTPServer(ln.Addr().String(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/authorize?state=" + strings.Repeat("s", 2*serverMaxHeaderBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+		t.Errorf("status = %d, want 431", resp.StatusCode)
 	}
 }

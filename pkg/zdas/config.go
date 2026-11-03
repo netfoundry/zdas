@@ -1,8 +1,10 @@
 package zdas
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -176,7 +178,11 @@ func LoadConfig(path string) (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read config file: %w", err)
 		}
-		if err := yaml.Unmarshal(data, cfg); err != nil {
+		// Reject unknown keys, so that a misspelled setting such as
+		// allowed_orgs fails loudly instead of leaving its control off.
+		dec := yaml.NewDecoder(bytes.NewReader(data))
+		dec.KnownFields(true)
+		if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("parse config file: %w", err)
 		}
 	}
@@ -336,7 +342,7 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("rate_limit.trusted_proxies[%d]: %w", i, err)
 		}
 	}
-	return nil
+	return c.Claims.checkNames()
 }
 
 // checkRequired returns an error for a setting NewServer cannot work

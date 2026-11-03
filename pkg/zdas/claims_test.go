@@ -335,3 +335,19 @@ func stringClaim(tok jwt.Token, name string) string {
 	s, _ := claim(tok, name).(string)
 	return s
 }
+
+// TestComposeClaimsExternalIDWins verifies that even with a claim name that
+// collides with another claim, which Validate rejects, the external ID is
+// not replaced by a value the user controls.
+func TestComposeClaimsExternalIDWins(t *testing.T) {
+	identity := &UpstreamIdentity{Subject: "u1", Username: "victim", Issuer: "https://idp"}
+	info := &DeviceInfo{DeviceName: "laptop"}
+	for _, name := range []string{"device_name", "preferred_username"} {
+		cfg := defaultClaimsConfig()
+		cfg.ExternalIDClaim = name
+		claims := ComposeClaims(cfg, FallbackConfig{}, identity, info, "")
+		if want := computeExternalID("https://idp", "u1", "laptop"); claims[name] != want {
+			t.Errorf("external_id_claim %q: claim = %v, want the external ID", name, claims[name])
+		}
+	}
+}

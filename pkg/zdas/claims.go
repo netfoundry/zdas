@@ -2,6 +2,7 @@ package zdas
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -46,15 +47,43 @@ func ComposeClaims(cfg ClaimsConfig, fbCfg FallbackConfig, identity *UpstreamIde
 	}
 
 	claims := map[string]any{
-		cfg.IdentityNameClaim:  identityName,
-		cfg.ExternalIDClaim:    externalID,
 		"sub":                  externalID, // per spec: sub = device_external_id
 		"upstream_sub":         identity.Subject,
 		"upstream_iss":         identity.Issuer,
 		preferredUsernameClaim: username,
 		"device_name":          deviceName,
 	}
+	// The configured names go last, and the external ID after the name, so
+	// that a name that collides with another claim can never let a value
+	// the user controls replace the external ID. ClaimsConfig.checkNames
+	// rejects such names.
+	claims[cfg.IdentityNameClaim] = identityName
+	claims[cfg.ExternalIDClaim] = externalID
 	return claims
+}
+
+// reservedClaims are the claims ComposeClaims and MintToken set themselves.
+var reservedClaims = []string{
+	jwt.SubjectKey, "upstream_sub", "upstream_iss", preferredUsernameClaim, "device_name",
+	jwt.IssuerKey, jwt.AudienceKey, jwt.ExpirationKey, jwt.IssuedAtKey, jwt.NotBeforeKey, jwt.JwtIDKey,
+}
+
+// checkNames returns an error if the identity name or external ID claim
+// would overwrite another claim ZDAS sets. external_id_claim may be "sub",
+// which carries the external ID anyway.
+func (c ClaimsConfig) checkNames() error {
+	if c.IdentityNameClaim == c.ExternalIDClaim {
+		return errors.New("claims.identity_name_claim and claims.external_id_claim must differ")
+	}
+	for _, r := range reservedClaims {
+		if c.IdentityNameClaim == r {
+			return fmt.Errorf("claims.identity_name_claim %q is a claim ZDAS sets itself", r)
+		}
+		if c.ExternalIDClaim == r && r != jwt.SubjectKey {
+			return fmt.Errorf("claims.external_id_claim %q is a claim ZDAS sets itself", r)
+		}
+	}
+	return nil
 }
 
 // expandFallbackTemplate replaces {username} and {nonce_short} in the fallback

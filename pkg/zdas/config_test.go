@@ -448,3 +448,62 @@ func TestNewServerRequiresDefaults(t *testing.T) {
 		t.Error("Validate accepted a negative session timeout")
 	}
 }
+
+// TestLoadConfigRejectsUnknownKeys verifies that a misspelled setting fails
+// loading instead of leaving the control it names at its default.
+func TestLoadConfigRejectsUnknownKeys(t *testing.T) {
+	for name, body := range map[string]string{
+		"misspelled allowed_orgs": minimalYAML + `
+providers:
+  - name: github
+    type: github
+    client_id: id
+    client_secret: secret
+    allowed_org: [netfoundry]
+`,
+		"misspelled rate_limit": minimalYAML + `
+ratelimit:
+  authorize_per_second: 1
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := LoadConfig(writeTempConfig(t, body)); err == nil {
+				t.Error("LoadConfig accepted an unknown key")
+			}
+		})
+	}
+	if _, err := LoadConfig(writeTempConfig(t, "")); err == nil || strings.Contains(err.Error(), "parse config file") {
+		t.Errorf("an empty file should fail validation, not parsing: %v", err)
+	}
+}
+
+func TestClaimsCheckNames(t *testing.T) {
+	cases := []struct {
+		name, identity, external string
+		wantErr                  bool
+	}{
+		{"defaults", "device_identity_name", "device_external_id", false},
+		{"external ID in sub", "device_identity_name", "sub", false},
+		{"same name", "x", "x", true},
+		{"external ID in device_name", "device_identity_name", "device_name", true},
+		{"external ID in preferred_username", "device_identity_name", "preferred_username", true},
+		{"external ID in exp", "device_identity_name", "exp", true},
+		{"identity name in sub", "sub", "device_external_id", true},
+		{"identity name in upstream_iss", "upstream_iss", "device_external_id", true},
+	}
+	for _, tc := range cases {
+		err := ClaimsConfig{IdentityNameClaim: tc.identity, ExternalIDClaim: tc.external}.checkNames()
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%s: checkNames = %v, wantErr %v", tc.name, err, tc.wantErr)
+		}
+	}
+
+	// Loading a config runs the check.
+	body := minimalYAML + `
+claims:
+  external_id_claim: device_name
+`
+	if _, err := LoadConfig(writeTempConfig(t, body)); err == nil || !strings.Contains(err.Error(), "external_id_claim") {
+		t.Errorf("LoadConfig = %v, want an external_id_claim error", err)
+	}
+}
