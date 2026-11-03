@@ -328,3 +328,13 @@ func TestExtractField(t *testing.T) {
 		t.Errorf("nope = %q", got)
 	}
 }
+
+// TestGitHubProviderOrgCheckIgnoresCase verifies that allowed_orgs matches
+// organization names regardless of case, as GitHub does.
+func TestGitHubProviderOrgCheckIgnoresCase(t *testing.T) {
+	server := mockGitHubServer(t, map[string]any{"id": float64(1), "login": "member"}, []map[string]any{{"login": "NETFOUNDRY"}}, nil)
+	p := newTestGitHubProvider(t, server, []string{"NetFoundry"})
+	if _, err := p.ExchangeAndIdentify(context.Background(), "code", "https://zdas/callback"); err != nil {
+		t.Errorf("member of netfoundry rejected for allowed_orgs [NetFoundry]: %v", err)
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // newTestEndpoints returns endpoints over store, keyed as NewServer keys
@@ -815,5 +816,136 @@ func TestRedirectKeepsExistingQuery(t *testing.T) {
 		if got := withQuery(tc.in, url.Values{"code": {"c"}}); got != tc.want {
 			t.Errorf("withQuery(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// authorizeURL returns an /authorize URL with valid parameters, overridden
+// by over.
+func authorizeURL(t *testing.T, over url.Values) string {
+	t.Helper()
+	_, challenge := generateTestPKCE(t)
+	q := url.Values{
+		"redirect_uri":          {"http://localhost:20314/auth/callback"},
+		"state":                 {"s1"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"device_name":           {"laptop"},
+	}
+	for k, v := range over {
+		q[k] = v
+	}
+	return "/authorize?" + q.Encode()
+}
+
+// TestAuthorizeRejectsOversizedParams verifies that /authorize refuses a
+// state or redirect_uri too large to keep in a session, without creating
+// one, and accepts values at the limit.
+func TestAuthorizeRejectsOversizedParams(t *testing.T) {
+	h, _ := setupHandlers(t)
+	cases := []struct {
+		name string
+		over url.Values
+		want int
+	}{
+		{"huge state", url.Values{"state": {strings.Repeat("s", 900_000)}}, http.StatusBadRequest},
+		{"state over the limit", url.Values{"state": {strings.Repeat("s", maxStateLength+1)}}, http.StatusBadRequest},
+		{"state at the limit", url.Values{"state": {strings.Repeat("s", maxStateLength)}}, http.StatusFound},
+		{"redirect_uri over the limit", url.Values{"redirect_uri": {"http://localhost:1/" + strings.Repeat("p", maxRedirectURILength)}}, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, authorizeURL(t, tc.over), nil))
+			if w.Code != tc.want {
+				t.Fatalf("status = %d, want %d", w.Code, tc.want)
+			}
+			if tc.want == http.StatusBadRequest && (w.Header().Get("Location") != "" || len(w.Result().Cookies()) != 0) {
+				t.Error("rejected request redirected or started a session")
+			}
+		})
+	}
+}
+
+// TestAuthorizeRejectsMalformedChallenge verifies that a code_challenge that
+// is not a canonical S256 digest is refused before the user signs in.
+func TestAuthorizeRejectsMalformedChallenge(t *testing.T) {
+	h, _ := setupHandlers(t)
+	_, valid := generateTestPKCE(t)
+	for name, challenge := range map[string]string{
+		"too short":         "abc",
+		"padded":            valid + "=",
+		"standard alphabet": "+" + valid[1:],
+		"non-canonical":     valid[:42] + "B",
+		"too long":          valid + "A",
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, authorizeURL(t, url.Values{"code_challenge": {challenge}}), nil))
+			loc, err := url.Parse(w.Header().Get("Location"))
+			if err != nil || loc.Query().Get("error") != "invalid_request" {
+				t.Errorf("status = %d, Location = %q; want an invalid_request redirect", w.Code, w.Header().Get("Location"))
+			}
+			if len(w.Result().Cookies()) != 0 {
+				t.Error("session started for a malformed challenge")
+			}
+		})
+	}
+}
+
+// TestAuthorizeSessionDoesNotKeepRequest verifies that the session's strings
+// are copies, not slices of the request's query string, which would keep
+// the whole request line in memory for the life of the session.
+func TestAuthorizeSessionDoesNotKeepRequest(t *testing.T) {
+	h, _ := setupHandlers(t)
+	req := httptest.NewRequest(http.MethodGet, authorizeURL(t, url.Values{
+		"hostname":          {strings.Repeat("h", 10_000)},
+		"os":                {"linux"},
+		"enrollment_method": {"enrollToCert"},
+		"client_type":       {"tunneler"},
+	}), nil)
+	raw := req.URL.RawQuery
+	w := httptest.NewRecorder()
+	h.mux().ServeHTTP(w, req)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d", w.Code)
+	}
+
+	mem := h.store.(*memStore)
+	mem.mu.Lock()
+	sess := mem.sessions.order.Front().Value.(*entry[*AuthSession]).value
+	mem.mu.Unlock()
+	start := uintptr(unsafe.Pointer(unsafe.StringData(raw)))
+	end := start + uintptr(len(raw))
+	for name, v := range map[string]string{
+		"redirect_uri":      sess.TunnelerRedirectURI,
+		"state":             sess.TunnelerState,
+		"code_challenge":    sess.TunnelerCodeChallenge,
+		"method":            sess.TunnelerCodeChallengeMethod,
+		"device_name":       sess.DeviceInfo.DeviceName,
+		"hostname":          sess.DeviceInfo.Hostname,
+		"os":                sess.DeviceInfo.OS,
+		"enrollment_method": sess.EnrollmentMethod,
+		"client_type":       sess.ClientType,
+	} {
+		if p := uintptr(unsafe.Pointer(unsafe.StringData(v))); v != "" && p >= start && p < end {
+			t.Errorf("session %s shares memory with the request's query string", name)
+		}
+	}
+	if len(sess.DeviceInfo.Hostname) != 255 {
+		t.Errorf("hostname length = %d, want 255", len(sess.DeviceInfo.Hostname))
+	}
+}
+
+// TestTokenRejectsOversizedBody verifies that /token stops reading a body
+// far larger than any real token request.
+func TestTokenRejectsOversizedBody(t *testing.T) {
+	h, _ := setupHandlers(t)
+	body := "grant_type=authorization_code&code=" + strings.Repeat("c", 1<<20)
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.mux().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || tokenErrorCode(t, w) != "invalid_request" {
+		t.Errorf("status = %d, body = %s; want 400 invalid_request", w.Code, w.Body.String())
 	}
 }

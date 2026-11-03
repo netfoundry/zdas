@@ -2,7 +2,9 @@ package zdas
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -127,6 +129,17 @@ func (h *endpoints) handleJWKS(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
+// Limits on the /authorize parameters a session keeps. Sessions are created
+// before anyone authenticates, so unbounded values would let anonymous
+// requests fill memory. Tunnelers send far less than these.
+const (
+	maxRedirectURILength = 2048
+	maxStateLength       = 512
+	// s256ChallengeLength is the length of an S256 code_challenge: a
+	// SHA-256 digest in unpadded base64url (RFC 7636 section 4.2).
+	s256ChallengeLength = 43
+)
+
 func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	if h.rateLimiter != nil && !h.rateLimiter.allow(r) {
 		w.Header().Set("Retry-After", "1")
@@ -150,8 +163,17 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	codeChallengeMethod := q.Get("code_challenge_method")
 
 	// Validate redirect_uri early - before we trust it for error redirects.
+	// state is echoed in those redirects, so it is checked here too.
 	if redirectURI == "" {
 		http.Error(w, "redirect_uri is required", http.StatusBadRequest)
+		return
+	}
+	if len(redirectURI) > maxRedirectURILength {
+		http.Error(w, "redirect_uri is too long", http.StatusBadRequest)
+		return
+	}
+	if len(state) > maxStateLength {
+		http.Error(w, "state is too long", http.StatusBadRequest)
 		return
 	}
 	parsedRedirect, err := parseRedirectURI(redirectURI)
@@ -171,6 +193,10 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 	if codeChallengeMethod != "S256" {
 		oidcErrorRedirect(w, r, redirectURI, state, "invalid_request", "only S256 code_challenge_method is supported")
+		return
+	}
+	if !validS256Challenge(codeChallenge) {
+		oidcErrorRedirect(w, r, redirectURI, state, "invalid_request", "code_challenge must be a base64url SHA-256 digest")
 		return
 	}
 	var fallbackNonce string
@@ -201,7 +227,7 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	// fallback path DeviceName will be empty, but os/hostname/arch may
 	// still be present and useful to the consumer (e.g. provisioner).
 	deviceInfo := &DeviceInfo{
-		DeviceName: deviceName,
+		DeviceName: strings.Clone(deviceName),
 		Hostname:   truncateParam(hostname, 255),
 		OS:         truncateParam(osName, 64),
 		Arch:       truncateParam(arch, 64),
@@ -231,11 +257,13 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	// Build session and redirect to upstream.
 	callbackURL := h.cfg.ExternalURL + "/callback"
 
+	// Copy what the session keeps: values parsed from the query can share
+	// its memory, and the session would keep the whole request line alive.
 	sess := &AuthSession{
-		TunnelerRedirectURI:         redirectURI,
-		TunnelerState:               state,
-		TunnelerCodeChallenge:       codeChallenge,
-		TunnelerCodeChallengeMethod: codeChallengeMethod,
+		TunnelerRedirectURI:         strings.Clone(redirectURI),
+		TunnelerState:               strings.Clone(state),
+		TunnelerCodeChallenge:       strings.Clone(codeChallenge),
+		TunnelerCodeChallengeMethod: strings.Clone(codeChallengeMethod),
 		DeviceInfo:                  deviceInfo,
 		FallbackNonce:               fallbackNonce,
 		EnrollmentMethod:            truncateParam(enrollmentMethod, 64),
@@ -428,7 +456,12 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, redir, http.StatusFound)
 }
 
+// maxTokenRequestBytes caps a /token request body. A real one is a few
+// hundred bytes.
+const maxTokenRequestBytes = 16 << 10
+
 func (h *endpoints) handleToken(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxTokenRequestBytes)
 	if err := r.ParseForm(); err != nil {
 		tokenError(w, "invalid_request", "malformed form body")
 		return
@@ -525,12 +558,24 @@ func sanitizeErrorDescription(s string) string {
 	return string(out)
 }
 
-// truncateParam caps a tunneler-supplied query parameter to maxLen bytes.
+// truncateParam returns a copy of a tunneler-supplied query parameter, cut to
+// maxLen bytes. It copies so that a stored value does not keep the request's
+// query string in memory.
 func truncateParam(s string, maxLen int) string {
 	if len(s) > maxLen {
-		return s[:maxLen]
+		s = s[:maxLen]
 	}
-	return s
+	return strings.Clone(s)
+}
+
+// validS256Challenge reports whether challenge is an S256 code_challenge: a
+// 32-byte digest in canonical unpadded base64url.
+func validS256Challenge(challenge string) bool {
+	if len(challenge) != s256ChallengeLength {
+		return false
+	}
+	digest, err := base64.RawURLEncoding.Strict().DecodeString(challenge)
+	return err == nil && len(digest) == sha256.Size
 }
 
 // handleProvisionerError translates an error from the EnrollmentProvisioner

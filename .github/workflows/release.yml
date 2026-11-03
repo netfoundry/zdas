@@ -26,6 +26,12 @@ jobs:
         with:
           go-version: stable
           check-latest: true
+          # A release builds from scratch: restoring a cache written by
+          # another workflow would let that run influence the binaries.
+          cache: false
+
+      - name: Verify modules
+        run: go mod verify
 
       - name: Run tests
         run: go test -race -count=1 ./...
@@ -34,6 +40,9 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
       - name: Build binaries
+        env:
+          # Static binaries, which run on any Linux, Alpine included.
+          CGO_ENABLED: "0"
         run: |
           version="${GITHUB_REF_NAME}"
           ldflags="-s -w -X main.version=${version}"
@@ -56,6 +65,16 @@ jobs:
             fi
             echo "Building ${os}/${arch}..."
             GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$ldflags" -o "dist/${output}" ./cmd/zdas/
+          done
+
+      - name: Check the Linux binaries are static
+        run: |
+          for f in dist/zdas-*-linux-*; do
+            if ! file "$f" | grep -q 'statically linked'; then
+              file "$f"
+              echo "$f is not statically linked"
+              exit 1
+            fi
           done
 
       - name: Create checksums

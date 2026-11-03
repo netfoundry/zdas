@@ -165,9 +165,10 @@ func (p *GitHubProvider) fetchUser(ctx context.Context, accessToken string) (map
 // checkOrgs returns nil if the user belongs to one of AllowedOrgs, reading
 // up to maxGitHubOrgPages pages of the user's organizations.
 func (p *GitHubProvider) checkOrgs(ctx context.Context, accessToken string) error {
+	// GitHub organization names are case-insensitive.
 	allowed := make(map[string]struct{}, len(p.allowedOrgs))
 	for _, o := range p.allowedOrgs {
-		allowed[o] = struct{}{}
+		allowed[strings.ToLower(o)] = struct{}{}
 	}
 	for page := 1; page <= maxGitHubOrgPages; page++ {
 		orgsURL := withQuery(strings.TrimSuffix(p.userURL, "/")+"/orgs", url.Values{
@@ -181,7 +182,7 @@ func (p *GitHubProvider) checkOrgs(ctx context.Context, accessToken string) erro
 			return fmt.Errorf("github orgs api: %w", err)
 		}
 		for _, org := range orgs {
-			if _, ok := allowed[org.Login]; ok {
+			if _, ok := allowed[strings.ToLower(org.Login)]; ok {
 				return nil
 			}
 		}
