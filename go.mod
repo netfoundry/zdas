@@ -1,5 +1,4 @@
-// Deprecated: this module moved to github.com/netfoundry/zdas. Import that path instead.
-module github.com/smilindave26/zdas
+module github.com/netfoundry/zdas
 
 go 1.26.0
 

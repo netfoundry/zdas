@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/smilindave26/zdas/pkg/zdas"
-	"github.com/smilindave26/zdas/pkg/zdas/zdastest"
+	"github.com/netfoundry/zdas/pkg/zdas"
+	"github.com/netfoundry/zdas/pkg/zdas/zdastest"
 )
 
 func TestMemoryStoreConformance(t *testing.T) {

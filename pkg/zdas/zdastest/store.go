@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/smilindave26/zdas/pkg/zdas"
+	"github.com/netfoundry/zdas/pkg/zdas"
 )
 
 // TestStore runs a conformance suite against a zdas.Store implementation.

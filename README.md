@@ -107,7 +107,7 @@ Unmodified tunnelers work without changes when `fallback.enabled` is true. They 
 Mount the full service on your own mux:
 
 ```go
-import "github.com/smilindave26/zdas/pkg/zdas"
+import "github.com/netfoundry/zdas/pkg/zdas"
 
 handler, err := zdas.NewHandler(cfg, logger)
 mux.Handle("/device-auth/", http.StripPrefix("/device-auth", handler))
