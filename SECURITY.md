@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report vulnerabilities privately through GitHub's
-[private vulnerability reporting](https://github.com/smilindave26/zdas/security/advisories/new),
+[private vulnerability reporting](https://github.com/netfoundry/zdas/security/advisories/new),
 not in a public issue. Include the version or commit, what an attacker
 needs, and how to reproduce it if you can.
 
@@ -17,11 +17,11 @@ to pick them up.
 
 ## Verifying release binaries
 
-Each release binary has a build provenance attestation. To check that a
-binary was built from this repository by its release workflow:
+Release binaries from v0.13.0 on have a build provenance attestation. To
+check that a binary was built from this repository by its release workflow:
 
 ```
-gh attestation verify zdas-v0.12.0-linux-amd64 --repo smilindave26/zdas
+gh attestation verify zdas-v0.13.0-linux-amd64 --repo netfoundry/zdas
 ```
 
 `checksums-sha256.txt` in each release lists the SHA-256 of every binary.

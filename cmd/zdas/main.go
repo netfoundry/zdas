@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/smilindave26/zdas/pkg/zdas"
+	"github.com/netfoundry/zdas/pkg/zdas"
 )
 
 var version = "dev"
