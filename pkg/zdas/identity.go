@@ -103,11 +103,11 @@ type apiSession struct {
 	ExpiresAt time.Time
 }
 
-// authenticateSession performs a certificate-based authentication against the
-// Ziti controller management API. It returns a session token that must be
-// passed as the zt-session header on subsequent management API calls.
-func authenticateSession(ctx context.Context, client *http.Client, apiURL string) (*apiSession, error) {
-	authURL := strings.TrimSuffix(apiURL, "/") + "/authenticate?method=cert"
+// authenticateSession authenticates with the client certificate to the
+// management API at mgmtURL. It returns a session token that must be passed
+// as the zt-session header on subsequent management API calls.
+func authenticateSession(ctx context.Context, client *http.Client, mgmtURL string) (*apiSession, error) {
+	authURL := mgmtURL + "/authenticate?method=cert"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, authURL, strings.NewReader("{}"))
 	if err != nil {
 		return nil, fmt.Errorf("build authenticate request: %w", err)

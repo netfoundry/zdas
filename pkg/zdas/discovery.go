@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -142,13 +143,24 @@ type signerPagination struct {
 	TotalCount int `json:"totalCount"`
 }
 
+// signerEntry is the part of a signer ZDAS uses. The client API does not
+// send the signer's issuer. Tunnelers treat externalAuthUrl as the IdP's
+// OIDC issuer and read its discovery document from there, so ZDAS does too.
 type signerEntry struct {
-	Name                 string `json:"name"`
-	Issuer               string `json:"issuer"`
-	ClientID             string `json:"clientId"`
-	ExternalAuthURL      string `json:"externalAuthUrl"`
-	EnrollToCertEnabled  bool   `json:"enrollToCertEnabled"`
-	EnrollToTokenEnabled bool   `json:"enrollToTokenEnabled"`
+	Name                 string   `json:"name"`
+	ClientID             string   `json:"clientId"`
+	ExternalAuthURL      string   `json:"externalAuthUrl"`
+	Scopes               []string `json:"scopes"`
+	Audience             string   `json:"audience"`
+	EnrollToCertEnabled  bool     `json:"enrollToCertEnabled"`
+	EnrollToTokenEnabled bool     `json:"enrollToTokenEnabled"`
+}
+
+// equal reports whether s and o have the same settings.
+func (s signerEntry) equal(o signerEntry) bool {
+	return s.Name == o.Name && s.ClientID == o.ClientID && s.ExternalAuthURL == o.ExternalAuthURL &&
+		slices.Equal(s.Scopes, o.Scopes) && s.Audience == o.Audience &&
+		s.EnrollToCertEnabled == o.EnrollToCertEnabled && s.EnrollToTokenEnabled == o.EnrollToTokenEnabled
 }
 
 // cachedNetworkJWTs returns the cached response from the controller's
@@ -221,9 +233,9 @@ func (d *signerDiscovery) poll(ctx context.Context) error {
 }
 
 // usableSigners returns the signers to build providers for: those with
-// enrollment enabled, other than ZDAS itself, that have an issuer, and whose
-// name, ignoring case, is not already taken by a configured provider or an
-// earlier signer. A signer whose name is taken is skipped rather than
+// enrollment enabled, other than ZDAS itself, that have an externalAuthUrl,
+// and whose name, ignoring case, is not already taken by a configured
+// provider or an earlier signer. A signer whose name is taken is skipped rather than
 // failing the poll, so that one misnamed signer cannot stop discovery.
 func (d *signerDiscovery) usableSigners(signers []signerEntry) []signerEntry {
 	taken := make(map[string]bool, len(d.configuredNames)+len(signers))
@@ -236,13 +248,13 @@ func (d *signerDiscovery) usableSigners(signers []signerEntry) []signerEntry {
 		case !s.EnrollToCertEnabled && !s.EnrollToTokenEnabled:
 			continue
 		case d.isSelf(s):
-			d.logger.Debug("excluding self from discovered signers", "name", s.Name, "issuer", s.Issuer)
+			d.logger.Debug("excluding self from discovered signers", "name", s.Name, "external_auth_url", s.ExternalAuthURL)
 			continue
-		case s.Issuer == "":
-			d.logger.Debug("skipping signer with empty issuer", "name", s.Name)
+		case s.ExternalAuthURL == "":
+			d.logger.Debug("skipping signer with no externalAuthUrl", "name", s.Name)
 			continue
 		case taken[strings.ToLower(s.Name)]:
-			d.logger.Warn("skipping signer whose name is already taken by another provider", "name", s.Name, "issuer", s.Issuer)
+			d.logger.Warn("skipping signer whose name is already taken by another provider", "name", s.Name, "external_auth_url", s.ExternalAuthURL)
 			continue
 		}
 		taken[strings.ToLower(s.Name)] = true
@@ -251,17 +263,14 @@ func (d *signerDiscovery) usableSigners(signers []signerEntry) []signerEntry {
 	return usable
 }
 
-// isSelf reports whether s is ZDAS's own signer: its issuer is SelfIssuer,
-// or, since the public API may return an empty issuer for a new signer, its
-// externalAuthUrl is SelfIssuer or a path under it.
+// isSelf reports whether s is ZDAS's own signer: its externalAuthUrl is
+// SelfIssuer or, as older setup instructions had it, a path under it.
 func (d *signerDiscovery) isSelf(s signerEntry) bool {
 	self := strings.TrimSuffix(d.cfg.SelfIssuer, "/")
 	if self == "" {
 		return false
 	}
-	return strings.TrimSuffix(s.Issuer, "/") == self ||
-		s.ExternalAuthURL == self ||
-		strings.HasPrefix(s.ExternalAuthURL, self+"/")
+	return s.ExternalAuthURL == self || strings.HasPrefix(s.ExternalAuthURL, self+"/")
 }
 
 // builtProvider is a provider discovery built and the signer it was built
@@ -281,22 +290,38 @@ func (d *signerDiscovery) buildProvider(ctx context.Context, s signerEntry) *OID
 	defer cancel()
 	p, err := NewOIDCProvider(setupCtx, OIDCProviderConfig{
 		Name:       s.Name,
-		Issuer:     s.Issuer,
+		Issuer:     s.ExternalAuthURL,
 		ClientID:   s.ClientID,
-		AuthURL:    s.ExternalAuthURL,
+		Scopes:     signerScopes(s.Scopes),
+		Audience:   s.Audience,
 		HTTPClient: d.upstreamClient,
 		Logger:     d.logger,
 	})
 	if err == nil {
-		d.logger.Info("discovered oidc provider", "name", s.Name, "issuer", s.Issuer)
+		d.logger.Info("discovered oidc provider", "name", s.Name, "issuer", s.ExternalAuthURL)
 		return p
 	}
-	if prev, ok := d.built[s.Name]; ok && prev.signer == s {
+	if prev, ok := d.built[s.Name]; ok && prev.signer.equal(s) {
 		d.logger.Warn("failed to refresh oidc provider from signer, keeping previous", "name", s.Name, "error", err)
 		return prev.provider
 	}
 	d.logger.Warn("failed to create oidc provider from signer, skipping", "name", s.Name, "error", err)
 	return nil
+}
+
+// signerScopes returns the scopes to request for a signer: ZDAS's defaults,
+// which give it the claims it names identities from, followed by the
+// signer's own, which the IdP may need, e.g. for group claims.
+func signerScopes(extra []string) []string {
+	scopes := slices.Clone(defaultOIDCScopes)
+	for _, e := range extra {
+		for _, sc := range strings.Fields(e) {
+			if !slices.Contains(scopes, sc) {
+				scopes = append(scopes, sc)
+			}
+		}
+	}
+	return scopes
 }
 
 // fetchSigners fetches every page of the controller's signer list. It
@@ -370,6 +395,25 @@ func (d *signerDiscovery) fetchSignerPage(ctx context.Context, offset int) ([]by
 		return nil, fmt.Errorf("signers endpoint returned %d: %s", resp.StatusCode, truncateBody(body))
 	}
 	return body, nil
+}
+
+// The Edge API paths, which ZDAS appends to the controller's root URL.
+const (
+	clientAPIPath     = "/edge/client/v1"
+	managementAPIPath = "/edge/management/v1"
+)
+
+// controllerRoot returns the controller's root URL from rawURL, which may be
+// the root or an Edge API URL, as ztAPI in an identity file is. A path in
+// front of the API path, such as a reverse proxy's prefix, is kept.
+func controllerRoot(rawURL string) string {
+	u := strings.TrimSuffix(rawURL, "/")
+	for _, p := range []string{clientAPIPath, managementAPIPath} {
+		if root, ok := strings.CutSuffix(u, p); ok {
+			return root
+		}
+	}
+	return u
 }
 
 // controllerClient builds an HTTP client for controller communication.

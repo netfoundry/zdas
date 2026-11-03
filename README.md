@@ -33,7 +33,7 @@ When multiple identity providers are available, ZDAS presents a selection page i
 ## Features
 
 - **Single binary, no database.** Ephemeral EC P-256 keys generated at startup, served via JWKS. In-memory session store with automatic cleanup.
-- **Controller-driven IdP discovery.** ZDAS polls the OpenZiti controller for ext-jwt-signers with enrollment enabled (cert or token), so adding a new IdP to the controller automatically makes it available through ZDAS.
+- **Controller-driven IdP discovery.** ZDAS polls the OpenZiti controller for ext-jwt-signers with enrollment enabled (cert or token), so adding a new IdP to the controller automatically makes it available through ZDAS. As for tunnelers, a signer's external auth URL must be the IdP's OIDC issuer: ZDAS reads the issuer's discovery document for the authorization endpoint, and requests the signer's scopes and audience.
 - **Non-OIDC provider support.** GitHub (and other OAuth-only providers) can be configured directly. Both discovered and configured providers are unified behind a common `UpstreamProvider` interface.
 - **Fallback for unmodified tunnelers.** Deploy ZDAS before updating any tunnelers. Unmodified tunnelers enroll with a temporary name, and ZDAS renames the identity via the management API after the tunneler connects and reports `envInfo`. Set `fallback.enabled: false` once all tunnelers are updated.
 - **Three TLS modes.** `acme` (automatic Let's Encrypt), `static` (bring your own cert), or `none` (behind a reverse proxy).
@@ -58,7 +58,7 @@ cp config.example.yaml config.yaml
 ziti edge create ext-jwt-signer zdas-signer \
   "https://das.example.com" \
   --jwks-endpoint "https://das.example.com/.well-known/jwks.json" \
-  --external-auth-url "https://das.example.com/authorize" \
+  --external-auth-url "https://das.example.com" \
   --audience "ziti-enroll" \
   --client-id "ziti-enroll" \
   --enroll-to-cert \
@@ -80,7 +80,7 @@ Key settings:
 | Setting | Description | Default |
 |---------|-------------|---------|
 | `external_url` | Public URL where tunnelers and the controller reach ZDAS | (required) |
-| `controller.api_url` | OpenZiti controller Edge Client API URL | (required) |
+| `controller.api_url` | OpenZiti controller URL, e.g. `https://ctrl.example.com:1280`. A client or management API URL also works. | (required) |
 | `controller.identity_file` | OpenZiti admin identity JSON (cert, key, CA) for management API | (optional, required for fallback) |
 | `fallback.enabled` | Allow enrollment without device info from unmodified tunnelers | `false` |
 | `claims.name_template` | Template for identity names. Placeholders: `{username}`, `{device_name}`, `{hostname}`, `{os}`, `{arch}` | `{username}-{device_name}` |

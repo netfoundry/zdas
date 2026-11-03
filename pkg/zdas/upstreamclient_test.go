@@ -145,7 +145,7 @@ func upstreamClientConfig(t *testing.T, configured, signer string) Config {
 	ctrlMux.HandleFunc("/edge/client/v1/external-jwt-signers", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(signerResponse{Data: []signerEntry{
-			{Name: "discovered", Issuer: signer, ClientID: "test-client", EnrollToCertEnabled: true},
+			{Name: "discovered", ExternalAuthURL: signer, ClientID: "test-client", EnrollToCertEnabled: true},
 		}})
 	})
 	ctrlServer := httptest.NewServer(ctrlMux)

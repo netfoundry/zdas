@@ -22,7 +22,7 @@ type fallbackReconciler struct {
 	cfg       FallbackConfig
 	claimsCfg ClaimsConfig
 	client    *http.Client
-	apiURL    string
+	mgmtURL   string // the management API, e.g. https://ctrl:1280/edge/management/v1
 	logger    *slog.Logger
 
 	mu      sync.Mutex
@@ -46,14 +46,15 @@ type pendingReconciliation struct {
 	TrackedAt  time.Time
 }
 
-// newFallbackReconciler creates a fallbackReconciler. Call start to begin
-// background polling.
-func newFallbackReconciler(cfg FallbackConfig, claimsCfg ClaimsConfig, client *http.Client, apiURL string, logger *slog.Logger) *fallbackReconciler {
+// newFallbackReconciler creates a fallbackReconciler that reaches the
+// management API of the controller at ctrlURL, its root or an Edge API URL.
+// Call start to begin background polling.
+func newFallbackReconciler(cfg FallbackConfig, claimsCfg ClaimsConfig, client *http.Client, ctrlURL string, logger *slog.Logger) *fallbackReconciler {
 	return &fallbackReconciler{
 		cfg:       cfg,
 		claimsCfg: claimsCfg,
 		client:    client,
-		apiURL:    strings.TrimSuffix(apiURL, "/"),
+		mgmtURL:   controllerRoot(ctrlURL) + managementAPIPath,
 		logger:    logger,
 		pending:   make(map[string]*pendingReconciliation),
 	}
@@ -270,7 +271,7 @@ func (r *fallbackReconciler) findIdentity(ctx context.Context, externalID string
 	}
 	quoted, _ := zitiqlString(externalID)
 	filter := "externalId=" + quoted
-	reqURL := r.apiURL + "/edge/management/v1/identities?filter=" + url.QueryEscape(filter)
+	reqURL := r.mgmtURL + "/identities?filter=" + url.QueryEscape(filter)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
@@ -329,7 +330,7 @@ func (r *fallbackReconciler) findIdentity(ctx context.Context, externalID string
 
 // renameIdentity patches the identity name via the management API.
 func (r *fallbackReconciler) renameIdentity(ctx context.Context, identityID, newName string) error {
-	patchURL := r.apiURL + "/edge/management/v1/identities/" + url.PathEscape(identityID)
+	patchURL := r.mgmtURL + "/identities/" + url.PathEscape(identityID)
 	payload, _ := json.Marshal(map[string]string{"name": newName})
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, patchURL, bytes.NewReader(payload))
@@ -358,7 +359,7 @@ func (r *fallbackReconciler) renameIdentity(ctx context.Context, identityID, new
 }
 
 func (r *fallbackReconciler) refreshSession(ctx context.Context) error {
-	session, err := authenticateSession(ctx, r.client, r.apiURL)
+	session, err := authenticateSession(ctx, r.client, r.mgmtURL)
 	if err != nil {
 		return err
 	}
