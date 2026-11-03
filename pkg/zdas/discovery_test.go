@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -26,8 +27,9 @@ type signerResponse struct {
 
 // mockControllerAndIDPs sets up:
 //   - a mock Ziti controller that returns the given signer entries
-//   - for each signer entry, a mock OIDC discovery server (if the issuer is
-//     left as "", it gets filled in automatically from the mock server URL)
+//   - for each signer entry, a mock OIDC discovery server (if the
+//     externalAuthUrl is left as "", it is set to the mock server's URL, its
+//     issuer)
 //
 // Returns the controller server and a list of OIDC mock servers.
 func mockControllerAndIDPs(t *testing.T, signers []signerEntry) (*httptest.Server, []*httptest.Server) {
@@ -41,8 +43,8 @@ func mockControllerAndIDPs(t *testing.T, signers []signerEntry) (*httptest.Serve
 		}
 		idpServer, _ := mockOIDCServer(t, map[string]any{"sub": "testuser"})
 		idpServers = append(idpServers, idpServer)
-		if signers[i].Issuer == "" {
-			signers[i].Issuer = idpServer.URL
+		if signers[i].ExternalAuthURL == "" {
+			signers[i].ExternalAuthURL = idpServer.URL
 		}
 	}
 
@@ -92,7 +94,7 @@ func TestDiscoveryExcludesSelf(t *testing.T) {
 	// One signer is ZDAS itself (matching self_issuer), one is a real IdP.
 	selfIssuer := "https://zdas.example.com"
 	signers := []signerEntry{
-		{Name: "zdas-signer", Issuer: selfIssuer, ClientID: "c", EnrollToCertEnabled: true},
+		{Name: "zdas-signer", ExternalAuthURL: selfIssuer, ClientID: "c", EnrollToCertEnabled: true},
 		{Name: "keycloak", ClientID: "kc-client", EnrollToCertEnabled: true},
 	}
 	ctrl, _ := mockControllerAndIDPs(t, signers)
@@ -116,7 +118,7 @@ func TestDiscoveryExcludesSelf(t *testing.T) {
 
 func TestDiscoveryFiltersNonEnrollToCert(t *testing.T) {
 	signers := []signerEntry{
-		{Name: "auth-only", ClientID: "c", Issuer: "https://auth-only", EnrollToCertEnabled: false},
+		{Name: "auth-only", ClientID: "c", ExternalAuthURL: "https://auth-only", EnrollToCertEnabled: false},
 		{Name: "enroll", ClientID: "c", EnrollToCertEnabled: true},
 	}
 	ctrl, _ := mockControllerAndIDPs(t, signers)
@@ -179,14 +181,15 @@ func TestDiscoveryIsSelf(t *testing.T) {
 		s    signerEntry
 		want bool
 	}{
-		{"https://zdas.example.com", signerEntry{Issuer: "https://zdas.example.com"}, true},
-		{"https://zdas.example.com", signerEntry{Issuer: "https://zdas.example.com/"}, true},
+		{"https://zdas.example.com", signerEntry{ExternalAuthURL: "https://zdas.example.com"}, true},
+		{"https://zdas.example.com", signerEntry{ExternalAuthURL: "https://zdas.example.com/"}, true},
+		{"https://zdas.example.com/", signerEntry{ExternalAuthURL: "https://zdas.example.com"}, true},
 		{"https://zdas.example.com", signerEntry{ExternalAuthURL: "https://zdas.example.com/authorize"}, true},
 		{"https://zdas.example.com/", signerEntry{ExternalAuthURL: "https://zdas.example.com/authorize"}, true},
-		{"https://zdas.example.com", signerEntry{ExternalAuthURL: "https://zdas.example.com"}, true},
+		{"https://zdas.example.com", signerEntry{ExternalAuthURL: "https://zdas.example.com.evil"}, false},
 		{"https://zdas.example.com", signerEntry{ExternalAuthURL: "https://zdas.example.com.evil/authorize"}, false},
-		{"https://zdas.example.com", signerEntry{Issuer: "https://idp.example.com"}, false},
-		{"", signerEntry{Issuer: "https://idp.example.com", ExternalAuthURL: "https://idp.example.com/auth"}, false},
+		{"https://zdas.example.com", signerEntry{ExternalAuthURL: "https://idp.example.com"}, false},
+		{"", signerEntry{ExternalAuthURL: "https://idp.example.com"}, false},
 	}
 	for _, tc := range cases {
 		d := &signerDiscovery{cfg: ControllerConfig{SelfIssuer: tc.self}}
@@ -208,9 +211,9 @@ func TestDiscoveryUnresponsiveIssuer(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 
 	signers := []signerEntry{
-		{Name: "hung-1", Issuer: hung.URL + "/a", ClientID: "c", EnrollToCertEnabled: true},
-		{Name: "hung-2", Issuer: hung.URL + "/b", ClientID: "c", EnrollToCertEnabled: true},
-		{Name: "hung-3", Issuer: hung.URL + "/c", ClientID: "c", EnrollToCertEnabled: true},
+		{Name: "hung-1", ExternalAuthURL: hung.URL + "/a", ClientID: "c", EnrollToCertEnabled: true},
+		{Name: "hung-2", ExternalAuthURL: hung.URL + "/b", ClientID: "c", EnrollToCertEnabled: true},
+		{Name: "hung-3", ExternalAuthURL: hung.URL + "/c", ClientID: "c", EnrollToCertEnabled: true},
 		{Name: "kc", ClientID: "c", EnrollToCertEnabled: true},
 	}
 	ctrl, _ := mockControllerAndIDPs(t, signers)
@@ -274,7 +277,7 @@ func TestDiscoveryPaginates(t *testing.T) {
 	for i := range 3 {
 		idp, _ := mockOIDCServer(t, map[string]any{"sub": "u"})
 		entries = append(entries, fmt.Sprintf(
-			`{"id":"id%d","name":"kc%d","issuer":%q,"clientId":"c","enrollToCertEnabled":true}`, i, i, idp.URL))
+			`{"id":"id%d","name":"kc%d","externalAuthUrl":%q,"clientId":"c","enrollToCertEnabled":true}`, i, i, idp.URL))
 	}
 	var offsets []string
 	ctrlMux := http.NewServeMux()
@@ -547,4 +550,146 @@ func TestDiscoveryLoop(t *testing.T) {
 		t.Errorf("%d polls after stop", n-after)
 	}
 	d.stop()
+}
+
+// clientAPISigner is a signer as the controller's client API sends it
+// (ClientExternalJWTSignerDetail): there is no issuer, and externalAuthUrl
+// is the IdP's issuer.
+const clientAPISigner = `{
+	"_links": {"self": {"href": "./external-jwt-signers/s1"}},
+	"createdAt": "2026-10-01T12:00:00.000Z",
+	"id": "s1",
+	"tags": {},
+	"updatedAt": "2026-10-01T12:00:00.000Z",
+	"audience": %s,
+	"clientId": "kc-client",
+	"enrollToCertEnabled": true,
+	"enrollToTokenEnabled": false,
+	"externalAuthUrl": %q,
+	"name": %q,
+	"scopes": %s,
+	"targetToken": "ID"
+}`
+
+// TestDiscoveryClientAPIShape verifies that a signer in the client API's
+// shape becomes a provider whose issuer is its externalAuthUrl, that sends
+// the browser to the authorization endpoint from the issuer's discovery
+// document, and that requests the signer's scopes and audience.
+func TestDiscoveryClientAPIShape(t *testing.T) {
+	withExtras, _ := mockOIDCServer(t, map[string]any{"sub": "u"})
+	plain, _ := mockOIDCServer(t, map[string]any{"sub": "u"})
+	ctrlMux := http.NewServeMux()
+	ctrlMux.HandleFunc("/edge/client/v1/external-jwt-signers", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"data":[`+clientAPISigner+`,`+clientAPISigner+`],"meta":{"pagination":{"limit":500,"offset":0,"totalCount":2}}}`,
+			`"api://ziti"`, withExtras.URL, "with-extras", `["openid","offline_access","groups"]`,
+			`null`, plain.URL, "plain", `null`)
+	})
+	ctrl := httptest.NewServer(ctrlMux)
+	t.Cleanup(ctrl.Close)
+
+	reg := NewProviderRegistry()
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL}, http.DefaultClient, nil, reg, nil, slog.Default())
+	if err := d.poll(t.Context()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+
+	cases := []struct {
+		name, issuer, scope, audience string
+	}{
+		{"with-extras", withExtras.URL, "openid profile email offline_access groups", "api://ziti"},
+		{"plain", plain.URL, "openid profile email", ""},
+	}
+	for _, tc := range cases {
+		p, err := reg.Resolve(tc.name)
+		if err != nil {
+			t.Fatalf("Resolve %s: %v (providers %v)", tc.name, err, reg.Names())
+		}
+		if p.Issuer() != tc.issuer {
+			t.Errorf("%s: Issuer() = %q, want %q", tc.name, p.Issuer(), tc.issuer)
+		}
+		u, err := url.Parse(p.AuthorizeURL("st", "https://zdas.test/callback"))
+		if err != nil {
+			t.Fatalf("%s: parse authorize URL: %v", tc.name, err)
+		}
+		if got := u.Scheme + "://" + u.Host + u.Path; got != tc.issuer+"/authorize" {
+			t.Errorf("%s: authorize endpoint = %q, want %q", tc.name, got, tc.issuer+"/authorize")
+		}
+		q := u.Query()
+		if q.Get("scope") != tc.scope {
+			t.Errorf("%s: scope = %q, want %q", tc.name, q.Get("scope"), tc.scope)
+		}
+		if q.Get("audience") != tc.audience || tc.audience == "" && q.Has("audience") {
+			t.Errorf("%s: audience = %q, want %q", tc.name, q["audience"], tc.audience)
+		}
+	}
+}
+
+func TestSignerScopes(t *testing.T) {
+	cases := []struct {
+		extra []string
+		want  []string
+	}{
+		{nil, []string{"openid", "profile", "email"}},
+		{[]string{"openid", "email"}, []string{"openid", "profile", "email"}},
+		{[]string{"groups", "offline_access", "groups"}, []string{"openid", "profile", "email", "groups", "offline_access"}},
+		{[]string{" groups  api://x/read ", ""}, []string{"openid", "profile", "email", "groups", "api://x/read"}},
+	}
+	for _, tc := range cases {
+		if got := signerScopes(tc.extra); !slices.Equal(got, tc.want) {
+			t.Errorf("signerScopes(%q) = %q, want %q", tc.extra, got, tc.want)
+		}
+	}
+	if !slices.Equal(defaultOIDCScopes, []string{"openid", "profile", "email"}) {
+		t.Errorf("defaultOIDCScopes changed to %q", defaultOIDCScopes)
+	}
+}
+
+// TestSignerEntryEqual verifies that a change to any setting makes a signer
+// unequal, so that discovery does not keep a provider built from old
+// settings.
+func TestSignerEntryEqual(t *testing.T) {
+	base := signerEntry{
+		Name: "kc", ClientID: "c", ExternalAuthURL: "https://idp", Scopes: []string{"groups"},
+		Audience: "a", EnrollToCertEnabled: true,
+	}
+	changes := map[string]func(*signerEntry){
+		"name":     func(s *signerEntry) { s.Name = "other" },
+		"clientId": func(s *signerEntry) { s.ClientID = "other" },
+		"url":      func(s *signerEntry) { s.ExternalAuthURL = "https://other" },
+		"scopes":   func(s *signerEntry) { s.Scopes = []string{"groups", "more"} },
+		"audience": func(s *signerEntry) { s.Audience = "other" },
+		"cert":     func(s *signerEntry) { s.EnrollToCertEnabled = false },
+		"token":    func(s *signerEntry) { s.EnrollToTokenEnabled = true },
+	}
+	same := base
+	same.Scopes = slices.Clone(base.Scopes)
+	if !base.equal(same) {
+		t.Error("identical signers are not equal")
+	}
+	for name, change := range changes {
+		s := base
+		s.Scopes = slices.Clone(base.Scopes)
+		change(&s)
+		if base.equal(s) {
+			t.Errorf("signers differing in %s are equal", name)
+		}
+	}
+}
+
+func TestControllerRoot(t *testing.T) {
+	cases := map[string]string{
+		"https://ctrl:1280":                          "https://ctrl:1280",
+		"https://ctrl:1280/":                         "https://ctrl:1280",
+		"https://ctrl:1280/edge/client/v1":           "https://ctrl:1280",
+		"https://ctrl:1280/edge/client/v1/":          "https://ctrl:1280",
+		"https://ctrl:1280/edge/management/v1":       "https://ctrl:1280",
+		"https://ctrl/ziti/edge/client/v1":           "https://ctrl/ziti",
+		"https://ctrl/ziti":                          "https://ctrl/ziti",
+		"https://ctrl/edge/client/v1/edge/client/v1": "https://ctrl/edge/client/v1",
+	}
+	for in, want := range cases {
+		if got := controllerRoot(in); got != want {
+			t.Errorf("controllerRoot(%q) = %q, want %q", in, got, want)
+		}
+	}
 }

@@ -29,6 +29,7 @@ type OIDCProvider struct {
 	clientSecret    string // optional; set for confidential-client IdPs (e.g. Google Web)
 	authURL         string
 	tokenURL        string
+	audience        string
 	provider        *oidc.Provider
 	verifier        *oidc.IDTokenVerifier
 	scopes          []string
@@ -37,6 +38,10 @@ type OIDCProvider struct {
 	client          *http.Client // makes the token exchange and userinfo requests
 	logger          *slog.Logger
 }
+
+// defaultOIDCScopes are the scopes requested when OIDCProviderConfig.Scopes
+// is empty. Read only.
+var defaultOIDCScopes = []string{"openid", "profile", "email"}
 
 // OIDCProviderConfig holds the data needed to construct an OIDCProvider.
 // Sourced either from a discovered ext-jwt-signer (secret empty) or from
@@ -49,6 +54,12 @@ type OIDCProviderConfig struct {
 	AuthURL      string
 	TokenURL     string
 	Scopes       []string
+
+	// Audience, when set, is sent as the audience parameter of the
+	// authorization request. Some IdPs, such as Auth0, use it to choose
+	// the audience of the access token. The ID token's audience is the
+	// client ID either way.
+	Audience string
 
 	// FetchUserInfo, when true, calls the issuer's userinfo endpoint with
 	// the access token after the ID token is validated and merges the
@@ -111,7 +122,7 @@ func NewOIDCProvider(ctx context.Context, cfg OIDCProviderConfig) (*OIDCProvider
 	}
 	scopes := cfg.Scopes
 	if len(scopes) == 0 {
-		scopes = []string{"openid", "profile", "email"}
+		scopes = defaultOIDCScopes
 	}
 
 	logger := cfg.Logger
@@ -137,6 +148,7 @@ func NewOIDCProvider(ctx context.Context, cfg OIDCProviderConfig) (*OIDCProvider
 		clientSecret:    cfg.ClientSecret,
 		authURL:         authURL,
 		tokenURL:        tokenURL,
+		audience:        cfg.Audience,
 		provider:        provider,
 		verifier:        verifier,
 		scopes:          scopes,
@@ -178,6 +190,9 @@ func (p *OIDCProvider) authorizeURL(state, redirectURI, challenge string) string
 		"redirect_uri":  {redirectURI},
 		"state":         {state},
 		"scope":         {joinScopes(p.scopes)},
+	}
+	if p.audience != "" {
+		v.Set("audience", p.audience)
 	}
 	if challenge != "" {
 		v.Set("code_challenge", challenge)

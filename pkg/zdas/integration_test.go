@@ -33,9 +33,8 @@ func TestIntegrationOIDCFlow(t *testing.T) {
 		resp := signerResponse{Data: []signerEntry{
 			{
 				Name:                "test-keycloak",
-				Issuer:              idpServer.URL,
 				ClientID:            "test-client",
-				ExternalAuthURL:     idpServer.URL + "/authorize",
+				ExternalAuthURL:     idpServer.URL,
 				EnrollToCertEnabled: true,
 			},
 		}}
@@ -352,9 +351,8 @@ func TestIntegrationFallbackFlow(t *testing.T) {
 		resp := signerResponse{Data: []signerEntry{
 			{
 				Name:                "test-kc",
-				Issuer:              idpServer.URL,
 				ClientID:            "test-client",
-				ExternalAuthURL:     idpServer.URL + "/authorize",
+				ExternalAuthURL:     idpServer.URL,
 				EnrollToCertEnabled: true,
 			},
 		}}

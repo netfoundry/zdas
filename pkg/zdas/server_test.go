@@ -330,3 +330,28 @@ func TestHTTPServerLimitsHeaderSize(t *testing.T) {
 		t.Errorf("status = %d, want 431", resp.StatusCode)
 	}
 }
+
+// TestNewServerControllerURLs verifies that NewServer reaches the client API
+// from the controller's root when api_url is a client API URL, and gives the
+// reconciler the management API of the identity file's controller.
+func TestNewServerControllerURLs(t *testing.T) {
+	cfg := replicaConfig(t)
+	cfg.Controller.APIURL = "https://ctrl.example.com/edge/client/v1/"
+	cfg.Controller.IdentityFile = generateTestIdentityFile(t, "https://mgmt.example.com:1280/edge/client/v1")
+	cfg.Fallback = FallbackConfig{Enabled: true, PollInterval: time.Minute, Timeout: time.Hour}
+
+	srv, err := NewServer(cfg, slog.Default())
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	t.Cleanup(func() { srv.Shutdown(context.Background()) })
+	if got := srv.discovery.cfg.APIURL; got != "https://ctrl.example.com" {
+		t.Errorf("discovery controller URL = %q, want https://ctrl.example.com", got)
+	}
+	if srv.reconciler == nil {
+		t.Fatal("no reconciler")
+	}
+	if got := srv.reconciler.mgmtURL; got != "https://mgmt.example.com:1280/edge/management/v1" {
+		t.Errorf("reconciler management URL = %q", got)
+	}
+}

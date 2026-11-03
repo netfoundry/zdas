@@ -210,7 +210,7 @@ func TestManagementClientFromIdentity(t *testing.T) {
 func TestAuthenticateSession(t *testing.T) {
 	token := "test-zt-session-token"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/authenticate" || r.URL.Query().Get("method") != "cert" {
+		if r.URL.Path != managementAPIPath+"/authenticate" || r.URL.Query().Get("method") != "cert" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
 			http.Error(w, "bad", 400)
 			return
@@ -223,7 +223,7 @@ func TestAuthenticateSession(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	session, err := authenticateSession(t.Context(), server.Client(), server.URL)
+	session, err := authenticateSession(t.Context(), server.Client(), server.URL+managementAPIPath)
 	if err != nil {
 		t.Fatalf("authenticateSession: %v", err)
 	}

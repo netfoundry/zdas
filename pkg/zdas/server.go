@@ -39,6 +39,7 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 	if err := cfg.checkRequired(); err != nil {
 		return nil, fmt.Errorf("config: %w (was ApplyDefaults called?)", err)
 	}
+	cfg.Controller.APIURL = controllerRoot(cfg.Controller.APIURL)
 	var sopts serverOptions
 	for _, o := range opts {
 		o(&sopts)

@@ -13,8 +13,9 @@ import (
 )
 
 // mockManagementAPI simulates the Ziti controller management API for reconciler
-// tests. It handles /authenticate, GET /identities (with filter), and PATCH
-// /identities/{id}.
+// tests. It handles POST /authenticate?method=cert, GET /identities (with
+// filter), and PATCH /identities/{id}, all under /edge/management/v1. The
+// identity calls need the session token /authenticate returns.
 type mockManagementAPI struct {
 	mu         sync.Mutex
 	identities map[string]mockIdentity
@@ -41,7 +42,11 @@ func newMockManagementAPI(identities []mockIdentity) *mockManagementAPI {
 
 func (m *mockManagementAPI) handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/authenticate", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /edge/management/v1/authenticate", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("method") != "cert" {
+			http.Error(w, "unsupported method", http.StatusBadRequest)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"data": map[string]any{
@@ -51,6 +56,10 @@ func (m *mockManagementAPI) handler() http.Handler {
 		})
 	})
 	mux.HandleFunc("/edge/management/v1/identities/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("zt-session") != "mock-zt-session" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		if r.Method == http.MethodPatch {
 			// Extract identity ID from path.
 			parts := strings.Split(r.URL.Path, "/")
@@ -69,7 +78,7 @@ func (m *mockManagementAPI) handler() http.Handler {
 		filter := r.URL.Query().Get("filter")
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		if m.rejectAll {
+		if m.rejectAll || r.Header.Get("zt-session") != "mock-zt-session" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -404,5 +413,49 @@ func TestReconcilerLoop(t *testing.T) {
 	defer api.mu.Unlock()
 	if api.renamed["id-1"] != "alice-laptop" {
 		t.Errorf("renamed = %v, want id-1 -> alice-laptop", api.renamed)
+	}
+}
+
+// TestReconcilerControllerURLForms verifies that the reconciler signs in to
+// and renames through the management API whether it is given the
+// controller's root or an Edge API URL, as ztAPI in an identity file from
+// `ziti edge enroll` is, and that a reverse proxy's path prefix is kept.
+func TestReconcilerControllerURLForms(t *testing.T) {
+	forms := []struct {
+		name, prefix, suffix string
+	}{
+		{"root", "", ""},
+		{"root with slash", "", "/"},
+		{"client API", "", "/edge/client/v1"},
+		{"client API with slash", "", "/edge/client/v1/"},
+		{"management API", "", "/edge/management/v1"},
+		{"proxy prefix", "/ziti", "/edge/client/v1"},
+	}
+	for _, f := range forms {
+		t.Run(f.name, func(t *testing.T) {
+			mock := newMockManagementAPI([]mockIdentity{{ID: "id-1", ExternalID: "ext-1", Hostname: "laptop"}})
+			var h http.Handler = mock.handler()
+			if f.prefix != "" {
+				h = http.StripPrefix(f.prefix, h)
+			}
+			server := httptest.NewServer(h)
+			t.Cleanup(server.Close)
+
+			r := newFallbackReconciler(
+				FallbackConfig{PollInterval: time.Minute, Timeout: time.Hour},
+				defaultClaimsConfig(),
+				server.Client(),
+				server.URL+f.prefix+f.suffix,
+				slog.Default(),
+			)
+			r.track("ext-1", "jsmith", "abc123")
+			r.poll(t.Context())
+
+			mock.mu.Lock()
+			defer mock.mu.Unlock()
+			if got := mock.renamed["id-1"]; got != "jsmith-laptop" {
+				t.Errorf("renamed to %q, want jsmith-laptop", got)
+			}
+		})
 	}
 }
