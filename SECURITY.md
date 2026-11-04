@@ -10,6 +10,12 @@ needs, and how to reproduce it if you can.
 You should get a reply within a few business days. Fixes ship in a new
 release, with a GitHub security advisory once the fix is available.
 
+## Security model
+
+[docs/security.md](docs/security.md) describes what ZDAS enforces, what
+operators and embedders must do, and the design decisions behind behavior
+that can look like a gap. Please read it before reporting one of those.
+
 ## Supported versions
 
 zdas is pre-1.0. Fixes go into the latest release only, so upgrade to it

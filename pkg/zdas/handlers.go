@@ -144,6 +144,7 @@ func (h *endpoints) handleJWKS(w http.ResponseWriter, r *http.Request) {
 const (
 	maxRedirectURILength = 2048
 	maxStateLength       = 512
+	maxNonceLength       = 512
 	// s256ChallengeLength is the length of an S256 code_challenge: a
 	// SHA-256 digest in unpadded base64url (RFC 7636 section 4.2).
 	s256ChallengeLength = 43
@@ -159,6 +160,7 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	redirectURI := q.Get("redirect_uri")
 	state := q.Get("state")
+	nonce := q.Get("nonce")
 	deviceName := q.Get("device_name")
 	hostname := q.Get("hostname")
 	osName := q.Get("os")
@@ -185,6 +187,10 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "state is too long", http.StatusBadRequest)
 		return
 	}
+	if len(nonce) > maxNonceLength {
+		http.Error(w, "nonce is too long", http.StatusBadRequest)
+		return
+	}
 	parsedRedirect, err := parseRedirectURI(redirectURI)
 	if err != nil {
 		http.Error(w, "redirect_uri must be a valid http(s) URL", http.StatusBadRequest)
@@ -195,7 +201,13 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate remaining required parameters.
+	// Validate remaining required parameters. Tunnelers always send
+	// response_type=code, the only flow ZDAS has; one that sends nothing is
+	// let through, as before.
+	if rt := q.Get("response_type"); rt != "" && rt != "code" {
+		oidcErrorRedirect(w, r, redirectURI, state, "unsupported_response_type", "only response_type=code is supported")
+		return
+	}
 	if codeChallenge == "" || codeChallengeMethod == "" {
 		oidcErrorRedirect(w, r, redirectURI, state, "invalid_request", "PKCE code_challenge and code_challenge_method are required")
 		return
@@ -278,6 +290,7 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	sess := &AuthSession{
 		TunnelerRedirectURI:         strings.Clone(redirectURI),
 		TunnelerState:               strings.Clone(state),
+		TunnelerNonce:               strings.Clone(nonce),
 		TunnelerCodeChallenge:       strings.Clone(codeChallenge),
 		TunnelerCodeChallengeMethod: strings.Clone(codeChallengeMethod),
 		DeviceInfo:                  deviceInfo,
@@ -509,6 +522,7 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 			err := h.createPendingProvision(r.Context(), pendingID, &PendingProvision{
 				TunnelerRedirectURI:         sess.TunnelerRedirectURI,
 				TunnelerState:               sess.TunnelerState,
+				TunnelerNonce:               sess.TunnelerNonce,
 				TunnelerCodeChallenge:       sess.TunnelerCodeChallenge,
 				TunnelerCodeChallengeMethod: sess.TunnelerCodeChallengeMethod,
 				IsFallback:                  sess.FallbackNonce != "",
@@ -527,7 +541,8 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 		claims = ComposeClaims(h.cfg.Claims, h.cfg.Fallback, identity, sess.DeviceInfo, sess.FallbackNonce)
 	}
 
-	if err := checkClaims(claims); err != nil {
+	claims = withNonce(claims, sess.TunnelerNonce)
+	if err := checkClaims(h.cfg.Token, claims); err != nil {
 		h.handleProvisionerError(w, r, fmt.Errorf("provisioner returned claims that cannot be signed: %w", err),
 			sess.TunnelerRedirectURI, sess.TunnelerState, "provider", sess.UpstreamProviderName)
 		return
@@ -724,7 +739,8 @@ func (h *endpoints) completeProvision(w http.ResponseWriter, r *http.Request, pe
 		err = errors.New("CompleteProvision called with neither claims nor an error")
 	}
 	if err == nil {
-		if cerr := checkClaims(claims); cerr != nil {
+		claims = withNonce(claims, pp.TunnelerNonce)
+		if cerr := checkClaims(h.cfg.Token, claims); cerr != nil {
 			err = fmt.Errorf("CompleteProvision called with claims that cannot be signed: %w", cerr)
 		}
 	}

@@ -30,6 +30,8 @@ ZDAS discovers upstream IdPs automatically by polling the controller's public `e
 
 Before sending the browser to an IdP, ZDAS shows a page where the user continues: a button for each available identity provider, or one when there is only one. This click is the user's consent. Without it, a link someone else built could sign in a user whose IdP session is still live, with no prompt at all. The page shows the device as the device describes itself. It also warns that the address the browser returns to carries the sign-in and must not be pasted anywhere. An embedding application can show its own picker instead (`idp_selector_url`); see `Config.IDPSelectorURL` for what that page must do.
 
+See [docs/security.md](docs/security.md) for the security model: what ZDAS enforces, what a deployment must do, and the reasoning behind its design decisions.
+
 ## Features
 
 - **Single binary, no database.** Ephemeral EC P-256 keys generated at startup, served via JWKS. In-memory session store with automatic cleanup.
@@ -81,7 +83,7 @@ Key settings:
 |---------|-------------|---------|
 | `external_url` | Public URL where tunnelers and the controller reach ZDAS | (required) |
 | `controller.api_url` | OpenZiti controller URL, e.g. `https://ctrl.example.com:1280`. A client or management API URL also works. | (required) |
-| `controller.identity_file` | OpenZiti admin identity JSON (cert, key, CA) for management API | (optional, required for fallback) |
+| `controller.identity_file` | OpenZiti identity JSON (cert, key, CA) for the management API. It needs only the `identity.read` and `identity.update` permissions (`ziti edge create identity <name> --permissions identity.read,identity.update`); ZDAS warns if it is a full admin. | (optional, required for fallback) |
 | `fallback.enabled` | Allow enrollment without device info from unmodified tunnelers | `false` |
 | `rate_limit` | Limits on `/authorize`, per client and for everyone together. Behind a reverse proxy, also set `rate_limit.trusted_proxies`, or the per-client limit applies to everyone at once. | 2/s (burst 10) per client, 5/s (burst 500) in all |
 | `claims.name_template` | Template for identity names. Placeholders: `{username}`, `{device_name}`, `{hostname}`, `{os}`, `{arch}` | `{username}-{device_name}` |
@@ -95,7 +97,7 @@ Environment variable overrides follow the pattern `ZDAS_SECTION_FIELD`, e.g. `ZD
 
 Updated tunnelers send device info as query parameters on the authorize URL:
 
-- `device_name` - primary device identifier (hostname, machine-id, or user-chosen name)
+- `device_name` - primary device identifier (hostname, machine-id, or user-chosen name). Since v0.11.0 it may not contain `:` or be longer than 255 bytes, so that the external ID stays unambiguous; such names are refused with `invalid_request`.
 - `hostname`, `os`, `arch`, `os_release`, `os_version` - optional, for richer identity names
 - `client_type` - optional free-form hint (`tunneler`, `host`, `service`) passed through to an embedding application's provisioner
 
@@ -136,7 +138,9 @@ handler, err := zdas.NewHandler(cfg, logger,
 
 A provisioner (`zdas.WithProvisioner`) can send the browser to a page of yours, such as a network picker, by returning `ProvisionResult.RedirectURL`. ZDAS passes the enrollment's pending ID to your provisioner as `ProvisionRequest.PendingID`; record it with your own state for the user you authenticated. Your handler for the page finishes the flow with `handler.CompleteProvision(w, r, pendingID, claims, err)`, passing the pending ID you recorded. Take both the pending ID and the claims from your own server-side state, never from the request: the user enrolling can change the URL. ZDAS also adds the ID to the redirect as `pending_id`, for compatibility.
 
-If someone you do not fully trust chooses the upstream issuers, such as a tenant admin in a multi-tenant service, pass `zdas.WithUpstreamHTTPClient(client)` so that discovery, signing keys, token exchanges and userinfo all go through a client you control, for example one whose dialer refuses internal addresses. `OIDCProviderConfig.HTTPClient` does the same for a provider used on its own. A refused token exchange is a `*zdas.TokenError`, whose `StatusCode` can be shown without the reply.
+An embedder that serves several OpenZiti networks registers ZDAS's signer on each with its own audience, lists them in `Token.ProvisionerAudiences`, and sets the `aud` claim of each enrollment, in `ProvisionResult.Claims` or `CompleteProvision`, to the network it chose. Otherwise a token minted for one network is accepted by the others until it expires. An `aud` that isn't configured fails the enrollment.
+
+If someone you do not fully trust chooses the upstream issuers, such as a tenant admin in a multi-tenant service, pass `zdas.WithUpstreamHTTPClient(client)` so that discovery, signing keys, token exchanges and userinfo all go through a client you control. `zdas.PublicHTTPClient()` is one that connects only to public addresses and follows no redirects. `OIDCProviderConfig.HTTPClient` does the same for a provider used on its own. A refused token exchange is a `*zdas.TokenError`, whose `StatusCode` can be shown without the reply.
 
 Or use the provider layer on its own to federate login to an upstream IdP without the enrollment handlers:
 

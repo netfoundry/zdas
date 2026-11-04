@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
@@ -282,5 +283,60 @@ func TestTokenErrorTruncatesBody(t *testing.T) {
 	err := &TokenError{StatusCode: 400, Body: bytes.Repeat([]byte("x"), maxErrorBody+100)}
 	if n := len(err.Error()); n > maxErrorBody+64 {
 		t.Errorf("error message is %d bytes, want the body cut to about %d", n, maxErrorBody)
+	}
+}
+
+func TestIsPublicAddr(t *testing.T) {
+	cases := map[string]bool{
+		"8.8.8.8":           true,
+		"2606:4700::1111":   true,
+		"127.0.0.1":         false,
+		"10.1.2.3":          false,
+		"172.16.0.1":        false,
+		"192.168.1.1":       false,
+		"169.254.169.254":   false,
+		"100.64.0.1":        false,
+		"0.0.0.1":           false,
+		"0.0.0.0":           false,
+		"224.0.0.1":         false,
+		"255.255.255.255":   false,
+		"198.18.0.1":        false,
+		"::1":               false,
+		"fe80::1":           false,
+		"fd00::1":           false,
+		"::ffff:10.0.0.1":   false,
+		"::ffff:8.8.8.8":    true,
+		"::ffff:100.64.0.1": false,
+		"64:ff9b::a00:1":    false,
+		"ff02::1":           false,
+	}
+	for s, want := range cases {
+		if got := isPublicAddr(netip.MustParseAddr(s)); got != want {
+			t.Errorf("isPublicAddr(%s) = %v, want %v", s, got, want)
+		}
+	}
+}
+
+// TestPublicHTTPClient verifies that the client refuses a local server,
+// whether named by address or by a host name that resolves to it, and
+// follows no redirects.
+func TestPublicHTTPClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(srv.Close)
+	c := PublicHTTPClient()
+	for _, target := range []string{srv.URL, strings.Replace(srv.URL, "127.0.0.1", "localhost", 1)} {
+		resp, err := c.Get(target)
+		if err == nil {
+			resp.Body.Close()
+			t.Errorf("GET %s succeeded", target)
+		} else if !strings.Contains(err.Error(), "non-public address") {
+			t.Errorf("GET %s: %v, want a non-public address error", target, err)
+		}
+	}
+	if err := c.CheckRedirect(httptest.NewRequest(http.MethodGet, "https://idp.example.com/next", nil), nil); err != http.ErrUseLastResponse {
+		t.Errorf("CheckRedirect = %v, want ErrUseLastResponse", err)
+	}
+	if c.Transport.(limitedBodyTransport).base.(*http.Transport).Proxy != nil {
+		t.Error("client uses proxy settings")
 	}
 }

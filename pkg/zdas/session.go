@@ -12,6 +12,7 @@ import (
 type AuthSession struct {
 	TunnelerRedirectURI         string
 	TunnelerState               string
+	TunnelerNonce               string // the nonce /authorize got, for the token's nonce claim; often empty
 	TunnelerCodeChallenge       string
 	TunnelerCodeChallengeMethod string
 	DeviceInfo                  *DeviceInfo // always populated; DeviceName may be empty on fallback path
@@ -41,6 +42,7 @@ type AuthCode struct {
 type PendingProvision struct {
 	TunnelerRedirectURI         string
 	TunnelerState               string
+	TunnelerNonce               string
 	TunnelerCodeChallenge       string
 	TunnelerCodeChallengeMethod string
 	IsFallback                  bool

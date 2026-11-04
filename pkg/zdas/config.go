@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/lestrrat-go/jwx/v3/jwt"
 	"gopkg.in/yaml.v3"
 )
 
@@ -217,6 +219,34 @@ type TokenConfig struct {
 	Issuer   string        `yaml:"issuer"`
 	Audience string        `yaml:"audience"`
 	Expiry   time.Duration `yaml:"expiry"`
+
+	// ProvisionerAudiences are the audiences, besides Audience, that a
+	// provisioner may give an enrollment's token by setting its "aud"
+	// claim, in Provision's result or in CompleteProvision. An embedder
+	// serving several OpenZiti networks registers ZDAS's signer on each
+	// network with that network's own audience, and sets the aud of each
+	// enrollment to the network it chose. Without this, one network would
+	// accept a token minted for another until it expired. Any other aud
+	// fails the enrollment.
+	ProvisionerAudiences []string `yaml:"provisioner_audiences"`
+}
+
+// audience returns the aud for a token with claims: the claims' own aud if
+// it is Audience or one of ProvisionerAudiences, or Audience if they have
+// none.
+func (c TokenConfig) audience(claims map[string]any) (string, error) {
+	v, ok := claims[jwt.AudienceKey]
+	if !ok {
+		return c.Audience, nil
+	}
+	aud, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("claim %s must be a single string, not %T", jwt.AudienceKey, v)
+	}
+	if aud != c.Audience && !slices.Contains(c.ProvisionerAudiences, aud) {
+		return "", fmt.Errorf("claim %s %q is not token.audience or one of token.provisioner_audiences", jwt.AudienceKey, aud)
+	}
+	return aud, nil
 }
 
 // SessionConfig controls in-flight auth session and code lifetimes.
@@ -412,6 +442,11 @@ func (c *Config) Validate() error {
 		}
 		if err != nil {
 			return fmt.Errorf("allowed_redirect_uris[%d] %q: %w", i, raw, err)
+		}
+	}
+	for i, aud := range c.Token.ProvisionerAudiences {
+		if aud == "" {
+			return fmt.Errorf("token.provisioner_audiences[%d] is empty", i)
 		}
 	}
 	for i, raw := range c.RateLimit.TrustedProxies {
