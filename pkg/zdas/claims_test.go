@@ -2,6 +2,7 @@ package zdas
 
 import (
 	"encoding/json"
+	"slices"
 	"testing"
 	"time"
 
@@ -349,5 +350,48 @@ func TestComposeClaimsExternalIDWins(t *testing.T) {
 		if want := computeExternalID("https://idp", "u1", "laptop"); claims[name] != want {
 			t.Errorf("external_id_claim %q: claim = %v, want the external ID", name, claims[name])
 		}
+	}
+}
+
+func TestTokenConfigAudience(t *testing.T) {
+	cfg := TokenConfig{Audience: "ziti-enroll", ProvisionerAudiences: []string{"net-a", "net-b"}}
+	cases := []struct {
+		claims  map[string]any
+		want    string
+		wantErr bool
+	}{
+		{map[string]any{"sub": "x"}, "ziti-enroll", false},
+		{map[string]any{"aud": "net-b"}, "net-b", false},
+		{map[string]any{"aud": "ziti-enroll"}, "ziti-enroll", false},
+		{map[string]any{"aud": "net-c"}, "", true},
+		{map[string]any{"aud": []string{"net-a"}}, "", true},
+		{map[string]any{"aud": ""}, "", true},
+	}
+	for _, tc := range cases {
+		got, err := cfg.audience(tc.claims)
+		if got != tc.want || (err != nil) != tc.wantErr {
+			t.Errorf("audience(%v) = %q, %v; want %q, err %v", tc.claims, got, err, tc.want, tc.wantErr)
+		}
+	}
+}
+
+// TestMintTokenProvisionerAudience verifies that a token takes an allowed
+// aud from its claims, and that any other aud is refused rather than signed.
+func TestMintTokenProvisionerAudience(t *testing.T) {
+	ks, _ := GenerateKeySet()
+	cfg := TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: time.Minute, ProvisionerAudiences: []string{"net-b"}}
+	signed, err := MintToken(cfg, map[string]any{"sub": "x", "aud": "net-b"}, ks)
+	if err != nil {
+		t.Fatalf("MintToken: %v", err)
+	}
+	tok, err := jwt.ParseInsecure([]byte(signed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aud, _ := tok.Audience(); !slices.Equal(aud, []string{"net-b"}) {
+		t.Errorf("aud = %v, want [net-b]", aud)
+	}
+	if _, err := MintToken(cfg, map[string]any{"sub": "x", "aud": "net-c"}, ks); err == nil {
+		t.Error("MintToken signed a token for an audience not configured")
 	}
 }

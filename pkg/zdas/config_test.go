@@ -493,6 +493,7 @@ func TestClaimsCheckNames(t *testing.T) {
 		{"external ID in exp", "device_identity_name", "exp", true},
 		{"identity name in sub", "sub", "device_external_id", true},
 		{"identity name in upstream_iss", "upstream_iss", "device_external_id", true},
+		{"identity name in nonce", "nonce", "device_external_id", true},
 	}
 	for _, tc := range cases {
 		err := ClaimsConfig{IdentityNameClaim: tc.identity, ExternalIDClaim: tc.external}.checkNames()

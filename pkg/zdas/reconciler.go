@@ -33,6 +33,8 @@ type fallbackReconciler struct {
 	sessionToken   string
 	sessionExpires time.Time
 
+	adminChecked sync.Once // checks, after the first sign-in, whether the identity is a full admin
+
 	cancel  context.CancelFunc
 	stopped chan struct{}
 }
@@ -368,5 +370,42 @@ func (r *fallbackReconciler) refreshSession(ctx context.Context) error {
 	r.sessionExpires = session.ExpiresAt
 	r.sessMu.Unlock()
 	r.logger.Debug("reconciler session refreshed", "expires_at", session.ExpiresAt)
+	r.adminChecked.Do(func() { r.warnIfAdmin(ctx, session.Token) })
 	return nil
+}
+
+// warnIfAdmin logs a warning if the reconciler's identity, signed in with
+// token, is a full admin. The reconciler only needs the identity.read and
+// identity.update permissions, and ZDAS faces the internet.
+func (r *fallbackReconciler) warnIfAdmin(ctx context.Context, token string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.mgmtURL+"/current-identity", nil)
+	if err != nil {
+		r.logger.Debug("build current identity request", "error", err)
+		return
+	}
+	req.Header.Set("zt-session", token)
+	req.Header.Set("Accept", "application/json")
+	resp, err := r.client.Do(req)
+	if err != nil {
+		r.logger.Debug("fetch current identity", "error", err)
+		return
+	}
+	defer resp.Body.Close()
+	body, err := readResponseBody(resp)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		r.logger.Debug("fetch current identity", "status", resp.StatusCode, "error", err)
+		return
+	}
+	var current struct {
+		Data struct {
+			IsAdmin bool `json:"isAdmin"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &current); err != nil {
+		r.logger.Debug("parse current identity", "error", err)
+		return
+	}
+	if current.Data.IsAdmin {
+		r.logger.Warn("controller.identity_file is a full admin identity; the reconciler needs only the identity.read and identity.update permissions, so create one with just those (ziti edge create identity <name> --permissions identity.read,identity.update)")
+	}
 }

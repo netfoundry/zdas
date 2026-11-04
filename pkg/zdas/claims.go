@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -64,7 +65,7 @@ func ComposeClaims(cfg ClaimsConfig, fbCfg FallbackConfig, identity *UpstreamIde
 
 // reservedClaims are the claims ComposeClaims and MintToken set themselves.
 var reservedClaims = []string{
-	jwt.SubjectKey, "upstream_sub", "upstream_iss", preferredUsernameClaim, "device_name",
+	jwt.SubjectKey, "upstream_sub", "upstream_iss", preferredUsernameClaim, "device_name", nonceClaim,
 	jwt.IssuerKey, jwt.AudienceKey, jwt.ExpirationKey, jwt.IssuedAtKey, jwt.NotBeforeKey, jwt.JwtIDKey,
 }
 
@@ -99,16 +100,20 @@ func expandFallbackTemplate(tmpl, username, nonce string) string {
 func MintToken(cfg TokenConfig, claims map[string]any, ks *KeySet) (string, error) {
 	now := time.Now()
 	tok := jwt.New()
+	aud, err := cfg.audience(claims)
+	if err != nil {
+		return "", err
+	}
 
 	// Set custom claims first, then override with standard claims so that
 	// neither the provisioner hook nor CompleteProvision can tamper with
-	// iss, aud, iat, or exp.
+	// iss, iat, or exp, or set an aud outside the configured ones.
 	if err := setClaims(tok, claims); err != nil {
 		return "", err
 	}
 	if err := setClaims(tok, map[string]any{
 		jwt.IssuerKey:     cfg.Issuer,
-		jwt.AudienceKey:   cfg.Audience,
+		jwt.AudienceKey:   aud,
 		jwt.IssuedAtKey:   now,
 		jwt.ExpirationKey: now.Add(cfg.Expiry),
 	}); err != nil {
@@ -133,10 +138,29 @@ func setClaims(tok jwt.Token, claims map[string]any) error {
 	return nil
 }
 
-// checkClaims reports whether MintToken can sign claims. ZDAS checks a
-// provisioner's claims when it creates the code, so that a bad claim fails
-// the flow with an error the tunneler sees rather than at /token.
-func checkClaims(claims map[string]any) error {
+// nonceClaim is the OIDC claim that echoes the nonce sent to /authorize.
+const nonceClaim = "nonce"
+
+// withNonce returns claims with the nonce claim set to nonce, or claims
+// itself when nonce is empty. It copies claims rather than change a map a
+// provisioner returned.
+func withNonce(claims map[string]any, nonce string) map[string]any {
+	if nonce == "" {
+		return claims
+	}
+	claims = maps.Clone(claims)
+	claims[nonceClaim] = nonce
+	return claims
+}
+
+// checkClaims reports whether MintToken can sign claims under cfg. ZDAS
+// checks a provisioner's claims when it creates the code, so that a bad
+// claim fails the flow with an error the tunneler sees rather than at
+// /token.
+func checkClaims(cfg TokenConfig, claims map[string]any) error {
+	if _, err := cfg.audience(claims); err != nil {
+		return err
+	}
 	return setClaims(jwt.New(), claims)
 }
 

@@ -1,6 +1,7 @@
 package zdas
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -21,6 +22,7 @@ type mockManagementAPI struct {
 	identities map[string]mockIdentity
 	renamed    map[string]string // id -> new name
 	rejectAll  bool              // answer identity calls with 401
+	admin      bool              // the signed-in identity is a full admin
 }
 
 type mockIdentity struct {
@@ -54,6 +56,13 @@ func (m *mockManagementAPI) handler() http.Handler {
 				"expirationSeconds": 1800,
 			},
 		})
+	})
+	mux.HandleFunc("GET /edge/management/v1/current-identity", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("zt-session") != "mock-zt-session" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"id": "self", "isAdmin": m.admin}})
 	})
 	mux.HandleFunc("/edge/management/v1/identities/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("zt-session") != "mock-zt-session" {
@@ -457,5 +466,31 @@ func TestReconcilerControllerURLForms(t *testing.T) {
 				t.Errorf("renamed to %q, want jsmith-laptop", got)
 			}
 		})
+	}
+}
+
+// TestReconcilerWarnsAboutAdminIdentity verifies that the reconciler warns,
+// once, when its identity is a full admin, and not otherwise.
+func TestReconcilerWarnsAboutAdminIdentity(t *testing.T) {
+	for _, admin := range []bool{true, false} {
+		mock := newMockManagementAPI(nil)
+		mock.admin = admin
+		server := httptest.NewServer(mock.handler())
+		t.Cleanup(server.Close)
+		var buf bytes.Buffer
+		r := newFallbackReconciler(FallbackConfig{PollInterval: time.Minute, Timeout: time.Hour}, defaultClaimsConfig(),
+			server.Client(), server.URL, slog.New(slog.NewTextHandler(&buf, nil)))
+		for range 2 {
+			if err := r.refreshSession(t.Context()); err != nil {
+				t.Fatalf("refreshSession: %v", err)
+			}
+		}
+		want := 0
+		if admin {
+			want = 1
+		}
+		if n := strings.Count(buf.String(), "full admin identity"); n != want {
+			t.Errorf("admin=%v: %d warnings, want %d: %s", admin, n, want, buf.String())
+		}
 	}
 }

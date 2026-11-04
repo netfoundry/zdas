@@ -955,6 +955,8 @@ func TestAuthorizeRejectsOversizedParams(t *testing.T) {
 		{"state over the limit", url.Values{"state": {strings.Repeat("s", maxStateLength+1)}}, http.StatusBadRequest},
 		{"state at the limit", url.Values{"state": {strings.Repeat("s", maxStateLength)}}, http.StatusOK},
 		{"redirect_uri over the limit", url.Values{"redirect_uri": {"http://localhost:1/" + strings.Repeat("p", maxRedirectURILength)}}, http.StatusBadRequest},
+		{"nonce over the limit", url.Values{"nonce": {strings.Repeat("n", maxNonceLength+1)}}, http.StatusBadRequest},
+		{"nonce at the limit", url.Values{"nonce": {strings.Repeat("n", maxNonceLength)}}, http.StatusOK},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1006,6 +1008,7 @@ func TestAuthorizeSessionDoesNotKeepRequest(t *testing.T) {
 		"os":                {"linux"},
 		"enrollment_method": {"enrollToCert"},
 		"client_type":       {"tunneler"},
+		"nonce":             {"n-1"},
 	}), nil)
 	raw := req.URL.RawQuery
 	w := httptest.NewRecorder()
@@ -1030,10 +1033,14 @@ func TestAuthorizeSessionDoesNotKeepRequest(t *testing.T) {
 		"os":                sess.DeviceInfo.OS,
 		"enrollment_method": sess.EnrollmentMethod,
 		"client_type":       sess.ClientType,
+		"nonce":             sess.TunnelerNonce,
 	} {
 		if p := uintptr(unsafe.Pointer(unsafe.StringData(v))); v != "" && p >= start && p < end {
 			t.Errorf("session %s shares memory with the request's query string", name)
 		}
+	}
+	if sess.TunnelerNonce != "n-1" {
+		t.Errorf("TunnelerNonce = %q, want n-1", sess.TunnelerNonce)
 	}
 	if len(sess.DeviceInfo.Hostname) != 255 {
 		t.Errorf("hostname length = %d, want 255", len(sess.DeviceInfo.Hostname))
@@ -1141,6 +1148,26 @@ func TestCallbackChecksResponseIssuer(t *testing.T) {
 		got := w.Header().Get("Location")
 		if tc.ok != (strings.Contains(got, "code=") && !strings.Contains(got, "error=")) {
 			t.Errorf("iss %q: Location %s, want ok=%v", tc.iss, got, tc.ok)
+		}
+	}
+}
+
+// TestAuthorizeResponseType verifies that /authorize refuses any flow but
+// the code flow, and still takes a request that names none.
+func TestAuthorizeResponseType(t *testing.T) {
+	h, _ := setupHandlers(t)
+	for _, tc := range []struct {
+		rt   []string
+		want string
+	}{{[]string{"code"}, ""}, {nil, ""}, {[]string{"token"}, "unsupported_response_type"}, {[]string{"code id_token"}, "unsupported_response_type"}} {
+		w := httptest.NewRecorder()
+		h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, authorizeURL(t, url.Values{"response_type": tc.rt}), nil))
+		loc := w.Header().Get("Location")
+		if tc.want == "" && w.Code != http.StatusOK {
+			t.Errorf("response_type %v: %d %s, want the consent page", tc.rt, w.Code, loc)
+		}
+		if tc.want != "" && !strings.Contains(loc, "error="+tc.want) {
+			t.Errorf("response_type %v: %d %s, want %s", tc.rt, w.Code, loc, tc.want)
 		}
 	}
 }

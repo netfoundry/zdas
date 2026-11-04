@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -43,6 +46,67 @@ func (t limitedBodyTransport) RoundTrip(req *http.Request) (*http.Response, erro
 type limitedBody struct {
 	io.Reader
 	io.Closer
+}
+
+// PublicHTTPClient returns a client for WithUpstreamHTTPClient, for an
+// embedder whose upstream issuers are chosen by someone it does not fully
+// trust, such as a tenant admin. It connects only to public addresses:
+// loopback, private, link-local, shared (100.64.0.0/10) and other
+// non-public ranges are refused. The check is on the address actually
+// dialed, so a host name that resolves to one is refused too. It follows no
+// redirects and ignores proxy settings from the environment, since a proxy
+// would connect on its behalf. It has ZDAS's own timeout and response size
+// cap. An issuer on a private network needs a client of your own instead.
+func PublicHTTPClient() *http.Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second, Control: refuseNonPublic}
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil
+	t.DialContext = dialer.DialContext
+	return &http.Client{
+		Timeout:       outboundTimeout,
+		Transport:     limitedBodyTransport{base: t},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
+// nonPublicPrefixes are ranges isPublicAddr refuses beyond those netip
+// classifies: "this network", shared address space (RFC 6598), IETF
+// protocol assignments, benchmarking, reserved, and the NAT64 prefix, which
+// can reach any IPv4 address.
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+}
+
+// isPublicAddr reports whether a is a public unicast address.
+func isPublicAddr(a netip.Addr) bool {
+	a = a.Unmap()
+	if !a.IsGlobalUnicast() || a.IsPrivate() {
+		return false
+	}
+	for _, p := range nonPublicPrefixes {
+		if p.Contains(a) {
+			return false
+		}
+	}
+	return true
+}
+
+// refuseNonPublic is a net.Dialer Control function that fails a connection
+// to an address that is not public.
+func refuseNonPublic(_, address string, _ syscall.RawConn) error {
+	ap, err := netip.ParseAddrPort(address)
+	if err != nil {
+		return fmt.Errorf("refusing to connect to %s: %w", address, err)
+	}
+	if !isPublicAddr(ap.Addr()) {
+		return fmt.Errorf("refusing to connect to non-public address %s", ap.Addr())
+	}
+	return nil
 }
 
 // tlsClient returns a client with outboundTimeout whose transport is

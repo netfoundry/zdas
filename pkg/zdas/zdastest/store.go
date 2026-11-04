@@ -26,6 +26,7 @@ func TestStore(t *testing.T, newStore func(t *testing.T) zdas.Store) {
 		want := &zdas.AuthSession{
 			TunnelerRedirectURI:         "https://tunneler/cb",
 			TunnelerState:               "tstate",
+			TunnelerNonce:               "tnonce",
 			TunnelerCodeChallenge:       "challenge",
 			TunnelerCodeChallengeMethod: "S256",
 			DeviceInfo: &zdas.DeviceInfo{
@@ -99,6 +100,7 @@ func TestStore(t *testing.T, newStore func(t *testing.T) zdas.Store) {
 		want := &zdas.PendingProvision{
 			TunnelerRedirectURI:         "https://tunneler/cb",
 			TunnelerState:               "tstate",
+			TunnelerNonce:               "tnonce",
 			TunnelerCodeChallenge:       "challenge",
 			TunnelerCodeChallengeMethod: "S256",
 			IsFallback:                  true,

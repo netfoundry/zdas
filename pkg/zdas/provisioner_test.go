@@ -891,3 +891,133 @@ func TestProvisionerReceivesPendingID(t *testing.T) {
 		t.Error("pending entry stored although Provision returned claims")
 	}
 }
+
+// TestCompleteProvisionAudience verifies that CompleteProvision accepts an
+// aud from token.provisioner_audiences and refuses any other.
+func TestCompleteProvisionAudience(t *testing.T) {
+	for _, tc := range []struct {
+		aud string
+		ok  bool
+	}{{"net-b", true}, {"net-c", false}} {
+		h, pendingID := setupProvisionComplete(t)
+		h.cfg.Token.ProvisionerAudiences = []string{"net-a", "net-b"}
+		w := completeProvision(h, pendingID, map[string]any{
+			"device_identity_name": "alice-laptop", "device_external_id": "e1", "sub": "e1", "aud": tc.aud,
+		}, nil)
+		loc, _ := url.Parse(w.Header().Get("Location"))
+		if got := loc.Query().Get("code") != ""; got != tc.ok {
+			t.Errorf("aud %q: Location %s, want code=%v", tc.aud, loc, tc.ok)
+		}
+	}
+}
+
+// TestProvisionerAudienceCheckedAtCallback verifies that a provisioner's aud
+// outside token.provisioner_audiences fails the enrollment at /callback,
+// where the tunneler sees the error, rather than at /token.
+func TestProvisionerAudienceCheckedAtCallback(t *testing.T) {
+	ks, _ := GenerateKeySet()
+	reg := NewProviderRegistry()
+	_ = reg.Register(&callbackProvider{name: "mock-idp", issuer: "https://mock-idp", identity: &UpstreamIdentity{Subject: "u1", Username: "alice", Issuer: "https://mock-idp"}})
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
+	cfg := Config{
+		ExternalURL: "https://zdas.test",
+		Claims:      defaultClaimsConfig(),
+		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute, ProvisionerAudiences: []string{"net-a"}},
+	}
+	for _, tc := range []struct {
+		aud string
+		ok  bool
+	}{{"net-a", true}, {"net-c", false}} {
+		h := newTestEndpoints(cfg, ks, reg, store, &immediateProvisioner{claims: map[string]any{
+			"device_identity_name": "alice-laptop", "device_external_id": "e1", "sub": "e1", "aud": tc.aud,
+		}})
+		sessID := seedSession(t, h, &AuthSession{
+			TunnelerRedirectURI: "http://localhost:20314/auth/callback", TunnelerState: "s",
+			TunnelerCodeChallenge: "c", TunnelerCodeChallengeMethod: "S256",
+			DeviceInfo: &DeviceInfo{DeviceName: "laptop"}, UpstreamProviderName: "mock-idp",
+		})
+		w := httptest.NewRecorder()
+		h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+		loc, _ := url.Parse(w.Header().Get("Location"))
+		if got := loc.Query().Get("code") != ""; got != tc.ok {
+			t.Errorf("aud %q: Location %s, want code=%v", tc.aud, loc, tc.ok)
+		}
+	}
+}
+
+// TestNonceReachesToken verifies that the nonce sent to /authorize ends up
+// in the code's claims on both provisioning paths, without changing the
+// map the provisioner returned.
+func TestNonceReachesToken(t *testing.T) {
+	codeClaims := func(h *endpoints, w *httptest.ResponseRecorder) map[string]any {
+		t.Helper()
+		loc, _ := url.Parse(w.Header().Get("Location"))
+		ac, err := h.store.ConsumeCode(t.Context(), h.storeKey(kindCode, loc.Query().Get("code")))
+		if err != nil || ac == nil {
+			t.Fatalf("code from %s: %v, %v", loc, ac, err)
+		}
+		return ac.Claims
+	}
+
+	t.Run("Provision", func(t *testing.T) {
+		ks, _ := GenerateKeySet()
+		reg := NewProviderRegistry()
+		_ = reg.Register(&callbackProvider{name: "mock-idp", issuer: "https://mock-idp", identity: &UpstreamIdentity{Subject: "u1", Username: "alice", Issuer: "https://mock-idp"}})
+		store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+		t.Cleanup(store.stop)
+		provisioned := map[string]any{"device_identity_name": "alice-laptop", "device_external_id": "e1", "sub": "e1"}
+		cfg := Config{ExternalURL: "https://zdas.test", Claims: defaultClaimsConfig(), Token: TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: time.Minute}}
+		h := newTestEndpoints(cfg, ks, reg, store, &immediateProvisioner{claims: provisioned})
+		sessID := seedSession(t, h, &AuthSession{
+			TunnelerRedirectURI: "http://localhost:20314/auth/callback", TunnelerState: "s", TunnelerNonce: "n-1",
+			TunnelerCodeChallenge: "c", TunnelerCodeChallengeMethod: "S256",
+			DeviceInfo: &DeviceInfo{DeviceName: "laptop"}, UpstreamProviderName: "mock-idp",
+		})
+		w := httptest.NewRecorder()
+		h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+		if got := codeClaims(h, w)["nonce"]; got != "n-1" {
+			t.Errorf("nonce = %v, want n-1", got)
+		}
+		if _, changed := provisioned["nonce"]; changed {
+			t.Error("the provisioner's claims map was changed")
+		}
+	})
+
+	t.Run("CompleteProvision", func(t *testing.T) {
+		h, _ := setupProvisionComplete(t)
+		pendingID := seedPendingProvision(t, h, &PendingProvision{
+			TunnelerRedirectURI: "http://localhost:20314/auth/callback", TunnelerState: "s", TunnelerNonce: "n-2",
+			TunnelerCodeChallenge: "c", TunnelerCodeChallengeMethod: "S256",
+		})
+		w := completeProvision(h, pendingID, map[string]any{"device_identity_name": "a", "device_external_id": "e2", "sub": "e2"}, nil)
+		if got := codeClaims(h, w)["nonce"]; got != "n-2" {
+			t.Errorf("nonce = %v, want n-2", got)
+		}
+	})
+}
+
+// TestNonceKeptForInteractiveProvision verifies that a provisioner that
+// redirects leaves the nonce in the pending provision, for
+// CompleteProvision to put in the token.
+func TestNonceKeptForInteractiveProvision(t *testing.T) {
+	ks, _ := GenerateKeySet()
+	reg := NewProviderRegistry()
+	_ = reg.Register(&callbackProvider{name: "mock-idp", issuer: "https://mock-idp", identity: &UpstreamIdentity{Subject: "u1", Username: "alice", Issuer: "https://mock-idp"}})
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
+	cfg := Config{ExternalURL: "https://zdas.test", Claims: defaultClaimsConfig(), Token: TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: time.Minute}}
+	h := newTestEndpoints(cfg, ks, reg, store, &interactiveProvisioner{redirectURL: "https://embedder.example.com/pick"})
+	sessID := seedSession(t, h, &AuthSession{
+		TunnelerRedirectURI: "http://localhost:20314/auth/callback", TunnelerState: "s", TunnelerNonce: "n-3",
+		TunnelerCodeChallenge: "c", TunnelerCodeChallengeMethod: "S256",
+		DeviceInfo: &DeviceInfo{DeviceName: "laptop"}, UpstreamProviderName: "mock-idp",
+	})
+	w := httptest.NewRecorder()
+	h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+	loc, _ := url.Parse(w.Header().Get("Location"))
+	pp := consumePending(h, loc.Query().Get("pending_id"))
+	if pp == nil || pp.TunnelerNonce != "n-3" {
+		t.Errorf("pending provision = %+v, want TunnelerNonce n-3", pp)
+	}
+}

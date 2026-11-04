@@ -36,10 +36,16 @@ tls:
 # Ziti controller - ZDAS discovers upstream IdPs and manages identities here
 controller:
   api_url: "https://controller.example.com:1280"
-  # Ziti identity JSON file with admin=true - used for mTLS to the controller
-  # and management API access (required for fallback reconciliation).
-  # The file contains cert, key, and CA bundle.
-  # identity_file: "/path/to/zdas-admin.json"
+  # OpenZiti identity JSON file (cert, key and CA) for the management API,
+  # needed for fallback reconciliation. It needs only two permissions, not
+  # admin:
+  #   ziti edge create identity zdas-reconciler \
+  #     --permissions identity.read,identity.update -o zdas-reconciler.jwt
+  #   ziti edge enroll zdas-reconciler.jwt -o zdas-reconciler.json
+  # identity.update can still change any identity's name and role
+  # attributes, so guard this file. ZDAS warns at startup if the identity is
+  # a full admin.
+  # identity_file: "/path/to/zdas-reconciler.json"
   # PEM CA bundle for controllers using a private CA (when no identity file).
   # Not needed when the controller has a publicly-trusted cert.
   # ca_bundle: "/path/to/controller-ca.pem"
@@ -100,6 +106,10 @@ claims:
 token:
   audience: "ziti-enroll"            # must match the audience on the ext-jwt-signer
   expiry: "5m"
+  # Audiences an embedding application's provisioner may give an enrollment
+  # by setting its "aud" claim, one per OpenZiti network it serves, each
+  # matching the audience of ZDAS's signer on that network.
+  # provisioner_audiences: ["network-a", "network-b"]
 
 # Session settings
 session:
