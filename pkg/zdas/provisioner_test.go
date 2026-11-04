@@ -669,11 +669,10 @@ func TestProvisionerReceivesClientType(t *testing.T) {
 			mux := newTestEndpoints(cfg, ks, reg, store, provisioner).mux()
 
 			_, challenge := generateTestPKCE(t)
-			w := httptest.NewRecorder()
-			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet,
+			w := authorizeAndConsent(t, mux,
 				"/authorize?redirect_uri=http://localhost:20314/auth/callback&state=s1&device_name=box"+
-					"&code_challenge="+challenge+"&code_challenge_method=S256"+tc.param, nil))
-			if w.Code != http.StatusFound {
+					"&code_challenge="+challenge+"&code_challenge_method=S256"+tc.param, "")
+			if w.Code != http.StatusSeeOther {
 				t.Fatalf("authorize status = %d, body = %s", w.Code, w.Body.String())
 			}
 			loc, err := url.Parse(w.Header().Get("Location"))

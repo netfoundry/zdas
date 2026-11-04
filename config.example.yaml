@@ -3,12 +3,13 @@ listen: ":18443"                          # address to bind
 external_url: "https://das.example.com"   # how tunnelers and the controller reach ZDAS
 
 # Optional: delegate the IdP selector page to the embedding application.
-# When set and 2+ providers are registered, ZDAS 302-redirects unsigned
-# /authorize requests to this URL with the original query string plus
-# `providers=<comma-separated names>`. The host app renders its own
-# picker page (matching its branding) and directs the user back to
-# /authorize with the same query string plus `idp=<chosen-name>`.
-# When unset, ZDAS renders a built-in HTML picker.
+# When set and 2+ providers are registered, ZDAS 302-redirects
+# /authorize requests without an idp to this URL with the original query
+# string plus `providers=<comma-separated names>` and `consent=<opaque>`.
+# The host app renders its own picker page, on the same site as ZDAS,
+# that POSTs `consent` and `idp=<chosen-name>` back to /authorize when the
+# user clicks. See Config.IDPSelectorURL for the requirements.
+# When unset, ZDAS renders a built-in picker.
 # idp_selector_url: "https://app.example.com/enroll/pick-idp"
 
 # TLS - three modes:

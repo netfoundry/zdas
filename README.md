@@ -28,7 +28,7 @@ Tunneler          ZDAS              Upstream IdP       OpenZiti Controller
 
 ZDAS discovers upstream IdPs automatically by polling the controller's public `external-jwt-signers` endpoint - no parallel IdP configuration needed. Non-OIDC providers like GitHub (which issues opaque tokens, not JWTs) can be configured directly.
 
-When multiple identity providers are available, ZDAS presents a selection page in the browser so the user can choose where to authenticate.
+Before sending the browser to an IdP, ZDAS shows a page where the user continues: a button for each available identity provider, or one when there is only one. This click is the user's consent. Without it, a link someone else built could sign in a user whose IdP session is still live, with no prompt at all. The page shows the device as the device describes itself. It also warns that the address the browser returns to carries the sign-in and must not be pasted anywhere. An embedding application can show its own picker instead (`idp_selector_url`); see `Config.IDPSelectorURL` for what that page must do.
 
 ## Features
 
@@ -101,6 +101,8 @@ Updated tunnelers send device info as query parameters on the authorize URL:
 The IdP sign-in must finish in the browser the tunneler opened. ZDAS ties each enrollment to that browser with a cookie, so a sign-in completed anywhere else, such as another browser or a phone following an emailed magic link, is rejected at `/callback` with `400 session not found or expired`. The user has to start again from the tunneler. A callback from the wrong browser leaves the enrollment in place, so it can't be used to cancel someone else's.
 
 Unmodified tunnelers work without changes when `fallback.enabled` is true. They enroll with a temporary name (e.g., `jsmith-pending-a3f9b2`) that ZDAS reconciles to the real hostname after the tunneler connects.
+
+Fallback works with enroll-to-cert only. Each fallback login gets a new external ID, so an identity enrolled by token couldn't sign in again once its first token expired. While fallback is on, register ZDAS's signer with `--enroll-to-cert` and not `--enroll-to-token`. If ZDAS's signer allows enroll-to-token, ZDAS refuses fallback logins and logs an error. It checks the signer every `controller.poll_interval`.
 
 ## Embedding
 

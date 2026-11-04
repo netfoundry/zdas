@@ -1,6 +1,7 @@
 package zdas
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -8,7 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
+	"html/template"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -69,6 +70,7 @@ func (h *endpoints) mux() *http.ServeMux {
 	mux.HandleFunc("GET /edge/client/v1/external-jwt-signers", h.handleExtJWTSigners)
 	mux.HandleFunc("GET /external-jwt-signers", h.handleExtJWTSigners)
 	mux.HandleFunc("GET /authorize", h.handleAuthorize)
+	mux.HandleFunc("POST /authorize", h.handleConsent)
 	mux.HandleFunc("GET /callback", h.handleCallback)
 	mux.HandleFunc("POST /token", h.handleToken)
 	return mux
@@ -205,6 +207,15 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			oidcErrorRedirect(w, r, redirectURI, state, "invalid_request", "device_name parameter required")
 			return
 		}
+		// Every fallback login gets a new external ID, so a token-enrolled
+		// fallback identity could not sign in again once its first token
+		// expired. Unmodified tunnelers don't say how they enroll, so
+		// fallback is refused whenever ZDAS's signer allows enroll-to-token.
+		if h.discovery != nil && h.discovery.selfAllowsTokenEnrollment() {
+			h.logger.Error("refusing fallback login: ZDAS's signer on the controller allows enroll-to-token, which fallback identities cannot use; enable only enroll-to-cert on it while fallback is on")
+			oidcErrorRedirect(w, r, redirectURI, state, "invalid_request", "device_name parameter required: fallback enrollment supports enroll-to-cert only")
+			return
+		}
 		// Fallback path: generate a nonce for this enrollment.
 		nonce, err := generateShortNonce()
 		if err != nil {
@@ -235,30 +246,28 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		OSVersion:  truncateParam(osVersion, 128),
 	}
 
-	// Resolve upstream provider.
-	provider, err := h.registry.Resolve(idpHint)
-	if err != nil {
-		switch {
-		case errors.Is(err, ErrMultipleProviders):
-			if h.cfg.IDPSelectorURL != "" {
-				h.redirectToIDPSelector(w, r)
-				return
-			}
-			h.renderIDPSelector(w, r)
-		case errors.Is(err, ErrNoProviders):
-			h.logger.Error("no upstream providers configured")
-			oidcErrorRedirect(w, r, redirectURI, state, "server_error", "no upstream providers available")
-		default:
-			oidcErrorRedirect(w, r, redirectURI, state, "invalid_request", "unknown idp")
-		}
+	// Work out which providers to offer, but go no further: the user
+	// continues from a ZDAS page (handleConsent), so that a link alone
+	// cannot sign in someone whose IdP session is still live.
+	var choices []string
+	switch provider, err := h.registry.Resolve(idpHint); {
+	case err == nil:
+		choices = []string{provider.Name()}
+	case errors.Is(err, ErrMultipleProviders):
+		choices = h.registry.Names()
+		sort.Strings(choices)
+	case errors.Is(err, ErrNoProviders):
+		h.logger.Error("no upstream providers configured")
+		oidcErrorRedirect(w, r, redirectURI, state, "server_error", "no upstream providers available")
+		return
+	default:
+		oidcErrorRedirect(w, r, redirectURI, state, "invalid_request", "unknown idp")
 		return
 	}
 
-	// Build session and redirect to upstream.
-	callbackURL := h.cfg.ExternalURL + "/callback"
-
 	// Copy what the session keeps: values parsed from the query can share
 	// its memory, and the session would keep the whole request line alive.
+	// UpstreamProviderName stays empty until the user chooses.
 	sess := &AuthSession{
 		TunnelerRedirectURI:         strings.Clone(redirectURI),
 		TunnelerState:               strings.Clone(state),
@@ -268,26 +277,79 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		FallbackNonce:               fallbackNonce,
 		EnrollmentMethod:            truncateParam(enrollmentMethod, 64),
 		ClientType:                  truncateParam(clientType, 64),
-		UpstreamProviderName:        provider.Name(),
 	}
+	consentID, err := h.startSession(w, r, sess)
+	if err != nil {
+		h.logger.Error("create session", "error", err)
+		oidcErrorRedirect(w, r, redirectURI, state, "server_error", "internal error")
+		return
+	}
+	if len(choices) > 1 && h.cfg.IDPSelectorURL != "" {
+		h.redirectToIDPSelector(w, r, choices, consentID)
+		return
+	}
+	h.renderConsent(w, deviceInfo, parsedRedirect, choices, consentID)
+}
+
+// maxConsentRequestBytes caps the form posted from the consent page, which
+// holds a session ID and a provider name.
+const maxConsentRequestBytes = 4 << 10
+
+// consentMissing is the response to a consent form without a matching
+// session.
+const consentMissing = "sign-in request not found or expired; start again from the app"
+
+// handleConsent takes the form posted from the page /authorize shows, and
+// sends the browser to the chosen provider. The session /authorize stored
+// is bound to its browser by a SameSite=Lax cookie, which a cross-site
+// form post does not carry, so the post must come from that browser.
+func (h *endpoints) handleConsent(w http.ResponseWriter, r *http.Request) {
+	if h.rateLimiter != nil && !h.rateLimiter.allow(r) {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxConsentRequestBytes)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "malformed form body", http.StatusBadRequest)
+		return
+	}
+	sess, err := h.consumeBoundSession(w, r, r.PostFormValue("consent"))
+	if err != nil {
+		h.logger.Error("consume session", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	// A session that already has a provider is waiting for /callback, not
+	// for consent.
+	if sess == nil || sess.UpstreamProviderName != "" {
+		http.Error(w, consentMissing, http.StatusBadRequest)
+		return
+	}
+	provider, err := h.registry.Resolve(r.PostFormValue("idp"))
+	if err != nil {
+		oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, "invalid_request", "unknown idp")
+		return
+	}
+	sess.UpstreamProviderName = provider.Name()
 
 	// For OIDC, use our own PKCE pair toward the upstream, keeping the
 	// verifier in the session for /callback. Other providers (GitHub) get
 	// none.
+	callbackURL := h.cfg.ExternalURL + "/callback"
 	oidcProv, usePKCE := provider.(*OIDCProvider)
 	var challenge string
 	if usePKCE {
-		var err error
 		if sess.ZDASCodeVerifier, challenge, err = generatePKCE(); err != nil {
 			h.logger.Error("generate pkce", "error", err)
-			oidcErrorRedirect(w, r, redirectURI, state, "server_error", "internal error")
+			oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, "server_error", "internal error")
 			return
 		}
 	}
 	sessionState, err := h.startSession(w, r, sess)
 	if err != nil {
 		h.logger.Error("create session", "error", err)
-		oidcErrorRedirect(w, r, redirectURI, state, "server_error", "internal error")
+		oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, "server_error", "internal error")
 		return
 	}
 	var upstreamURL string
@@ -297,12 +359,12 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		upstreamURL = provider.AuthorizeURL(sessionState, callbackURL)
 	}
 
-	if fallbackNonce != "" {
-		h.logger.Info("redirecting to upstream (fallback)", "provider", provider.Name(), "nonce", fallbackNonce)
+	if sess.FallbackNonce != "" {
+		h.logger.Info("redirecting to upstream (fallback)", "provider", provider.Name(), "nonce", sess.FallbackNonce)
 	} else {
-		h.logger.Info("redirecting to upstream", "provider", provider.Name(), "device", deviceName)
+		h.logger.Info("redirecting to upstream", "provider", provider.Name(), "device", sess.DeviceInfo.DeviceName)
 	}
-	http.Redirect(w, r, upstreamURL, http.StatusFound)
+	http.Redirect(w, r, upstreamURL, http.StatusSeeOther)
 }
 
 // sessionMissing is the /callback response when no session matches. A
@@ -323,7 +385,8 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if sess == nil {
+	// A session without a provider is still waiting for consent.
+	if sess == nil || sess.UpstreamProviderName == "" {
 		http.Error(w, sessionMissing, http.StatusBadRequest)
 		return
 	}
@@ -802,79 +865,89 @@ func tokenError(w http.ResponseWriter, errCode, errDesc string) {
 	})
 }
 
-// redirectToIDPSelector hands picker rendering off to the embedding
-// application via cfg.IDPSelectorURL. It preserves the original /authorize
-// query string so the host app can echo it back to /authorize with an idp=
-// parameter added, and appends a `providers` query param listing the
-// available IdP names so the host app does not need to query ZDAS to know
-// what to render.
-func (h *endpoints) redirectToIDPSelector(w http.ResponseWriter, r *http.Request) {
-	names := h.registry.Names()
-	sort.Strings(names)
-
-	// Copy the original query string verbatim and add a providers list. We
-	// intentionally do NOT remove any existing params; the host app will
-	// round-trip them back to /authorize unchanged so that the
-	// tunneler-supplied state, PKCE, redirect_uri, device info, etc. are
-	// preserved through the picker round trip.
+// redirectToIDPSelector sends the browser to the embedding application's
+// picker with the original query string plus providers, the names to offer,
+// and consent, the session ID the picker posts back. See
+// Config.IDPSelectorURL.
+func (h *endpoints) redirectToIDPSelector(w http.ResponseWriter, r *http.Request, providers []string, consentID string) {
 	q := r.URL.Query()
-	q.Set("providers", strings.Join(names, ","))
-
-	redirURL := withQuery(h.cfg.IDPSelectorURL, q)
+	q.Set("providers", strings.Join(providers, ","))
+	q.Set("consent", consentID)
 
 	h.logger.Info("redirecting to host app idp selector",
 		"url", h.cfg.IDPSelectorURL,
-		"providers", names,
+		"providers", providers,
 	)
-	http.Redirect(w, r, redirURL, http.StatusFound)
+	http.Redirect(w, r, withQuery(h.cfg.IDPSelectorURL, q), http.StatusFound)
 }
 
-// renderIDPSelector shows an HTML page listing available identity providers
-// when multiple are configured and no selection has been made yet. Each link
-// re-enters /authorize with the original query parameters plus idp=<name>,
-// so all tunneler params (redirect_uri, state, PKCE, device info) carry through.
-func (h *endpoints) renderIDPSelector(w http.ResponseWriter, r *http.Request) {
-	names := h.registry.Names()
-	sort.Strings(names)
+// consentPageData is what the consent page shows. Everything about the
+// device comes from the request, so the page presents it as the device's
+// own description, not as something ZDAS vouches for.
+type consentPageData struct {
+	Device    string   // the device's name, or its hostname on the fallback path
+	Details   string   // OS and architecture, as reported
+	ReturnTo  string   // the host and port the browser returns to
+	Providers []string // one button each
+	Consent   string   // the session ID the form posts back
+}
 
-	// Rebuild the original query without idp so we can add it per-provider.
-	baseQuery := r.URL.Query()
-	baseQuery.Del("idp")
-
-	var links strings.Builder
-	for _, name := range names {
-		q := make(url.Values)
-		for k, v := range baseQuery {
-			q[k] = v
-		}
-		q.Set("idp", name)
-		// Relative URL: the browser resolves "?..." against the current
-		// page (/authorize), keeping the path and replacing only the
-		// query. This works regardless of how the embedding application
-		// mounts ZDAS (e.g., at /zdas via http.StripPrefix).
-		href := "?" + q.Encode()
-		fmt.Fprintf(&links, `<a href="%s">%s</a>`, html.EscapeString(href), html.EscapeString(name))
+// renderConsent shows the page the user continues from: one button per
+// provider in providers, posting back to /authorize. The page cannot be
+// framed, so another site cannot trick the user into clicking it.
+func (h *endpoints) renderConsent(w http.ResponseWriter, info *DeviceInfo, redirect *url.URL, providers []string, consentID string) {
+	data := consentPageData{
+		Device:    info.DeviceName,
+		Details:   strings.TrimSpace(info.OS + " " + info.Arch),
+		ReturnTo:  redirect.Host,
+		Providers: providers,
+		Consent:   consentID,
 	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, idpSelectorHTML, links.String())
+	if data.Device == "" {
+		data.Device = info.Hostname
+	}
+	var buf bytes.Buffer
+	if err := consentPage.Execute(&buf, data); err != nil {
+		h.logger.Error("render consent page", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	hdr := w.Header()
+	hdr.Set("Content-Type", "text/html; charset=utf-8")
+	hdr.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
+	hdr.Set("X-Frame-Options", "DENY")
+	hdr.Set("X-Content-Type-Options", "nosniff")
+	hdr.Set("Referrer-Policy", "no-referrer")
+	hdr.Set("Cache-Control", "no-store")
+	w.Write(buf.Bytes())
 }
 
-const idpSelectorHTML = `<!DOCTYPE html>
+// consentPage is the page renderConsent shows. The form has no action, so
+// it posts to the page's own URL, wherever ZDAS is mounted.
+var consentPage = template.Must(template.New("consent").Parse(`<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Select Identity Provider</title>
+<title>Sign in to OpenZiti</title>
 <style>
-  body { font-family: -apple-system, system-ui, sans-serif; max-width: 400px; margin: 80px auto; padding: 0 20px; color: #333; }
-  h1 { font-size: 1.4em; font-weight: 600; margin-bottom: 24px; }
-  a { display: block; padding: 14px 20px; margin: 8px 0; background: #f5f5f5; border: 1px solid #ddd; border-radius: 8px; color: #333; text-decoration: none; font-size: 1em; }
-  a:hover { background: #e8e8e8; border-color: #ccc; }
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 420px; margin: 80px auto; padding: 0 20px; color: #333; }
+  h1 { font-size: 1.4em; font-weight: 600; margin-bottom: 16px; }
+  p { line-height: 1.4; }
+  .note { font-size: 0.9em; color: #666; }
+  button { display: block; width: 100%; padding: 14px 20px; margin: 8px 0; background: #f5f5f5; border: 1px solid #ddd; border-radius: 8px; color: #333; font-size: 1em; text-align: left; cursor: pointer; }
+  button:hover { background: #e8e8e8; border-color: #ccc; }
 </style>
 </head>
 <body>
-<h1>Select an identity provider</h1>
-%s
+<h1>Sign in to OpenZiti</h1>
+<p>An app asked to sign you in to an OpenZiti network{{with .Device}} from a device that calls itself <strong>{{.}}</strong>{{end}}{{with .Details}} ({{.}}){{end}}.</p>
+<p>Continue only if you just started this yourself, on your own device.</p>
+<form method="post">
+<input type="hidden" name="consent" value="{{.Consent}}">
+{{range .Providers}}<button type="submit" name="idp" value="{{.}}">Continue with {{.}}</button>
+{{end}}</form>
+<p class="note">After you sign in, your browser returns to the app at {{.ReturnTo}}. Don't copy that address or paste it anywhere: it carries your sign-in.</p>
 </body>
-</html>`
+</html>
+`))

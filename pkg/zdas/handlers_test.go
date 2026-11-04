@@ -209,16 +209,16 @@ func TestHandleAuthorizeFallbackEnabled(t *testing.T) {
 	h := newTestEndpoints(cfg, ks, reg, store, nil)
 	mux := h.mux()
 
-	_, challenge := generateTestPKCE(t)
-	reqURL := "/authorize?redirect_uri=http://localhost:20314/auth/callback&response_type=code&state=s1" +
-		"&code_challenge=" + challenge + "&code_challenge_method=S256"
-	req := httptest.NewRequest(http.MethodGet, reqURL, nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	// Should redirect to upstream (not error), even without device_name.
-	if w.Code != http.StatusFound {
-		t.Fatalf("status = %d, want 302", w.Code)
+	// Should redirect to upstream (not error), even without device_name,
+	// after a page naming the device by its hostname.
+	page := httptest.NewRecorder()
+	mux.ServeHTTP(page, httptest.NewRequest(http.MethodGet, authorizeURL(t, url.Values{"device_name": nil, "hostname": {"build-box"}}), nil))
+	if !strings.Contains(page.Body.String(), "<strong>build-box</strong>") {
+		t.Errorf("fallback page doesn't name the device by hostname: %s", page.Body)
+	}
+	w := consent(t, mux, page, "")
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", w.Code)
 	}
 	loc := w.Header().Get("Location")
 	if strings.Contains(loc, "error=") {
@@ -229,6 +229,50 @@ func TestHandleAuthorizeFallbackEnabled(t *testing.T) {
 	}
 }
 
+// TestHandleAuthorizeFallbackRefusedForTokenEnrollment verifies that
+// fallback logins are refused while ZDAS's signer allows enroll-to-token,
+// and served again once it doesn't.
+func TestHandleAuthorizeFallbackRefusedForTokenEnrollment(t *testing.T) {
+	ks, _ := GenerateKeySet()
+	reg := NewProviderRegistry()
+	_ = reg.Register(&stubProvider{name: "test-idp", issuer: "https://test-idp"})
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
+	cfg := Config{
+		ExternalURL: "https://zdas.example.com",
+		Fallback:    FallbackConfig{Enabled: true, TempNameTemplate: "{username}-pending-{nonce_short}"},
+		Claims:      defaultClaimsConfig(),
+		Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
+	}
+	h := newTestEndpoints(cfg, ks, reg, store, nil)
+	h.discovery = &signerDiscovery{}
+	mux := h.mux()
+	noDevice := authorizeURL(t, url.Values{"device_name": nil})
+
+	h.discovery.selfToToken.Store(true)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, noDevice, nil))
+	if loc := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.Contains(loc, "error=invalid_request") || !strings.Contains(loc, "enroll-to-cert") {
+		t.Errorf("fallback with token enrollment allowed: %d %s", w.Code, loc)
+	}
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, authorizeURL(t, nil), nil))
+	if w.Code != http.StatusOK {
+		t.Errorf("login with device_name refused: %d %s", w.Code, w.Header().Get("Location"))
+	}
+
+	h.discovery.selfToToken.Store(false)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, noDevice, nil))
+	if w.Code != http.StatusOK {
+		t.Errorf("fallback with cert-only signer refused: %d %s", w.Code, w.Header().Get("Location"))
+	}
+}
+
+// TestHandleAuthorizeIDPSelector verifies that with several providers
+// /authorize shows a consent page with a button for each, that goes nowhere
+// until the user picks one, and that the page is safe to show: escaped, not
+// frameable, not cached.
 func TestHandleAuthorizeIDPSelector(t *testing.T) {
 	ks, _ := GenerateKeySet()
 	reg := NewProviderRegistry()
@@ -245,40 +289,120 @@ func TestHandleAuthorizeIDPSelector(t *testing.T) {
 	h := newTestEndpoints(cfg, ks, reg, store, nil)
 	mux := h.mux()
 
-	_, challenge := generateTestPKCE(t)
-	// Multiple providers, no selection yet - should show selector page.
-	reqURL := "/authorize?redirect_uri=http://localhost:20314/auth/callback&response_type=code&state=s1" +
-		"&code_challenge=" + challenge + "&code_challenge_method=S256&device_name=laptop"
-	req := httptest.NewRequest(http.MethodGet, reqURL, nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
+	page := httptest.NewRecorder()
+	mux.ServeHTTP(page, httptest.NewRequest(http.MethodGet, authorizeURL(t, url.Values{
+		"device_name": {"<b>laptop</b>"}, "os": {"darwin"}, "arch": {"arm64"},
+	}), nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", page.Code)
+	}
+	body := page.Body.String()
+	for _, want := range []string{
+		`value="github">Continue with github`, `value="keycloak">Continue with keycloak`,
+		"&lt;b&gt;laptop&lt;/b&gt;", "(darwin arm64)", "localhost:20314", `<form method="post">`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("page lacks %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "<b>laptop") {
+		t.Error("device name not escaped")
+	}
+	for k, want := range map[string]string{
+		"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+		"X-Frame-Options":         "DENY",
+		"Cache-Control":           "no-store",
+		"X-Content-Type-Options":  "nosniff",
+		"Referrer-Policy":         "no-referrer",
+	} {
+		if got := page.Header().Get(k); got != want {
+			t.Errorf("%s = %q, want %q", k, got, want)
+		}
+	}
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", w.Code)
+	w := consent(t, mux, page, "github")
+	if w.Code != http.StatusSeeOther || !strings.HasPrefix(w.Header().Get("Location"), "https://stub/github") {
+		t.Errorf("consent: %d %s, want 303 to github", w.Code, w.Header().Get("Location"))
 	}
-	body := w.Body.String()
-	if !strings.Contains(body, "Select") {
-		t.Error("expected selector page title")
+}
+
+// TestConsentRequiresBindingCookie verifies that the consent form only
+// works from the browser that got the page, once, and only for a session
+// that is waiting for consent.
+func TestConsentRequiresBindingCookie(t *testing.T) {
+	mux := bindingHandlers(t, "https://zdas.example.com")
+	post := func(form url.Values, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/authorize", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w
 	}
-	if !strings.Contains(body, "keycloak") || !strings.Contains(body, "github") {
-		t.Errorf("expected both provider names in page, got: %s", body)
+
+	page := httptest.NewRecorder()
+	mux.ServeHTTP(page, httptest.NewRequest(http.MethodGet, authorizeURL(t, nil), nil))
+	id := consentFieldRe.FindStringSubmatch(page.Body.String())[1]
+	cookie := liveCookie(t, page, id)
+	form := url.Values{"consent": {id}, "idp": {"mock-idp"}}
+
+	// A cross-site form post carries no SameSite=Lax cookie.
+	if w := post(form); w.Code != http.StatusBadRequest || w.Header().Get("Location") != "" {
+		t.Errorf("without cookie: %d %q, want 400", w.Code, w.Header().Get("Location"))
 	}
-	// Each link should carry forward the original query params.
-	if !strings.Contains(body, "device_name=laptop") {
-		t.Error("expected device_name in selector links")
+	// The fields are read from the form only, not the URL.
+	inQuery := httptest.NewRequest(http.MethodPost, "/authorize?"+form.Encode(), strings.NewReader(""))
+	inQuery.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	inQuery.AddCookie(cookie)
+	qw := httptest.NewRecorder()
+	mux.ServeHTTP(qw, inQuery)
+	if qw.Code != http.StatusBadRequest {
+		t.Errorf("fields in the query: %d, want 400", qw.Code)
 	}
-	if !strings.Contains(body, "idp=keycloak") || !strings.Contains(body, "idp=github") {
-		t.Error("expected idp param in selector links")
+	if w := post(url.Values{"consent": {id}, "idp": {strings.Repeat("x", maxConsentRequestBytes)}}, cookie); w.Code != http.StatusBadRequest {
+		t.Errorf("oversized form: %d, want 400", w.Code)
 	}
-	// Links must be relative so the browser resolves them against the
-	// current /authorize URL, regardless of how the embedding app mounts
-	// ZDAS (e.g., at /zdas). An absolute "/authorize?..." would 404 when
-	// ZDAS is mounted under a prefix via http.StripPrefix.
-	if !strings.Contains(body, `href="?`) {
-		t.Errorf("expected relative href=\"?...\" in selector, got: %s", body)
+	w := post(form, cookie)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("with cookie: %d %s", w.Code, w.Body)
 	}
-	if strings.Contains(body, `href="/authorize`) {
-		t.Errorf("selector must not use absolute /authorize path; got: %s", body)
+	if w := post(form, cookie); w.Code != http.StatusBadRequest {
+		t.Errorf("second post: %d, want 400", w.Code)
+	}
+
+	// A session waiting for /callback can't be consented to again.
+	started, upstream := startAuthorize(t, mux)
+	if w := post(url.Values{"consent": {upstream}, "idp": {"mock-idp"}}, liveCookie(t, started, upstream)); w.Code != http.StatusBadRequest {
+		t.Errorf("consent to an upstream session: %d, want 400", w.Code)
+	}
+}
+
+// TestCallbackRejectsConsentSession verifies that a session still waiting
+// for consent can't be completed at /callback, even from its own browser.
+func TestCallbackRejectsConsentSession(t *testing.T) {
+	h, _ := setupHandlers(t)
+	mux := h.mux()
+	page := httptest.NewRecorder()
+	mux.ServeHTTP(page, httptest.NewRequest(http.MethodGet, authorizeURL(t, nil), nil))
+	id := consentFieldRe.FindStringSubmatch(page.Body.String())[1]
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, browserRequest(page, "/callback?code=c&state="+id))
+	if w.Code != http.StatusBadRequest || w.Header().Get("Location") != "" {
+		t.Errorf("callback for a consent session: %d %q, want 400", w.Code, w.Header().Get("Location"))
+	}
+}
+
+// TestConsentUnknownProvider verifies that a post naming no registered
+// provider returns the error to the tunneler.
+func TestConsentUnknownProvider(t *testing.T) {
+	h, _ := setupHandlers(t)
+	mux := h.mux()
+	w := authorizeAndConsent(t, mux, authorizeURL(t, nil), "nope")
+	if loc := w.Header().Get("Location"); w.Code != http.StatusFound || !strings.HasPrefix(loc, "http://localhost:20314/auth/callback?") || !strings.Contains(loc, "error=invalid_request") {
+		t.Errorf("unknown idp: %d %s", w.Code, loc)
 	}
 }
 
@@ -304,21 +428,16 @@ func idpSelectorHandlers(t *testing.T, selectorURL string) *http.ServeMux {
 }
 
 func TestIDPSelectorURLUnsetRendersBuiltinPicker(t *testing.T) {
-	// Existing behavior: no IDPSelectorURL, multiple providers, no idp
-	// param -> built-in picker page rendered inline.
+	// No IDPSelectorURL, multiple providers, no idp param: ZDAS's own
+	// consent page offers every provider.
 	mux := idpSelectorHandlers(t, "")
-	_, challenge := generateTestPKCE(t)
-	reqURL := "/authorize?redirect_uri=http://localhost:20314/auth/callback&response_type=code&state=s1" +
-		"&code_challenge=" + challenge + "&code_challenge_method=S256&device_name=laptop"
-	req := httptest.NewRequest(http.MethodGet, reqURL, nil)
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, authorizeURL(t, nil), nil))
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (built-in picker)", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "Select an identity provider") {
-		t.Error("expected built-in picker page to be rendered")
+	if n := len(consentButtonRe.FindAllString(w.Body.String(), -1)); n != 2 {
+		t.Errorf("page offers %d providers, want 2", n)
 	}
 }
 
@@ -355,11 +474,24 @@ func TestIDPSelectorURLRedirectsWithProvidersAndQuery(t *testing.T) {
 	if loc.Query().Get("redirect_uri") != "http://localhost:20314/auth/callback" {
 		t.Errorf("redirect_uri = %q", loc.Query().Get("redirect_uri"))
 	}
+
+	// The host picker posts consent back from the same browser.
+	form := url.Values{"consent": {loc.Query().Get("consent")}, "idp": {"keycloak"}}
+	post := httptest.NewRequest(http.MethodPost, "/authorize", strings.NewReader(form.Encode()))
+	post.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, c := range w.Result().Cookies() {
+		post.AddCookie(c)
+	}
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, post)
+	if got := w.Header().Get("Location"); w.Code != http.StatusSeeOther || !strings.HasPrefix(got, "https://stub/keycloak") {
+		t.Errorf("host picker consent: %d %s, want 303 to keycloak", w.Code, got)
+	}
 }
 
 func TestIDPSelectorURLSingleProviderSkipsPicker(t *testing.T) {
-	// With IDPSelectorURL set but only one provider registered, ZDAS must
-	// still bypass the picker entirely and go straight to the upstream.
+	// With IDPSelectorURL set but only one provider registered, ZDAS
+	// skips the host picker and asks for consent on its own page.
 	ks, _ := GenerateKeySet()
 	reg := NewProviderRegistry()
 	_ = reg.Register(&stubProvider{name: "only-one", issuer: "https://only"})
@@ -373,42 +505,20 @@ func TestIDPSelectorURLSingleProviderSkipsPicker(t *testing.T) {
 		Token:          TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
 	h := newTestEndpoints(cfg, ks, reg, store, nil)
-	mux := h.mux()
-
-	_, challenge := generateTestPKCE(t)
-	reqURL := "/authorize?redirect_uri=http://localhost:20314/auth/callback&response_type=code&state=s1" +
-		"&code_challenge=" + challenge + "&code_challenge_method=S256&device_name=laptop"
-	req := httptest.NewRequest(http.MethodGet, reqURL, nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Code != http.StatusFound {
-		t.Fatalf("status = %d, want 302", w.Code)
-	}
-	// Must redirect to the stub upstream, NOT the picker URL.
-	loc := w.Header().Get("Location")
-	if !strings.HasPrefix(loc, "https://stub/only-one") {
-		t.Errorf("expected redirect to upstream, got %s", loc)
+	w := authorizeAndConsent(t, h.mux(), authorizeURL(t, nil), "")
+	if loc := w.Header().Get("Location"); w.Code != http.StatusSeeOther || !strings.HasPrefix(loc, "https://stub/only-one") {
+		t.Errorf("consent: %d %s, want 303 to the upstream", w.Code, loc)
 	}
 }
 
 func TestIDPSelectorURLIDPSuppliedSkipsPicker(t *testing.T) {
-	// With IDPSelectorURL set, multiple providers, AND an idp hint,
-	// ZDAS must skip the picker and go straight to the chosen upstream.
+	// With IDPSelectorURL set, multiple providers, AND an idp hint, as a
+	// host picker that links back sends, ZDAS skips the host picker and
+	// asks for consent to that provider only.
 	mux := idpSelectorHandlers(t, "https://app.example.com/pick-idp")
-	_, challenge := generateTestPKCE(t)
-	reqURL := "/authorize?redirect_uri=http://localhost:20314/auth/callback&response_type=code&state=s1" +
-		"&code_challenge=" + challenge + "&code_challenge_method=S256&device_name=laptop&idp=github"
-	req := httptest.NewRequest(http.MethodGet, reqURL, nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Code != http.StatusFound {
-		t.Fatalf("status = %d, want 302", w.Code)
-	}
-	loc := w.Header().Get("Location")
-	if !strings.HasPrefix(loc, "https://stub/github") {
-		t.Errorf("expected redirect to stub github, got %s", loc)
+	w := authorizeAndConsent(t, mux, authorizeURL(t, url.Values{"idp": {"github"}}), "")
+	if loc := w.Header().Get("Location"); w.Code != http.StatusSeeOther || !strings.HasPrefix(loc, "https://stub/github") {
+		t.Errorf("consent: %d %s, want 303 to github", w.Code, loc)
 	}
 }
 
@@ -463,20 +573,11 @@ func TestHandleAuthorizeMissingPKCE(t *testing.T) {
 
 func TestHandleAuthorizeRedirects(t *testing.T) {
 	h, _ := setupHandlers(t)
-	mux := h.mux()
-	_, challenge := generateTestPKCE(t)
-
-	reqURL := "/authorize?redirect_uri=http://localhost:20314/auth/callback&response_type=code&state=s1" +
-		"&code_challenge=" + challenge + "&code_challenge_method=S256&device_name=laptop"
-	req := httptest.NewRequest(http.MethodGet, reqURL, nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Code != http.StatusFound {
+	w := authorizeAndConsent(t, h.mux(), authorizeURL(t, nil), "")
+	if w.Code != http.StatusSeeOther {
 		t.Fatalf("status = %d", w.Code)
 	}
-	loc := w.Header().Get("Location")
-	if !strings.HasPrefix(loc, "https://stub/test-idp") {
+	if loc := w.Header().Get("Location"); !strings.HasPrefix(loc, "https://stub/test-idp") {
 		t.Errorf("expected redirect to stub provider, got %s", loc)
 	}
 }
@@ -849,7 +950,7 @@ func TestAuthorizeRejectsOversizedParams(t *testing.T) {
 	}{
 		{"huge state", url.Values{"state": {strings.Repeat("s", 900_000)}}, http.StatusBadRequest},
 		{"state over the limit", url.Values{"state": {strings.Repeat("s", maxStateLength+1)}}, http.StatusBadRequest},
-		{"state at the limit", url.Values{"state": {strings.Repeat("s", maxStateLength)}}, http.StatusFound},
+		{"state at the limit", url.Values{"state": {strings.Repeat("s", maxStateLength)}}, http.StatusOK},
 		{"redirect_uri over the limit", url.Values{"redirect_uri": {"http://localhost:1/" + strings.Repeat("p", maxRedirectURILength)}}, http.StatusBadRequest},
 	}
 	for _, tc := range cases {
@@ -906,7 +1007,7 @@ func TestAuthorizeSessionDoesNotKeepRequest(t *testing.T) {
 	raw := req.URL.RawQuery
 	w := httptest.NewRecorder()
 	h.mux().ServeHTTP(w, req)
-	if w.Code != http.StatusFound {
+	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}
 
