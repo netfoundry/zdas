@@ -1,9 +1,11 @@
 package zdas
 
 import (
+	"html"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +19,53 @@ func browserRequest(prev *httptest.ResponseRecorder, target string) *http.Reques
 		req.AddCookie(c)
 	}
 	return req
+}
+
+// consentFieldRe and consentButtonRe find the consent page's form fields.
+var (
+	consentFieldRe  = regexp.MustCompile(`name="consent" value="([^"]*)"`)
+	consentButtonRe = regexp.MustCompile(`name="idp" value="([^"]*)"`)
+)
+
+// consent submits the consent page in page, a response from GET /authorize,
+// as the browser that got it would, choosing idp, or the page's only
+// provider when idp is empty. It returns the response, which redirects
+// upstream and sets the binding cookie /callback needs.
+func consent(t *testing.T, h http.Handler, page *httptest.ResponseRecorder, idp string) *httptest.ResponseRecorder {
+	t.Helper()
+	if page.Code != http.StatusOK {
+		t.Fatalf("authorize: status = %d, want the consent page; Location %q, body %s", page.Code, page.Header().Get("Location"), page.Body)
+	}
+	body := page.Body.String()
+	field := consentFieldRe.FindStringSubmatch(body)
+	if field == nil {
+		t.Fatalf("no consent field in page: %s", body)
+	}
+	if idp == "" {
+		buttons := consentButtonRe.FindAllStringSubmatch(body, -1)
+		if len(buttons) != 1 {
+			t.Fatalf("consent page offers %d providers, want 1", len(buttons))
+		}
+		idp = html.UnescapeString(buttons[0][1])
+	}
+	form := url.Values{"consent": {field[1]}, "idp": {idp}}
+	req := httptest.NewRequest(http.MethodPost, "/authorize", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for _, c := range page.Result().Cookies() {
+		req.AddCookie(c)
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	return w
+}
+
+// authorizeAndConsent runs GET /authorize for target and then consents, as
+// consent does.
+func authorizeAndConsent(t *testing.T, h http.Handler, target, idp string) *httptest.ResponseRecorder {
+	t.Helper()
+	page := httptest.NewRecorder()
+	h.ServeHTTP(page, httptest.NewRequest(http.MethodGet, target, nil))
+	return consent(t, h, page, idp)
 }
 
 // bindingHandlers returns a mux for a deployment mounted at externalURL with
@@ -45,8 +94,8 @@ func bindingHandlers(t *testing.T, externalURL string) http.Handler {
 	return newTestEndpoints(cfg, ks, reg, store, nil).mux()
 }
 
-// startAuthorize runs /authorize and returns its response and the session
-// ID it sent to the IdP.
+// startAuthorize runs /authorize and consents, and returns the consent
+// response and the session ID it sent to the IdP.
 func startAuthorize(t *testing.T, mux http.Handler) (*httptest.ResponseRecorder, string) {
 	t.Helper()
 	_, challenge := generateTestPKCE(t)
@@ -58,16 +107,27 @@ func startAuthorize(t *testing.T, mux http.Handler) (*httptest.ResponseRecorder,
 		"code_challenge_method": {"S256"},
 		"device_name":           {"laptop"},
 	}.Encode()
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, reqURL, nil))
-	if w.Code != http.StatusFound {
-		t.Fatalf("authorize: status = %d, body = %s", w.Code, w.Body.String())
+	w := authorizeAndConsent(t, mux, reqURL, "")
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("consent: status = %d, body = %s", w.Code, w.Body.String())
 	}
 	loc, err := url.Parse(w.Header().Get("Location"))
 	if err != nil {
 		t.Fatalf("parse Location: %v", err)
 	}
 	return w, loc.Query().Get("state")
+}
+
+// liveCookie returns the cookie w sets for session ID sessID.
+func liveCookie(t *testing.T, w *httptest.ResponseRecorder, sessID string) *http.Cookie {
+	t.Helper()
+	for _, c := range w.Result().Cookies() {
+		if c.Name == bindingCookieName(sessID) && c.MaxAge > 0 {
+			return c
+		}
+	}
+	t.Fatalf("no binding cookie for session %s", sessID)
+	return nil
 }
 
 func TestAuthorizeSetsBindingCookie(t *testing.T) {
@@ -83,11 +143,12 @@ func TestAuthorizeSetsBindingCookie(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.externalURL, func(t *testing.T) {
 			w, sessID := startAuthorize(t, bindingHandlers(t, tc.externalURL))
-			cookies := w.Result().Cookies()
-			if len(cookies) != 1 {
-				t.Fatalf("got %d cookies, want 1", len(cookies))
+			c := liveCookie(t, w, sessID)
+			for _, other := range w.Result().Cookies() {
+				if other.Name != c.Name && other.MaxAge >= 0 {
+					t.Errorf("cookie %s set as well as the session's", other.Name)
+				}
 			}
-			c := cookies[0]
 			if want := "zdas_bind_" + sessID[:8]; c.Name != want {
 				t.Errorf("Name = %q, want %q", c.Name, want)
 			}
@@ -136,11 +197,11 @@ func TestCallbackRequiresBindingCookie(t *testing.T) {
 				mux := bindingHandlers(t, "https://zdas.example.com")
 				started, sessID := startAuthorize(t, mux)
 				// An attacker can start their own flow and hold its cookie.
-				attacker, _ := startAuthorize(t, mux)
+				attacker, attackerID := startAuthorize(t, mux)
 
 				target := "/callback?" + query + "&state=" + sessID
 				req := httptest.NewRequest(http.MethodGet, target, nil)
-				if c := tc.cookie(sessID, attacker.Result().Cookies()[0]); c != nil {
+				if c := tc.cookie(sessID, liveCookie(t, attacker, attackerID)); c != nil {
 					req.AddCookie(c)
 				}
 				w := httptest.NewRecorder()

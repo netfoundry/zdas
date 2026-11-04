@@ -309,6 +309,16 @@ func TestRateLimiterEnabled(t *testing.T) {
 	if w.Code == http.StatusTooManyRequests {
 		t.Error("different IP should not be rate limited")
 	}
+
+	// The consent post draws on the same budget.
+	req = httptest.NewRequest(http.MethodPost, "/authorize", strings.NewReader("consent=x"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.RemoteAddr = "1.2.3.4:12345"
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("consent post over the limit: status = %d, want 429", w.Code)
+	}
 }
 
 func TestTrustedProxiesValidation(t *testing.T) {

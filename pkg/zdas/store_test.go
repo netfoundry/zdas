@@ -287,9 +287,8 @@ func TestStoreKeysAreHashedAndStamped(t *testing.T) {
 
 	reqURL := "/authorize?redirect_uri=http://localhost:20314/auth/callback&response_type=code&state=s1" +
 		"&code_challenge=" + challenge + "&code_challenge_method=S256&device_name=laptop"
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, reqURL, nil))
-	if w.Code != http.StatusFound {
+	w := authorizeAndConsent(t, mux, reqURL, "")
+	if w.Code != http.StatusSeeOther {
 		t.Fatalf("authorize: status = %d, body = %s", w.Code, w.Body.String())
 	}
 	loc, err := url.Parse(w.Header().Get("Location"))
@@ -297,7 +296,7 @@ func TestStoreKeysAreHashedAndStamped(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := loc.Query().Get("state")
-	nonce := w.Result().Cookies()[0].Value
+	nonce := liveCookie(t, w, state).Value
 
 	keys := store.keys()
 	want := hashStoreKey(kindSession, "https://zdas.example.com", state+"."+nonce)

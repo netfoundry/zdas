@@ -97,10 +97,9 @@ func TestIntegrationOIDCFlow(t *testing.T) {
 		"client_id":             {"ziti-enrolltocert"},
 	}.Encode()
 
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, authReq, nil))
+	w := authorizeAndConsent(t, mux, authReq, "")
 
-	if w.Code != http.StatusFound {
+	if w.Code != http.StatusSeeOther {
 		t.Fatalf("authorize: status = %d, body = %s", w.Code, w.Body.String())
 	}
 	upstreamRedirect, err := url.Parse(w.Header().Get("Location"))
@@ -282,9 +281,8 @@ func TestIntegrationGitHubFlow(t *testing.T) {
 		"client_id":             {"ziti-enrolltocert"},
 	}.Encode()
 
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, authReq, nil))
-	if w.Code != http.StatusFound {
+	w := authorizeAndConsent(t, mux, authReq, "")
+	if w.Code != http.StatusSeeOther {
 		t.Fatalf("authorize: status = %d", w.Code)
 	}
 	upstreamRedirect, _ := url.Parse(w.Header().Get("Location"))
@@ -420,9 +418,8 @@ func TestIntegrationFallbackFlow(t *testing.T) {
 		"client_id":             {"ziti-enrolltocert"},
 	}.Encode()
 
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, authReq, nil))
-	if w.Code != http.StatusFound {
+	w := authorizeAndConsent(t, mux, authReq, "")
+	if w.Code != http.StatusSeeOther {
 		t.Fatalf("authorize: status = %d, body = %s", w.Code, w.Body.String())
 	}
 	upstreamRedirect, _ := url.Parse(w.Header().Get("Location"))
@@ -539,8 +536,8 @@ func newReplica(t *testing.T, cfg Config, opts ...Option) (*Server, http.Handler
 	return srv, srv.handlers.mux()
 }
 
-// enrollAcross runs /authorize on start, /callback on callback, and /token on
-// token, and returns the minted JWT.
+// enrollAcross runs GET /authorize on start, the consent post and /callback
+// on callback, and /token on token, and returns the minted JWT.
 func enrollAcross(t *testing.T, start, callback, token http.Handler) string {
 	t.Helper()
 	verifier, challenge := generateTestPKCE(t)
@@ -552,9 +549,10 @@ func enrollAcross(t *testing.T, start, callback, token http.Handler) string {
 		"code_challenge_method": {"S256"},
 		"device_name":           {"laptop"},
 	}.Encode()
-	w := httptest.NewRecorder()
-	start.ServeHTTP(w, httptest.NewRequest(http.MethodGet, authReq, nil))
-	if w.Code != http.StatusFound {
+	page := httptest.NewRecorder()
+	start.ServeHTTP(page, httptest.NewRequest(http.MethodGet, authReq, nil))
+	w := consent(t, callback, page, "")
+	if w.Code != http.StatusSeeOther {
 		t.Fatalf("authorize: status = %d, body = %s", w.Code, w.Body.String())
 	}
 	upstream, err := url.Parse(w.Header().Get("Location"))
@@ -679,14 +677,13 @@ func TestIntegrationProvisionCompleteAcrossReplicas(t *testing.T) {
 
 	verifier, challenge := generateTestPKCE(t)
 	redirectURI := "http://localhost:20314/auth/callback"
-	w := httptest.NewRecorder()
-	a.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/authorize?"+url.Values{
+	w := authorizeAndConsent(t, a, "/authorize?"+url.Values{
 		"redirect_uri":          {redirectURI},
 		"state":                 {"tstate"},
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
 		"device_name":           {"laptop"},
-	}.Encode(), nil))
+	}.Encode(), "")
 	upstream, err := url.Parse(w.Header().Get("Location"))
 	if err != nil {
 		t.Fatalf("parse upstream redirect: %v", err)

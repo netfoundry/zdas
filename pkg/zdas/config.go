@@ -42,20 +42,26 @@ type Config struct {
 	Token       TokenConfig      `yaml:"token"`
 	Session     SessionConfig    `yaml:"session"`
 
-	// IDPSelectorURL, when set, replaces ZDAS's built-in HTML IdP picker.
-	// When ZDAS would otherwise render its own picker (multiple providers
+	// IDPSelectorURL, when set, replaces ZDAS's built-in IdP picker. When
+	// ZDAS would otherwise show its own picker (multiple providers
 	// registered, no idp query param on /authorize), it 302-redirects to
-	// this URL with the original /authorize query string preserved plus
-	// an additional `providers` parameter containing a comma-separated
-	// list of available IdP names.
+	// this URL with the original /authorize query string plus two
+	// parameters: `providers`, a comma-separated list of IdP names, and
+	// `consent`, an opaque value.
 	//
-	// The embedding application is expected to render a branded picker
-	// page and direct the user back to <ExternalURL>/authorize with the
-	// original query string and an `idp=<name>` parameter selecting one
-	// of the listed providers. The redirect target must be on a host the
-	// embedding application controls; ZDAS does not validate or sanitize
-	// the URL beyond requiring it to be set at startup. Operators must
-	// not allow user input to influence this field.
+	// The picker is where the user consents to the sign-in, so it must
+	// show what is being signed in to, must not be frameable, and must
+	// continue only on the user's click: a form that POSTs `consent` and
+	// `idp=<name>` to <ExternalURL>/authorize. ZDAS accepts the post only
+	// with the cookie it set in the same browser, which a SameSite=Lax
+	// cookie carries only if the picker is on the same site as ZDAS. A
+	// picker that instead links back to /authorize with `idp=<name>` added
+	// still works, but the user then confirms again on ZDAS's own page.
+	//
+	// The redirect target must be on a host the embedding application
+	// controls; ZDAS does not validate or sanitize the URL beyond requiring
+	// it to be set at startup. Operators must not allow user input to
+	// influence this field.
 	IDPSelectorURL string `yaml:"idp_selector_url"`
 
 	// AllowedRedirectURIs restricts which redirect_uri values the /authorize
@@ -74,7 +80,8 @@ type Config struct {
 }
 
 // RateLimitConfig controls per-client rate limiting on the /authorize
-// endpoint. When AuthorizePerSecond is zero (the default), rate limiting is
+// endpoint, GET and POST alike, so a sign-in takes two requests from the
+// budget. When AuthorizePerSecond is zero (the default), rate limiting is
 // disabled.
 //
 // A client is the peer address of the connection: an IPv4 address, or an

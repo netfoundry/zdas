@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -48,6 +49,10 @@ type signerDiscovery struct {
 
 	pollMu sync.Mutex               // serializes polls
 	built  map[string]builtProvider // by name, from the last poll; guarded by pollMu
+
+	// selfToToken is whether ZDAS's own signer allows enroll-to-token, as
+	// of the last poll.
+	selfToToken atomic.Bool
 
 	mu                sync.Mutex
 	cancel            context.CancelFunc
@@ -187,6 +192,13 @@ func (d *signerDiscovery) poll(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	selfToToken := false
+	for _, s := range signers {
+		if d.isSelf(s) && s.EnrollToTokenEnabled {
+			selfToToken = true
+		}
+	}
+	d.selfToToken.Store(selfToToken)
 
 	// Fetch network JWTs alongside signers. Failure is non-fatal - keep
 	// the stale cache and log a warning.
@@ -230,6 +242,12 @@ func (d *signerDiscovery) poll(ctx context.Context) error {
 		return fmt.Errorf("update provider registry: %w", err)
 	}
 	return nil
+}
+
+// selfAllowsTokenEnrollment reports whether, as of the last poll, ZDAS's own
+// signer on the controller allows enroll-to-token.
+func (d *signerDiscovery) selfAllowsTokenEnrollment() bool {
+	return d.selfToToken.Load()
 }
 
 // usableSigners returns the signers to build providers for: those with

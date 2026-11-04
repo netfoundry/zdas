@@ -693,3 +693,39 @@ func TestControllerRoot(t *testing.T) {
 		}
 	}
 }
+
+// TestDiscoverySelfAllowsTokenEnrollment verifies that each poll records
+// whether ZDAS's own signer allows enroll-to-token.
+func TestDiscoverySelfAllowsTokenEnrollment(t *testing.T) {
+	const self = "https://zdas.example.com"
+	signers := []signerEntry{
+		{Name: "zdas", ExternalAuthURL: self, ClientID: "c", EnrollToCertEnabled: true, EnrollToTokenEnabled: true},
+		{Name: "other", ExternalAuthURL: "http://127.0.0.1:1", ClientID: "c", EnrollToTokenEnabled: true},
+	}
+	var mu sync.Mutex
+	ctrl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		json.NewEncoder(w).Encode(signerResponse{Data: signers})
+	}))
+	t.Cleanup(ctrl.Close)
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL, SelfIssuer: self}, http.DefaultClient, nil, NewProviderRegistry(), nil, slog.Default())
+	d.setupTimeout = 100 * time.Millisecond
+
+	if err := d.poll(t.Context()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if !d.selfAllowsTokenEnrollment() {
+		t.Error("self signer with enroll-to-token not detected")
+	}
+
+	mu.Lock()
+	signers[0].EnrollToTokenEnabled = false
+	mu.Unlock()
+	if err := d.poll(t.Context()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if d.selfAllowsTokenEnrollment() {
+		t.Error("cert-only self signer reported as allowing enroll-to-token; another signer's setting leaked in")
+	}
+}
