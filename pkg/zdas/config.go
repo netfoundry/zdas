@@ -64,25 +64,40 @@ type Config struct {
 	// influence this field.
 	IDPSelectorURL string `yaml:"idp_selector_url"`
 
+	// LegacyCallback sends every IdP ZDAS's old shared callback,
+	// <ExternalURL>/callback, instead of one per provider,
+	// <ExternalURL>/callback/<provider name>. Each IdP accepts only the
+	// callback URLs registered for its client, so set this until every
+	// registration has the per-provider URL. Deprecated: a shared callback
+	// lets one IdP get a code meant for another (RFC 9700 section 4.4),
+	// and this setting will be removed.
+	LegacyCallback bool `yaml:"legacy_callback"`
+
 	// AllowedRedirectURIs restricts which redirect_uri values the /authorize
 	// endpoint will accept. When empty (the default), only loopback
 	// callbacks are accepted: http or https to "localhost" or a loopback IP
 	// literal, on any port. Tunnelers always use one, so most deployments
 	// should leave this unset.
 	//
-	// When set, it replaces the loopback default. A redirect_uri matches an
-	// entry when the parsed scheme, host and port are equal, and the path
-	// too if the entry has one. An entry for a loopback host with no port,
-	// such as "http://localhost", matches any port. Entries are URLs, not
+	// When set, it replaces the loopback default. Entries are URLs, not
 	// string prefixes, and a redirect_uri with userinfo never matches.
+	//   - An entry for a host other than loopback must give the callback's
+	//     full path, and a redirect_uri matches it only exactly: the same
+	//     scheme, host, port and path, and the same query if the entry has
+	//     one. Validate rejects such an entry without a path.
+	//   - A loopback entry, such as "http://localhost", matches any port
+	//     when it has none, and any path when it has none.
 	AllowedRedirectURIs []string        `yaml:"allowed_redirect_uris"`
 	RateLimit           RateLimitConfig `yaml:"rate_limit"`
 }
 
-// RateLimitConfig controls per-client rate limiting on the /authorize
-// endpoint, GET and POST alike, so a sign-in takes two requests from the
-// budget. When AuthorizePerSecond is zero (the default), rate limiting is
-// disabled.
+// RateLimitConfig controls rate limiting on the /authorize endpoint. The
+// per-client limit applies to GET and POST alike, so a sign-in takes two
+// requests from it. The global limit applies only to GET, the request that
+// stores a session, across all clients together. A zero rate turns that
+// limit off. The zero Config has no limits; LoadConfig, which the zdas
+// binary uses, starts from 2 per second with a burst of 10 per client, and 5
+// per second with a burst of 500 in all.
 //
 // A client is the peer address of the connection: an IPv4 address, or an
 // IPv6 /64. Behind a reverse proxy, list the proxy in TrustedProxies so that
@@ -94,6 +109,24 @@ type RateLimitConfig struct {
 	AuthorizePerSecond float64  `yaml:"authorize_per_second"` // sustained rate per client; 0 = disabled
 	AuthorizeBurst     int      `yaml:"authorize_burst"`      // peak burst per client
 	TrustedProxies     []string `yaml:"trusted_proxies"`      // IP addresses or CIDR prefixes
+
+	// GlobalPerSecond and GlobalBurst cap GET /authorize for all clients
+	// together, so that a flood from many addresses gets 429s rather than
+	// filling the session store. The built-in store holds 10,000 sessions
+	// and evicts the oldest beyond that, so keep GlobalPerSecond times
+	// session.timeout in seconds, plus GlobalBurst, under 10,000.
+	GlobalPerSecond float64 `yaml:"global_per_second"` // sustained rate, all clients; 0 = disabled
+	GlobalBurst     int     `yaml:"global_burst"`      // peak burst, all clients
+}
+
+// defaultRateLimit is the rate limiting LoadConfig starts from. With the
+// default 10-minute session timeout, the global limit stores at most
+// 5*600+500 = 3,500 sessions from GET /authorize at a time.
+var defaultRateLimit = RateLimitConfig{
+	AuthorizePerSecond: 2,
+	AuthorizeBurst:     10,
+	GlobalPerSecond:    5,
+	GlobalBurst:        500,
 }
 
 // TLSConfig selects and configures the TLS serving mode.
@@ -148,11 +181,27 @@ type ProviderConfig struct {
 	// RequireUserInfo makes a failed userinfo fetch fail the login. Requires
 	// FetchUserInfo.
 	RequireUserInfo bool `yaml:"require_userinfo"`
+	// AllowedEmailDomains and RequiredClaims restrict who may sign in; see
+	// OIDCProviderConfig.
+	AllowedEmailDomains []string            `yaml:"allowed_email_domains"`
+	RequiredClaims      map[string][]string `yaml:"required_claims"`
 
 	// GitHub-specific fields.
 	UsernameField string   `yaml:"username_field"`
 	UserIDField   string   `yaml:"user_id_field"`
 	AllowedOrgs   []string `yaml:"allowed_orgs"`
+
+	// AllowAnyUser acknowledges that the provider has no policy: anyone
+	// who can sign in to it may enroll, which for GitHub or a public OIDC
+	// IdP such as Google is anyone at all. Validate requires either a
+	// policy (allowed_orgs for GitHub; allowed_email_domains or
+	// required_claims for OIDC) or this.
+	AllowAnyUser bool `yaml:"allow_any_user"`
+}
+
+// hasPolicy reports whether p restricts who may sign in.
+func (p ProviderConfig) hasPolicy() bool {
+	return len(p.AllowedOrgs) > 0 || len(p.AllowedEmailDomains) > 0 || len(p.RequiredClaims) > 0
 }
 
 // ClaimsConfig controls how the ZDAS JWT claims are composed.
@@ -179,7 +228,7 @@ type SessionConfig struct {
 // LoadConfig reads a YAML config file (if path is non-empty), applies environment
 // variable overrides, fills in defaults, and validates the result.
 func LoadConfig(path string) (*Config, error) {
-	cfg := &Config{}
+	cfg := &Config{RateLimit: defaultRateLimit}
 	if path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -311,6 +360,9 @@ func (c *Config) Validate() error {
 			if p.ClientID == "" || p.ClientSecret == "" {
 				return fmt.Errorf("providers[%d] (%s): client_id and client_secret are required for github", i, p.Name)
 			}
+			if len(p.AllowedEmailDomains) > 0 || len(p.RequiredClaims) > 0 {
+				return fmt.Errorf("providers[%d] (%s): allowed_email_domains and required_claims are for oidc; use allowed_orgs for github", i, p.Name)
+			}
 		case ProviderTypeOIDC:
 			if p.ClientID == "" || p.OIDCIssuerURL == "" {
 				return fmt.Errorf("providers[%d] (%s): client_id and oidc_issuer_url are required for oidc", i, p.Name)
@@ -318,10 +370,24 @@ func (c *Config) Validate() error {
 			if p.RequireUserInfo && !p.FetchUserInfo {
 				return fmt.Errorf("providers[%d] (%s): require_userinfo needs fetch_userinfo", i, p.Name)
 			}
+			if len(p.AllowedOrgs) > 0 {
+				return fmt.Errorf("providers[%d] (%s): allowed_orgs is for github; use allowed_email_domains or required_claims for oidc", i, p.Name)
+			}
+			for claim, values := range p.RequiredClaims {
+				if len(values) == 0 {
+					return fmt.Errorf("providers[%d] (%s): required_claims.%s lists no values", i, p.Name, claim)
+				}
+			}
 		case "":
 			return fmt.Errorf("providers[%d] (%s): type is required", i, p.Name)
 		default:
 			return fmt.Errorf("providers[%d] (%s): unknown type %q", i, p.Name, p.Type)
+		}
+		switch {
+		case !p.hasPolicy() && !p.AllowAnyUser:
+			return fmt.Errorf("providers[%d] (%s): anyone who can sign in to this provider could enroll; restrict it (allowed_orgs for github, allowed_email_domains or required_claims for oidc) or set allow_any_user: true", i, p.Name)
+		case p.hasPolicy() && p.AllowAnyUser:
+			return fmt.Errorf("providers[%d] (%s): allow_any_user conflicts with the provider's restrictions", i, p.Name)
 		}
 	}
 	if !strings.Contains(c.Claims.NameTemplate, "{username}") || !strings.Contains(c.Claims.NameTemplate, "{device_name}") {
@@ -340,7 +406,11 @@ func (c *Config) Validate() error {
 		}
 	}
 	for i, raw := range c.AllowedRedirectURIs {
-		if _, err := parseRedirectURI(raw); err != nil {
+		u, err := parseRedirectURI(raw)
+		if err == nil && u.Path == "" && !isLoopbackHost(u.Hostname()) {
+			err = errors.New("an entry for a host other than loopback needs the callback's full path, which it must match exactly")
+		}
+		if err != nil {
 			return fmt.Errorf("allowed_redirect_uris[%d] %q: %w", i, raw, err)
 		}
 	}

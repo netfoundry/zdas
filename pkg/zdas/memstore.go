@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -16,6 +17,8 @@ const (
 	// storeSweepInterval is how often the in-memory store drops expired
 	// entries.
 	storeSweepInterval = 30 * time.Second
+	// evictionLogInterval is the least time between eviction warnings.
+	evictionLogInterval = time.Minute
 )
 
 // memStore is the in-memory Store NewServer uses when no WithStore is given.
@@ -33,6 +36,9 @@ type memStore struct {
 
 	done     chan struct{}
 	stopOnce sync.Once
+
+	logger      *slog.Logger // warns of evictions; nil logs nothing
+	lastEvicted time.Time    // when an eviction was last logged; guarded by mu
 }
 
 // newMemStore returns a memStore that sweeps out sessions and pending
@@ -65,6 +71,11 @@ func (s *memStore) CreateSession(_ context.Context, key string, sess *AuthSessio
 	defer s.mu.Unlock()
 	if s.sessions.len() >= maxStoreEntries {
 		s.sessions.removeOldest()
+		if now := time.Now(); s.logger != nil && now.Sub(s.lastEvicted) >= evictionLogInterval {
+			s.lastEvicted = now
+			s.logger.Warn("session store full, dropping the oldest sign-ins; tighten rate_limit, global_per_second especially",
+				"max_sessions", maxStoreEntries)
+		}
 	}
 	s.sessions.add(key, sess, sess.CreatedAt)
 	return nil

@@ -54,6 +54,8 @@ func TestRedirectAllowedLoopbackDefault(t *testing.T) {
 func TestRedirectAllowedAllowList(t *testing.T) {
 	allowList := []string{
 		"https://app.example.com/cb",
+		"https://root.example.com/",
+		"https://q.example.com/cb?tenant=a",
 		"http://localhost",
 		"http://127.0.0.1:20314",
 	}
@@ -66,6 +68,12 @@ func TestRedirectAllowedAllowList(t *testing.T) {
 		{"https://app.example.com/cb?x=1", true},
 		{"https://app.example.com/other", false},
 		{"https://app.example.com/cb/more", false},
+		{"https://app.example.com/cb/", false},
+		{"https://root.example.com/", true},
+		{"https://root.example.com/any", false},
+		{"https://q.example.com/cb?tenant=a", true},
+		{"https://q.example.com/cb?tenant=b", false},
+		{"https://q.example.com/cb", false},
 		{"https://app.example.com:8443/cb", false},
 		{"http://app.example.com/cb", false},
 		{"https://app.example.com.evil.example/cb", false},
@@ -106,6 +114,9 @@ func TestValidateAllowedRedirectURIs(t *testing.T) {
 		wantErr bool
 	}{
 		{"https://app.example.com/cb", false},
+		{"https://app.example.com/", false},
+		{"https://app.example.com", true},
+		{"https://app.example.com:8443", true},
 		{"http://localhost:", false},
 		{"http://[::1]", false},
 		{"app.example.com", true},

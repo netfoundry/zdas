@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -30,11 +32,14 @@ type OIDCProvider struct {
 	authURL         string
 	tokenURL        string
 	audience        string
+	sendsIss        bool // the issuer adds iss to authorization responses (RFC 9207)
 	provider        *oidc.Provider
 	verifier        *oidc.IDTokenVerifier
 	scopes          []string
 	fetchUserInfo   bool
 	requireUserInfo bool
+	emailDomains    []string
+	requiredClaims  map[string][]string
 	client          *http.Client // makes the token exchange and userinfo requests
 	logger          *slog.Logger
 }
@@ -79,6 +84,21 @@ type OIDCProviderConfig struct {
 	// set.
 	RequireUserInfo bool
 
+	// AllowedEmailDomains, when set, admits only users whose verified
+	// email address (see UpstreamIdentity.Email) is in one of these
+	// domains, compared without regard to case. A user without a verified
+	// address is refused.
+	AllowedEmailDomains []string
+
+	// RequiredClaims, when set, admits only users whose claims include, for
+	// each name, one of the listed values. A claim that is a list, such as
+	// groups, matches when any element does. Strings, booleans ("true",
+	// "false") and numbers are compared as text. Claims come from the ID
+	// token, plus userinfo when FetchUserInfo is set.
+	//
+	// A refused user gets an error wrapping ErrAccessDenied.
+	RequiredClaims map[string][]string
+
 	// HTTPClient, when set, makes every request to the issuer: discovery,
 	// the signing keys, the token exchange and userinfo. An embedder whose
 	// issuers are chosen by someone it does not fully trust uses it to
@@ -109,6 +129,13 @@ func NewOIDCProvider(ctx context.Context, cfg OIDCProviderConfig) (*OIDCProvider
 	}
 	provider, err := oidc.NewProvider(ctx, cfg.Issuer)
 	if err != nil {
+		return nil, fmt.Errorf("oidc discovery for %q: %w", cfg.Issuer, err)
+	}
+
+	var meta struct {
+		SendsIss bool `json:"authorization_response_iss_parameter_supported"`
+	}
+	if err := provider.Claims(&meta); err != nil {
 		return nil, fmt.Errorf("oidc discovery for %q: %w", cfg.Issuer, err)
 	}
 
@@ -149,11 +176,14 @@ func NewOIDCProvider(ctx context.Context, cfg OIDCProviderConfig) (*OIDCProvider
 		authURL:         authURL,
 		tokenURL:        tokenURL,
 		audience:        cfg.Audience,
+		sendsIss:        meta.SendsIss,
 		provider:        provider,
 		verifier:        verifier,
 		scopes:          scopes,
 		fetchUserInfo:   fetchUserInfo,
 		requireUserInfo: cfg.RequireUserInfo,
+		emailDomains:    cfg.AllowedEmailDomains,
+		requiredClaims:  cfg.RequiredClaims,
 		client:          client,
 		logger:          logger,
 	}, nil
@@ -164,6 +194,19 @@ func (p *OIDCProvider) Name() string { return p.name }
 
 // Issuer returns the issuer URL the provider was configured with.
 func (p *OIDCProvider) Issuer() string { return p.issuer }
+
+// checkResponseIssuer returns an error if iss, the iss parameter of an
+// authorization response, shows it came from another issuer (RFC 9207). iss
+// must be present when the issuer says it sends it.
+func (p *OIDCProvider) checkResponseIssuer(iss string) error {
+	if iss == "" && !p.sendsIss {
+		return nil
+	}
+	if iss != p.issuer {
+		return fmt.Errorf("authorization response from issuer %q, want %q", iss, p.issuer)
+	}
+	return nil
+}
 
 // AuthorizeURL builds the upstream OIDC authorization URL, without PKCE.
 func (p *OIDCProvider) AuthorizeURL(state, redirectURI string) string {
@@ -292,6 +335,10 @@ func (p *OIDCProvider) exchangeAndIdentify(ctx context.Context, code, redirectUR
 		}
 	}
 
+	if err := p.checkPolicy(email, raw); err != nil {
+		return nil, err
+	}
+
 	return &UpstreamIdentity{
 		Subject:  claims.Sub,
 		Email:    email,
@@ -299,6 +346,46 @@ func (p *OIDCProvider) exchangeAndIdentify(ctx context.Context, code, redirectUR
 		Issuer:   p.issuer,
 		Raw:      raw,
 	}, nil
+}
+
+// checkPolicy returns an error wrapping ErrAccessDenied unless the user with
+// verified email address email and claims raw passes AllowedEmailDomains and
+// RequiredClaims.
+func (p *OIDCProvider) checkPolicy(email string, raw map[string]any) error {
+	if len(p.emailDomains) > 0 {
+		_, domain, ok := strings.Cut(email, "@")
+		if !ok || !slices.ContainsFunc(p.emailDomains, func(d string) bool { return strings.EqualFold(d, domain) }) {
+			return fmt.Errorf("%w: no verified email address in an allowed domain", ErrAccessDenied)
+		}
+	}
+	for name, allowed := range p.requiredClaims {
+		if !slices.ContainsFunc(claimValues(raw[name]), func(v string) bool { return slices.Contains(allowed, v) }) {
+			return fmt.Errorf("%w: claim %s has none of the required values", ErrAccessDenied, name)
+		}
+	}
+	return nil
+}
+
+// claimValues returns claim as text, one entry per element if it is a list.
+// Values of other types, such as objects, give nothing.
+func claimValues(claim any) []string {
+	switch v := claim.(type) {
+	case string:
+		return []string{v}
+	case bool:
+		return []string{strconv.FormatBool(v)}
+	case float64:
+		return []string{strconv.FormatFloat(v, 'f', -1, 64)}
+	case []any:
+		var out []string
+		for _, e := range v {
+			if _, nested := e.([]any); !nested {
+				out = append(out, claimValues(e)...)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // mergeUserInfo fetches the userinfo endpoint with accessToken and adds any

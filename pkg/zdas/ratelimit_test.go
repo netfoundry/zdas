@@ -339,3 +339,67 @@ func TestTrustedProxiesValidation(t *testing.T) {
 		t.Errorf("trusted = %v, want [10.0.0.0/8]", rl.trusted)
 	}
 }
+
+// TestGlobalRateLimit verifies that the global limit refuses GET /authorize
+// from any address once its burst is spent, and leaves the consent post to
+// the per-client limit.
+func TestGlobalRateLimit(t *testing.T) {
+	ks, _ := GenerateKeySet()
+	reg := NewProviderRegistry()
+	_ = reg.Register(&stubProvider{name: "test-idp", issuer: "https://test-idp"})
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
+	cfg := Config{
+		ExternalURL: "https://zdas.example.com",
+		Claims:      defaultClaimsConfig(),
+		Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
+		RateLimit:   RateLimitConfig{GlobalPerSecond: 0.001, GlobalBurst: 2},
+	}
+	mux := newTestEndpoints(cfg, ks, reg, store, nil).mux()
+
+	get := func(addr string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, authorizeURL(t, nil), nil)
+		req.RemoteAddr = addr
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w
+	}
+	first := get("1.1.1.1:1")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first request: %d", first.Code)
+	}
+	if w := get("2.2.2.2:1"); w.Code != http.StatusOK {
+		t.Fatalf("second request: %d", w.Code)
+	}
+	if w := get("3.3.3.3:1"); w.Code != http.StatusTooManyRequests {
+		t.Errorf("third request from a new address: %d, want 429", w.Code)
+	}
+	if w := consent(t, mux, first, ""); w.Code != http.StatusSeeOther {
+		t.Errorf("consent post after the global limit: %d, want 303", w.Code)
+	}
+}
+
+// TestLoadConfigRateLimitDefaults verifies that LoadConfig turns rate
+// limiting on unless the file turns it off, and that the zero Config has
+// none.
+func TestLoadConfigRateLimitDefaults(t *testing.T) {
+	cfg, err := LoadConfig(writeTempConfig(t, minimalYAML))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.RateLimit.AuthorizePerSecond != 2 || cfg.RateLimit.AuthorizeBurst != 10 || cfg.RateLimit.GlobalPerSecond != 5 || cfg.RateLimit.GlobalBurst != 500 {
+		t.Errorf("default rate limit = %+v", cfg.RateLimit)
+	}
+	cfg, err = LoadConfig(writeTempConfig(t, minimalYAML+"rate_limit:\n  authorize_per_second: 0\n  trusted_proxies: [10.0.0.0/8]\n"))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.RateLimit.AuthorizePerSecond != 0 || cfg.RateLimit.GlobalPerSecond != 5 {
+		t.Errorf("rate limit with per-client turned off = %+v, want global still on", cfg.RateLimit)
+	}
+	var zero Config
+	zero.ApplyDefaults()
+	if zero.RateLimit.AuthorizePerSecond != 0 || zero.RateLimit.GlobalPerSecond != 0 {
+		t.Errorf("ApplyDefaults turned rate limiting on: %+v", zero.RateLimit)
+	}
+}

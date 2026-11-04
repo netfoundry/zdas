@@ -588,3 +588,105 @@ func TestOIDCProviderRejectsMissingSub(t *testing.T) {
 		t.Errorf("accepted an id_token without sub, subject %q", id.Subject)
 	}
 }
+
+// TestOIDCProviderPolicy verifies that AllowedEmailDomains and
+// RequiredClaims refuse users with ErrAccessDenied, through a real token
+// exchange.
+func TestOIDCProviderPolicy(t *testing.T) {
+	claims := map[string]any{
+		"sub":            "user-42",
+		"email":          "jsmith@Example.com",
+		"email_verified": true,
+		"groups":         []any{"staff", "ziti-users"},
+		"tenant":         "acme",
+		"mfa":            true,
+		"level":          float64(3),
+		"profile":        map[string]any{"team": "a"},
+		"roles":          []any{[]any{"admin"}},
+	}
+	unverified := map[string]any{"sub": "user-43", "email": "x@example.com", "email_verified": false}
+	cases := []struct {
+		name    string
+		claims  map[string]any
+		domains []string
+		require map[string][]string
+		allowed bool
+	}{
+		{"domain matches ignoring case", claims, []string{"example.COM"}, nil, true},
+		{"other domain", claims, []string{"example.org"}, nil, false},
+		{"parent domain is not enough", map[string]any{"sub": "u", "email": "a@sub.example.com", "email_verified": true}, []string{"example.com"}, nil, false},
+		{"unverified email", unverified, []string{"example.com"}, nil, false},
+		{"group in list", claims, nil, map[string][]string{"groups": {"admins", "ziti-users"}}, true},
+		{"group not in list", claims, nil, map[string][]string{"groups": {"admins"}}, false},
+		{"string claim", claims, nil, map[string][]string{"tenant": {"acme"}}, true},
+		{"bool claim", claims, nil, map[string][]string{"mfa": {"true"}}, true},
+		{"number claim", claims, nil, map[string][]string{"level": {"3"}}, true},
+		{"missing claim", claims, nil, map[string][]string{"dept": {"eng"}}, false},
+		{"object claim", claims, nil, map[string][]string{"profile": {"a"}}, false},
+		{"nested list claim", claims, nil, map[string][]string{"roles": {"admin"}}, false},
+		{"every claim must match", claims, nil, map[string][]string{"tenant": {"acme"}, "mfa": {"false"}}, false},
+		{"domain and claims", claims, []string{"example.com"}, map[string][]string{"tenant": {"acme"}}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server, _ := mockOIDCServer(t, tc.claims)
+			p, err := NewOIDCProvider(t.Context(), OIDCProviderConfig{
+				Name: "idp", Issuer: server.URL, ClientID: "test-client",
+				AllowedEmailDomains: tc.domains, RequiredClaims: tc.require,
+			})
+			if err != nil {
+				t.Fatalf("NewOIDCProvider: %v", err)
+			}
+			_, err = p.ExchangeAndIdentify(t.Context(), "code", server.URL+"/callback")
+			if tc.allowed && err != nil {
+				t.Errorf("refused: %v", err)
+			}
+			if !tc.allowed && !errors.Is(err, ErrAccessDenied) {
+				t.Errorf("err = %v, want ErrAccessDenied", err)
+			}
+		})
+	}
+}
+
+func TestOIDCProviderCheckResponseIssuer(t *testing.T) {
+	cases := []struct {
+		sendsIss bool
+		iss      string
+		ok       bool
+	}{
+		{false, "", true},
+		{false, "https://idp", true},
+		{false, "https://evil", false},
+		{true, "https://idp", true},
+		{true, "", false},
+		{true, "https://idp/", false},
+	}
+	for _, tc := range cases {
+		p := &OIDCProvider{issuer: "https://idp", sendsIss: tc.sendsIss}
+		if err := p.checkResponseIssuer(tc.iss); (err == nil) != tc.ok {
+			t.Errorf("sendsIss=%v iss=%q: err = %v, want ok=%v", tc.sendsIss, tc.iss, err, tc.ok)
+		}
+	}
+}
+
+// TestOIDCProviderReadsIssParameterSupport verifies that NewOIDCProvider
+// reads authorization_response_iss_parameter_supported from discovery.
+func TestOIDCProviderReadsIssParameterSupport(t *testing.T) {
+	for _, supported := range []bool{false, true} {
+		var srv *httptest.Server
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(map[string]any{
+				"issuer": srv.URL, "authorization_endpoint": srv.URL + "/authorize", "token_endpoint": srv.URL + "/token",
+				"jwks_uri": srv.URL + "/jwks", "authorization_response_iss_parameter_supported": supported,
+			})
+		}))
+		p, err := NewOIDCProvider(t.Context(), OIDCProviderConfig{Name: "idp", Issuer: srv.URL, ClientID: "c"})
+		srv.Close()
+		if err != nil {
+			t.Fatalf("NewOIDCProvider: %v", err)
+		}
+		if p.sendsIss != supported {
+			t.Errorf("sendsIss = %v, want %v", p.sendsIss, supported)
+		}
+	}
+}

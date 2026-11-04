@@ -1,7 +1,10 @@
 package zdas
 
 import (
+	"bytes"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -118,5 +121,22 @@ func TestRandomIDUniqueness(t *testing.T) {
 			t.Fatalf("duplicate id after %d iterations", i)
 		}
 		seen[id] = struct{}{}
+	}
+}
+
+// TestMemStoreLogsEviction verifies that a full store warns when it starts
+// evicting sessions, at most once a minute.
+func TestMemStoreLogsEviction(t *testing.T) {
+	s := newMemStore(time.Hour, time.Minute, time.Hour)
+	t.Cleanup(s.stop)
+	var buf bytes.Buffer
+	s.logger = slog.New(slog.NewTextHandler(&buf, nil))
+	for i := range maxStoreEntries + 3 {
+		if err := s.CreateSession(t.Context(), fmt.Sprint(i), &AuthSession{CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := strings.Count(buf.String(), "session store full"); n != 1 {
+		t.Errorf("eviction warnings = %d, want 1: %s", n, buf.String())
 	}
 }

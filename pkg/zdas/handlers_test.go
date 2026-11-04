@@ -734,14 +734,17 @@ type callbackProvider struct {
 	issuer   string
 	identity *UpstreamIdentity
 	err      error // returned by ExchangeAndIdentify when set
+
+	exchangedWith string // the redirect URI ExchangeAndIdentify last got
 }
 
 func (p *callbackProvider) Name() string   { return p.name }
 func (p *callbackProvider) Issuer() string { return p.issuer }
 func (p *callbackProvider) AuthorizeURL(state, redirectURI string) string {
-	return "https://idp/authorize?state=" + state
+	return "https://idp/authorize?" + url.Values{"state": {state}, "redirect_uri": {redirectURI}}.Encode()
 }
 func (p *callbackProvider) ExchangeAndIdentify(_ context.Context, code, redirectURI string) (*UpstreamIdentity, error) {
+	p.exchangedWith = redirectURI
 	if p.err != nil {
 		return nil, p.err
 	}
@@ -1048,5 +1051,96 @@ func TestTokenRejectsOversizedBody(t *testing.T) {
 	h.mux().ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest || tokenErrorCode(t, w) != "invalid_request" {
 		t.Errorf("status = %d, body = %s; want 400 invalid_request", w.Code, w.Body.String())
+	}
+}
+
+// TestCallbackMustMatchProvider verifies that each provider gets its own
+// callback URL, used for the token exchange too, and that a response at
+// another provider's callback, or the shared one, is refused (an IdP
+// mix-up). With LegacyCallback it is the other way round.
+func TestCallbackMustMatchProvider(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%v", legacy), func(t *testing.T) {
+			ks, _ := GenerateKeySet()
+			reg := NewProviderRegistry()
+			providers := map[string]*callbackProvider{}
+			for _, name := range []string{"honest", "evil"} {
+				providers[name] = &callbackProvider{name: name, issuer: "https://" + name, identity: &UpstreamIdentity{Subject: "u1", Username: "jsmith", Issuer: "https://" + name}}
+				_ = reg.Register(providers[name])
+			}
+			store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+			t.Cleanup(store.stop)
+			cfg := Config{
+				ExternalURL:    "https://zdas.example.com",
+				LegacyCallback: legacy,
+				Claims:         defaultClaimsConfig(),
+				Token:          TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
+			}
+			mux := newTestEndpoints(cfg, ks, reg, store, nil).mux()
+
+			own, other := "https://zdas.example.com/callback/evil", "https://zdas.example.com/callback"
+			if legacy {
+				own, other = other, "https://zdas.example.com/callback/honest"
+			}
+			for _, tc := range []struct {
+				callback string
+				ok       bool
+			}{{other, false}, {"https://zdas.example.com/callback/honest", false}, {own, true}} {
+				started := authorizeAndConsent(t, mux, authorizeURL(t, nil), "evil")
+				loc, _ := url.Parse(started.Header().Get("Location"))
+				if got := loc.Query().Get("redirect_uri"); got != own {
+					t.Fatalf("redirect_uri sent upstream = %q, want %q", got, own)
+				}
+				path := strings.TrimPrefix(tc.callback, "https://zdas.example.com")
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, browserRequest(started, path+"?code=c&state="+loc.Query().Get("state")))
+				got := w.Header().Get("Location")
+				if tc.ok != !strings.Contains(got, "error=") {
+					t.Errorf("callback at %s: Location %s, want ok=%v", path, got, tc.ok)
+				}
+				if tc.ok && providers["evil"].exchangedWith != own {
+					t.Errorf("token exchange redirect_uri = %q, want %q", providers["evil"].exchangedWith, own)
+				}
+			}
+		})
+	}
+}
+
+// TestCallbackChecksResponseIssuer verifies that an authorization response
+// whose iss names another issuer is refused before its code is exchanged.
+func TestCallbackChecksResponseIssuer(t *testing.T) {
+	idp, _ := mockOIDCServer(t, map[string]any{"sub": "u1", "preferred_username": "jsmith"})
+	p, err := NewOIDCProvider(t.Context(), OIDCProviderConfig{Name: "kc", Issuer: idp.URL, ClientID: "test-client"})
+	if err != nil {
+		t.Fatalf("NewOIDCProvider: %v", err)
+	}
+	ks, _ := GenerateKeySet()
+	reg := NewProviderRegistry()
+	_ = reg.Register(p)
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
+	cfg := Config{
+		ExternalURL: "https://zdas.example.com",
+		Claims:      defaultClaimsConfig(),
+		Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
+	}
+	mux := newTestEndpoints(cfg, ks, reg, store, nil).mux()
+
+	for _, tc := range []struct {
+		iss string
+		ok  bool
+	}{{"https://evil.example.com", false}, {idp.URL, true}, {"", true}} {
+		started := authorizeAndConsent(t, mux, authorizeURL(t, nil), "")
+		loc, _ := url.Parse(started.Header().Get("Location"))
+		q := url.Values{"code": {"c"}, "state": {loc.Query().Get("state")}}
+		if tc.iss != "" {
+			q.Set("iss", tc.iss)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, browserRequest(started, "/callback/kc?"+q.Encode()))
+		got := w.Header().Get("Location")
+		if tc.ok != (strings.Contains(got, "code=") && !strings.Contains(got, "error=")) {
+			t.Errorf("iss %q: Location %s, want ok=%v", tc.iss, got, tc.ok)
+		}
 	}
 }

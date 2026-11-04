@@ -54,6 +54,15 @@ type rateLimitBucket struct {
 	lastSeen time.Time
 }
 
+// defaultBurst returns burst, or twice perSecond, at least 1, when burst is
+// not set.
+func defaultBurst(perSecond float64, burst int) int {
+	if burst > 0 {
+		return burst
+	}
+	return max(int(perSecond)*2, 1)
+}
+
 // newIPRateLimiter returns a limiter for cfg, or nil when rate limiting is
 // disabled. Invalid trusted proxy entries are logged and skipped; Validate
 // rejects them for configs that go through it.
@@ -61,10 +70,7 @@ func newIPRateLimiter(cfg RateLimitConfig, logger *slog.Logger) *ipRateLimiter {
 	if cfg.AuthorizePerSecond <= 0 {
 		return nil
 	}
-	burst := cfg.AuthorizeBurst
-	if burst <= 0 {
-		burst = max(int(cfg.AuthorizePerSecond)*2, 1)
-	}
+	burst := defaultBurst(cfg.AuthorizePerSecond, cfg.AuthorizeBurst)
 	var trusted []netip.Prefix
 	for _, raw := range cfg.TrustedProxies {
 		p, err := parseTrustedProxy(raw)

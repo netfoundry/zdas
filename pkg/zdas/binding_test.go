@@ -199,7 +199,7 @@ func TestCallbackRequiresBindingCookie(t *testing.T) {
 				// An attacker can start their own flow and hold its cookie.
 				attacker, attackerID := startAuthorize(t, mux)
 
-				target := "/callback?" + query + "&state=" + sessID
+				target := "/callback/mock-idp?" + query + "&state=" + sessID
 				req := httptest.NewRequest(http.MethodGet, target, nil)
 				if c := tc.cookie(sessID, liveCookie(t, attacker, attackerID)); c != nil {
 					req.AddCookie(c)

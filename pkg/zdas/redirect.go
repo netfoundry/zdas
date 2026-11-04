@@ -65,17 +65,21 @@ func redirectAllowed(u *url.URL, allowList []*url.URL) bool {
 	return false
 }
 
-// redirectMatches compares scheme, host and port, and the path when entry
-// has one. An entry for a loopback host without a port matches any port,
-// since loopback callbacks listen on an ephemeral one.
+// redirectMatches compares u with entry. For a host other than loopback,
+// scheme, host, port and path must match exactly, and the query too when
+// entry has one (RFC 9700 section 2.1). A loopback entry matches any port
+// when it has none, since loopback callbacks listen on an ephemeral one
+// (RFC 8252 section 7.3), and any path when it has none.
 func redirectMatches(u, entry *url.URL) bool {
 	if u.Scheme != entry.Scheme || !strings.EqualFold(u.Hostname(), entry.Hostname()) {
 		return false
 	}
-	if entry.Port() != "" || !isLoopbackHost(entry.Hostname()) {
-		if effectivePort(u) != effectivePort(entry) {
-			return false
-		}
+	if !isLoopbackHost(entry.Hostname()) {
+		return effectivePort(u) == effectivePort(entry) && u.Path == entry.Path &&
+			(entry.RawQuery == "" || u.RawQuery == entry.RawQuery)
+	}
+	if entry.Port() != "" && effectivePort(u) != effectivePort(entry) {
+		return false
 	}
 	return entry.Path == "" || entry.Path == "/" || u.Path == entry.Path
 }
