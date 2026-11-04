@@ -20,6 +20,7 @@ type AuthSession struct {
 	ClientType                  string      // from the client_type param; empty for unmodified tunnelers
 	ZDASCodeVerifier            string      // ZDAS's own PKCE verifier for upstream (empty for non-PKCE providers)
 	UpstreamProviderName        string
+	CallbackURL                 string // the redirect_uri sent upstream; empty before consent, and in sessions from before it was kept
 	CreatedAt                   time.Time
 }
 

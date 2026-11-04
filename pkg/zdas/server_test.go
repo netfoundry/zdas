@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -353,5 +354,34 @@ func TestNewServerControllerURLs(t *testing.T) {
 	}
 	if got := srv.reconciler.mgmtURL; got != "https://mgmt.example.com:1280/edge/management/v1" {
 		t.Errorf("reconciler management URL = %q", got)
+	}
+}
+
+// TestNewServerWiresPolicyAndStoreLogger verifies that NewServer passes a
+// configured OIDC provider's policy through, and gives the built-in store
+// a logger for eviction warnings.
+func TestNewServerWiresPolicyAndStoreLogger(t *testing.T) {
+	idp, _ := mockOIDCServer(t, map[string]any{"sub": "u"})
+	cfg := replicaConfig(t)
+	cfg.Providers = []ProviderConfig{{
+		Type: ProviderTypeOIDC, Name: "corp", ClientID: "c", OIDCIssuerURL: idp.URL,
+		AllowedEmailDomains: []string{"corp.example"}, RequiredClaims: map[string][]string{"groups": {"ziti"}},
+	}}
+	srv, err := NewServer(cfg, slog.Default())
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	t.Cleanup(func() { srv.Shutdown(context.Background()) })
+
+	p, err := srv.registry.Resolve("corp")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	op := p.(*OIDCProvider)
+	if !slices.Equal(op.emailDomains, []string{"corp.example"}) || !slices.Equal(op.requiredClaims["groups"], []string{"ziti"}) {
+		t.Errorf("policy = %v, %v", op.emailDomains, op.requiredClaims)
+	}
+	if srv.store.logger == nil {
+		t.Error("built-in store has no logger")
 	}
 }

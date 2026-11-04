@@ -69,6 +69,7 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 	var owned *memStore // the store ZDAS created, and so stops
 	if store == nil {
 		owned = newMemStore(cfg.Session.Timeout, cfg.Session.CodeExpiry, storeSweepInterval)
+		owned.logger = logger
 		store = owned
 		// Stop the store's sweep goroutine if NewServer fails partway
 		// through; on success the returned Server owns it.
@@ -99,15 +100,17 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 			// hang startup indefinitely.
 			discoCtx, cancel := context.WithTimeout(context.Background(), providerSetupTimeout)
 			oidcProv, err := NewOIDCProvider(discoCtx, OIDCProviderConfig{
-				Name:            pc.Name,
-				Issuer:          pc.OIDCIssuerURL,
-				ClientID:        pc.ClientID,
-				ClientSecret:    pc.ClientSecret,
-				Scopes:          pc.Scopes,
-				FetchUserInfo:   pc.FetchUserInfo,
-				RequireUserInfo: pc.RequireUserInfo,
-				HTTPClient:      sopts.upstream,
-				Logger:          logger,
+				Name:                pc.Name,
+				Issuer:              pc.OIDCIssuerURL,
+				ClientID:            pc.ClientID,
+				ClientSecret:        pc.ClientSecret,
+				Scopes:              pc.Scopes,
+				FetchUserInfo:       pc.FetchUserInfo,
+				RequireUserInfo:     pc.RequireUserInfo,
+				AllowedEmailDomains: pc.AllowedEmailDomains,
+				RequiredClaims:      pc.RequiredClaims,
+				HTTPClient:          sopts.upstream,
+				Logger:              logger,
 			})
 			cancel()
 			if err != nil {
@@ -146,6 +149,10 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 		logger.Info("fallback reconciler enabled", "poll_interval", cfg.Fallback.PollInterval)
 	} else if cfg.Fallback.Enabled {
 		logger.Info("fallback enrollment enabled without reconciler (no identity_file)")
+	}
+
+	if cfg.LegacyCallback {
+		logger.Warn("legacy_callback is deprecated and will be removed: register <external_url>/callback/<provider name> with each IdP, then turn it off")
 	}
 
 	handlers := newEndpoints(cfg, keys, sopts.verifyKeys, registry, store, disc, reconciler, sopts.provisioner, logger)

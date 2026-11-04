@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // endpoints serves the ZDAS HTTP endpoints and holds their dependencies.
@@ -29,6 +31,7 @@ type endpoints struct {
 	reconciler  *fallbackReconciler   // nil when fallback is disabled
 	provisioner EnrollmentProvisioner // nil uses built-in ComposeClaims
 	rateLimiter *ipRateLimiter        // nil when rate limiting is disabled
+	globalLimit *rate.Limiter         // GET /authorize for all clients; nil when disabled
 	redirects   []*url.URL            // parsed cfg.AllowedRedirectURIs; nil keeps the loopback default
 	logger      *slog.Logger
 
@@ -57,6 +60,9 @@ func newEndpoints(cfg Config, keys *KeySet, verifyKeys []*KeySet, registry *Prov
 	}
 	h.cookiePath, h.cookieSecure = bindingCookieScope(cfg.ExternalURL)
 	h.rateLimiter = newIPRateLimiter(cfg.RateLimit, logger)
+	if rl := cfg.RateLimit; rl.GlobalPerSecond > 0 {
+		h.globalLimit = rate.NewLimiter(rate.Limit(rl.GlobalPerSecond), defaultBurst(rl.GlobalPerSecond, rl.GlobalBurst))
+	}
 	h.redirects = parseAllowList(cfg.AllowedRedirectURIs, logger)
 	return h
 }
@@ -72,6 +78,7 @@ func (h *endpoints) mux() *http.ServeMux {
 	mux.HandleFunc("GET /authorize", h.handleAuthorize)
 	mux.HandleFunc("POST /authorize", h.handleConsent)
 	mux.HandleFunc("GET /callback", h.handleCallback)
+	mux.HandleFunc("GET /callback/{provider}", h.handleCallback)
 	mux.HandleFunc("POST /token", h.handleToken)
 	return mux
 }
@@ -143,7 +150,7 @@ const (
 )
 
 func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
-	if h.rateLimiter != nil && !h.rateLimiter.allow(r) {
+	if (h.rateLimiter != nil && !h.rateLimiter.allow(r)) || (h.globalLimit != nil && !h.globalLimit.Allow()) {
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
@@ -291,6 +298,15 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	h.renderConsent(w, deviceInfo, parsedRedirect, choices, consentID)
 }
 
+// callbackURL returns the redirect_uri ZDAS sends provider: its own
+// callback path, or the shared one with LegacyCallback.
+func (h *endpoints) callbackURL(provider string) string {
+	if h.cfg.LegacyCallback {
+		return h.cfg.ExternalURL + "/callback"
+	}
+	return h.cfg.ExternalURL + "/callback/" + url.PathEscape(provider)
+}
+
 // maxConsentRequestBytes caps the form posted from the consent page, which
 // holds a session ID and a provider name.
 const maxConsentRequestBytes = 4 << 10
@@ -332,11 +348,11 @@ func (h *endpoints) handleConsent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sess.UpstreamProviderName = provider.Name()
+	sess.CallbackURL = h.callbackURL(provider.Name())
 
 	// For OIDC, use our own PKCE pair toward the upstream, keeping the
 	// verifier in the session for /callback. Other providers (GitHub) get
 	// none.
-	callbackURL := h.cfg.ExternalURL + "/callback"
 	oidcProv, usePKCE := provider.(*OIDCProvider)
 	var challenge string
 	if usePKCE {
@@ -354,9 +370,9 @@ func (h *endpoints) handleConsent(w http.ResponseWriter, r *http.Request) {
 	}
 	var upstreamURL string
 	if usePKCE {
-		upstreamURL = oidcProv.authorizeURL(sessionState, callbackURL, challenge)
+		upstreamURL = oidcProv.authorizeURL(sessionState, sess.CallbackURL, challenge)
 	} else {
-		upstreamURL = provider.AuthorizeURL(sessionState, callbackURL)
+		upstreamURL = provider.AuthorizeURL(sessionState, sess.CallbackURL)
 	}
 
 	if sess.FallbackNonce != "" {
@@ -410,7 +426,31 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	callbackURL := h.cfg.ExternalURL + "/callback"
+	// A response that reached the wrong callback, or that names another
+	// issuer, came from an IdP other than the one this sign-in went to: a
+	// mix-up attack (RFC 9700 section 4.4). Its code must not be sent to
+	// this provider's token endpoint.
+	callbackURL := sess.CallbackURL
+	if callbackURL == "" {
+		callbackURL = h.cfg.ExternalURL + "/callback"
+	}
+	reached := h.cfg.ExternalURL + "/callback"
+	if p := r.PathValue("provider"); p != "" {
+		reached += "/" + url.PathEscape(p)
+	}
+	if reached != callbackURL {
+		h.logger.Warn("upstream response at another provider's callback", "provider", provider.Name(), "callback", reached)
+		oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, "invalid_request", "sign-in response came back for another identity provider")
+		return
+	}
+	if oidcProv, ok := provider.(*OIDCProvider); ok {
+		if err := oidcProv.checkResponseIssuer(q.Get("iss")); err != nil {
+			h.logger.Warn("upstream response from another issuer", "provider", provider.Name(), "error", err)
+			oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, "invalid_request", "sign-in response came back for another identity provider")
+			return
+		}
+	}
+
 	var identity *UpstreamIdentity
 	if oidcProv, ok := provider.(*OIDCProvider); ok && sess.ZDASCodeVerifier != "" {
 		identity, err = oidcProv.ExchangeAndIdentifyWithPKCE(r.Context(), code, callbackURL, sess.ZDASCodeVerifier)
@@ -443,6 +483,7 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 			Name:             identity.Username,
 			Subject:          identity.Subject,
 			Provider:         sess.UpstreamProviderName,
+			Raw:              identity.Raw,
 			EnrollmentMethod: sess.EnrollmentMethod,
 			ClientType:       sess.ClientType,
 			IsFallback:       sess.FallbackNonce != "",

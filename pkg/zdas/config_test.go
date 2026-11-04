@@ -113,6 +113,7 @@ providers:
     name: gh-prod
     client_id: "placeholder"
     client_secret: "placeholder"
+    allow_any_user: true
 `
 	path := writeTempConfig(t, yaml)
 	t.Setenv("ZDAS_PROVIDER_GH_PROD_CLIENT_SECRET", "real-secret")
@@ -180,8 +181,8 @@ func TestValidateRejectsDuplicateProviderNames(t *testing.T) {
 		ExternalURL: "https://das.example.com",
 		Controller:  ControllerConfig{APIURL: "https://c"},
 		Providers: []ProviderConfig{
-			{Type: "github", Name: "dup", ClientID: "a", ClientSecret: "b"},
-			{Type: "github", Name: "dup", ClientID: "c", ClientSecret: "d"},
+			{Type: "github", Name: "dup", ClientID: "a", ClientSecret: "b", AllowAnyUser: true},
+			{Type: "github", Name: "dup", ClientID: "c", ClientSecret: "d", AllowAnyUser: true},
 		},
 	}
 	cfg.ApplyDefaults()
@@ -233,7 +234,7 @@ func TestValidateOIDCAccepts(t *testing.T) {
 		ExternalURL: "https://das.example.com",
 		Controller:  ControllerConfig{APIURL: "https://c"},
 		Providers: []ProviderConfig{
-			{Type: "oidc", Name: "kc", ClientID: "c", OIDCIssuerURL: "https://kc.example.com"},
+			{Type: "oidc", Name: "kc", ClientID: "c", OIDCIssuerURL: "https://kc.example.com", AllowedEmailDomains: []string{"example.com"}},
 		},
 	}
 	cfg.ApplyDefaults()
@@ -265,6 +266,8 @@ providers:
     oidc_issuer_url: https://okta.example.com
     fetch_userinfo: true
     require_userinfo: true
+    required_claims:
+      groups: [ziti-users]
 `)
 	cfg, err := LoadConfig(path)
 	if err != nil {
@@ -505,5 +508,43 @@ claims:
 `
 	if _, err := LoadConfig(writeTempConfig(t, body)); err == nil || !strings.Contains(err.Error(), "external_id_claim") {
 		t.Errorf("LoadConfig = %v, want an external_id_claim error", err)
+	}
+}
+
+// TestValidateProviderPolicy verifies that a configured provider needs a
+// policy or allow_any_user, not both, and only the policies its type has.
+func TestValidateProviderPolicy(t *testing.T) {
+	gh := ProviderConfig{Type: ProviderTypeGitHub, Name: "gh", ClientID: "c", ClientSecret: "s"}
+	oidc := ProviderConfig{Type: ProviderTypeOIDC, Name: "kc", ClientID: "c", OIDCIssuerURL: "https://kc"}
+	with := func(p ProviderConfig, f func(*ProviderConfig)) ProviderConfig { f(&p); return p }
+	cases := []struct {
+		name    string
+		p       ProviderConfig
+		wantErr string
+	}{
+		{"github open", gh, "allow_any_user: true"},
+		{"github orgs", with(gh, func(p *ProviderConfig) { p.AllowedOrgs = []string{"acme"} }), ""},
+		{"github any user", with(gh, func(p *ProviderConfig) { p.AllowAnyUser = true }), ""},
+		{"github both", with(gh, func(p *ProviderConfig) { p.AllowedOrgs = []string{"acme"}; p.AllowAnyUser = true }), "conflicts"},
+		{"github with oidc policy", with(gh, func(p *ProviderConfig) { p.AllowedEmailDomains = []string{"acme.com"} }), "are for oidc"},
+		{"oidc open", oidc, "allow_any_user: true"},
+		{"oidc domains", with(oidc, func(p *ProviderConfig) { p.AllowedEmailDomains = []string{"acme.com"} }), ""},
+		{"oidc claims", with(oidc, func(p *ProviderConfig) { p.RequiredClaims = map[string][]string{"groups": {"z"}} }), ""},
+		{"oidc any user", with(oidc, func(p *ProviderConfig) { p.AllowAnyUser = true }), ""},
+		{"oidc with orgs", with(oidc, func(p *ProviderConfig) { p.AllowedOrgs = []string{"acme"} }), "is for github"},
+		{"oidc claim without values", with(oidc, func(p *ProviderConfig) { p.RequiredClaims = map[string][]string{"groups": nil} }), "lists no values"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{ExternalURL: "https://das.example.com", Controller: ControllerConfig{APIURL: "https://c"}, Providers: []ProviderConfig{tc.p}}
+			cfg.ApplyDefaults()
+			err := cfg.Validate()
+			if tc.wantErr == "" && err != nil {
+				t.Errorf("Validate: %v", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Errorf("Validate = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
 	}
 }

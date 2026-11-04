@@ -61,6 +61,12 @@ type ProvisionRequest struct {
 	Name     string // display name
 	Subject  string // stable user ID (OIDC sub, GitHub numeric ID)
 	Provider string // provider name ("google", "github", etc.)
+	// Raw holds the upstream identity's claims as the provider returned
+	// them: for OIDC the ID token's, plus userinfo when fetched, and for
+	// GitHub the /user fields. Use it for policies ZDAS doesn't apply
+	// itself, such as group membership. Of the email fields, only Email
+	// above is known to be verified.
+	Raw map[string]any
 
 	// From tunneler query params on /authorize. DeviceName and other fields
 	// will be empty for unmodified tunnelers (fallback path).

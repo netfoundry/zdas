@@ -115,7 +115,7 @@ func TestIntegrationOIDCFlow(t *testing.T) {
 	}
 
 	// 5. Simulate the upstream IdP calling back with an authorization code.
-	callbackReq := "/callback?" + url.Values{
+	callbackReq := "/callback/test-keycloak?" + url.Values{
 		"code":  {"upstream-auth-code"},
 		"state": {sessionState},
 	}.Encode()
@@ -289,7 +289,7 @@ func TestIntegrationGitHubFlow(t *testing.T) {
 	sessionState := upstreamRedirect.Query().Get("state")
 
 	// Simulate GitHub callback.
-	req := browserRequest(w, "/callback?code=gh-code&state="+sessionState)
+	req := browserRequest(w, "/callback/github?code=gh-code&state="+sessionState)
 	w = httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 	if w.Code != http.StatusFound {
@@ -429,7 +429,7 @@ func TestIntegrationFallbackFlow(t *testing.T) {
 	sessionState := upstreamRedirect.Query().Get("state")
 
 	// Simulate upstream callback.
-	req := browserRequest(w, "/callback?code=upstream-code&state="+sessionState)
+	req := browserRequest(w, "/callback/test-kc?code=upstream-code&state="+sessionState)
 	w = httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 	if w.Code != http.StatusFound {
@@ -560,7 +560,7 @@ func enrollAcross(t *testing.T, start, callback, token http.Handler) string {
 		t.Fatalf("parse upstream redirect: %v", err)
 	}
 
-	callbackReq := "/callback?" + url.Values{
+	callbackReq := "/callback/mock-idp?" + url.Values{
 		"code":  {"upstream-code"},
 		"state": {upstream.Query().Get("state")},
 	}.Encode()
@@ -689,7 +689,7 @@ func TestIntegrationProvisionCompleteAcrossReplicas(t *testing.T) {
 		t.Fatalf("parse upstream redirect: %v", err)
 	}
 	cb := httptest.NewRecorder()
-	a.ServeHTTP(cb, browserRequest(w, "/callback?code=x&state="+upstream.Query().Get("state")))
+	a.ServeHTTP(cb, browserRequest(w, "/callback/mock-idp?code=x&state="+upstream.Query().Get("state")))
 	pick, err := url.Parse(cb.Header().Get("Location"))
 	if err != nil || pick.Host != "embedder.example.com" {
 		t.Fatalf("callback: status = %d, Location = %q; want picker redirect", cb.Code, cb.Header().Get("Location"))

@@ -615,6 +615,9 @@ func TestProvisionerReceivesEnrollmentMethod(t *testing.T) {
 		t.Fatalf("callback status = %d, body = %s", w.Code, w.Body.String())
 	}
 
+	if provisioner.captured.Raw["preferred_username"] != "alice" {
+		t.Errorf("Raw = %v, want the upstream claims", provisioner.captured.Raw)
+	}
 	if provisioner.captured.EnrollmentMethod != "enrollToToken" {
 		t.Errorf("EnrollmentMethod = %q, want %q", provisioner.captured.EnrollmentMethod, "enrollToToken")
 	}
@@ -679,7 +682,7 @@ func TestProvisionerReceivesClientType(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse Location: %v", err)
 			}
-			req := browserRequest(w, "/callback?code=c&state="+loc.Query().Get("state"))
+			req := browserRequest(w, "/callback/mock-idp?code=c&state="+loc.Query().Get("state"))
 			w = httptest.NewRecorder()
 			mux.ServeHTTP(w, req)
 			if w.Code != http.StatusFound {
