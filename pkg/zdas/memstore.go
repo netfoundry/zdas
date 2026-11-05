@@ -39,6 +39,7 @@ type memStore struct {
 
 	logger      *slog.Logger // warns of evictions; nil logs nothing
 	lastEvicted time.Time    // when an eviction was last logged; guarded by mu
+	evicted     int          // sessions evicted since then; guarded by mu
 }
 
 // newMemStore returns a memStore that sweeps out sessions and pending
@@ -71,10 +72,12 @@ func (s *memStore) CreateSession(_ context.Context, key string, sess *AuthSessio
 	defer s.mu.Unlock()
 	if s.sessions.len() >= maxStoreEntries {
 		s.sessions.removeOldest()
+		s.evicted++
 		if now := time.Now(); s.logger != nil && now.Sub(s.lastEvicted) >= evictionLogInterval {
+			s.logger.Warn("session store full, dropping the oldest sign-ins; something is creating sessions faster than users finish them",
+				"max_sessions", maxStoreEntries, "dropped", s.evicted)
 			s.lastEvicted = now
-			s.logger.Warn("session store full, dropping the oldest sign-ins; tighten rate_limit, global_per_second especially",
-				"max_sessions", maxStoreEntries)
+			s.evicted = 0
 		}
 	}
 	s.sessions.add(key, sess, sess.CreatedAt)

@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"golang.org/x/time/rate"
 )
@@ -32,6 +34,7 @@ type endpoints struct {
 	provisioner EnrollmentProvisioner // nil uses built-in ComposeClaims
 	rateLimiter *ipRateLimiter        // nil when rate limiting is disabled
 	globalLimit *rate.Limiter         // GET /authorize for all clients; nil when disabled
+	rejections  *rejectionLog         // counts and logs what the limits refuse
 	redirects   []*url.URL            // parsed cfg.AllowedRedirectURIs; nil keeps the loopback default
 	logger      *slog.Logger
 
@@ -60,6 +63,7 @@ func newEndpoints(cfg Config, keys *KeySet, verifyKeys []*KeySet, registry *Prov
 	}
 	h.cookiePath, h.cookieSecure = bindingCookieScope(cfg.ExternalURL)
 	h.rateLimiter = newIPRateLimiter(cfg.RateLimit, logger)
+	h.rejections = newRejectionLog(logger)
 	if rl := cfg.RateLimit; rl.GlobalPerSecond > 0 {
 		h.globalLimit = rate.NewLimiter(rate.Limit(rl.GlobalPerSecond), defaultBurst(rl.GlobalPerSecond, rl.GlobalBurst))
 	}
@@ -151,9 +155,9 @@ const (
 )
 
 func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
-	if (h.rateLimiter != nil && !h.rateLimiter.allow(r)) || (h.globalLimit != nil && !h.globalLimit.Allow()) {
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+	if h.rateLimiter != nil && !h.rateLimiter.allow(r) {
+		h.rejections.add(rejectClient)
+		tooManyRequests(w)
 		return
 	}
 
@@ -298,6 +302,13 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		EnrollmentMethod:            truncateParam(enrollmentMethod, 64),
 		ClientType:                  truncateParam(clientType, 64),
 	}
+	// The global limit is spent only here, by a request that stores a
+	// session, so that invalid requests cannot use it up.
+	if h.globalLimit != nil && !h.globalLimit.Allow() {
+		h.rejections.add(rejectGlobal)
+		tooManyRequests(w)
+		return
+	}
 	consentID, err := h.startSession(w, r, sess)
 	if err != nil {
 		h.logger.Error("create session", "error", err)
@@ -334,8 +345,8 @@ const consentMissing = "sign-in request not found or expired; start again from t
 // form post does not carry, so the post must come from that browser.
 func (h *endpoints) handleConsent(w http.ResponseWriter, r *http.Request) {
 	if h.rateLimiter != nil && !h.rateLimiter.allow(r) {
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		h.rejections.add(rejectClient)
+		tooManyRequests(w)
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxConsentRequestBytes)
@@ -343,21 +354,26 @@ func (h *endpoints) handleConsent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "malformed form body", http.StatusBadRequest)
 		return
 	}
-	sess, err := h.consumeBoundSession(w, r, r.PostFormValue("consent"))
+	// Resolve the provider before consuming the session, so that a post
+	// naming none or an unknown one leaves the session for another try.
+	provider, err := h.registry.Resolve(r.PostFormValue("idp"))
+	if err != nil {
+		http.Error(w, "unknown or missing sign-in provider; go back and choose one", http.StatusBadRequest)
+		return
+	}
+	sess, otherBrowser, err := h.consumeBoundSession(w, r, r.PostFormValue("consent"))
 	if err != nil {
 		h.logger.Error("consume session", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	if otherBrowser {
+		h.logger.Warn("consent posted from a browser that did not start the sign-in; cancelled it")
+	}
 	// A session that already has a provider is waiting for /callback, not
 	// for consent.
 	if sess == nil || sess.UpstreamProviderName != "" {
 		http.Error(w, consentMissing, http.StatusBadRequest)
-		return
-	}
-	provider, err := h.registry.Resolve(r.PostFormValue("idp"))
-	if err != nil {
-		oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, "invalid_request", "unknown idp")
 		return
 	}
 	sess.UpstreamProviderName = provider.Name()
@@ -396,10 +412,17 @@ func (h *endpoints) handleConsent(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, upstreamURL, http.StatusSeeOther)
 }
 
-// sessionMissing is the /callback response when no session matches. A
-// browser other than the one that started the flow lands here too, since
-// it lacks the binding cookie the session is stored under.
-const sessionMissing = "session not found or expired; enrollment must finish in the browser that started it"
+// sessionMissing is the /callback response when no session matches.
+const sessionMissing = "sign-in not found or expired; start again from the app"
+
+// sessionOtherBrowser is the /callback response when the session was
+// started in another browser, which cancels it. A phisher who starts a
+// sign-in in their own browser and sends the victim the IdP's address needs
+// the victim to send back the address this lands on, so the text warns
+// against exactly that rather than telling the user where to finish.
+const sessionOtherBrowser = "This sign-in was started in a different browser, so it has been cancelled. " +
+	"If someone sent you a sign-in link, or asks you to send them this page's address, don't: " +
+	"it would let them enroll a device as you. To enroll your own device, start again from the app on it."
 
 func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -408,10 +431,15 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// The session holds the tunneler's redirect_uri, which every outcome
 	// below needs, including an upstream error.
-	sess, err := h.consumeBoundSession(w, r, sessionState)
+	sess, otherBrowser, err := h.consumeBoundSession(w, r, sessionState)
 	if err != nil {
 		h.logger.Error("consume session", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if otherBrowser {
+		h.logger.Warn("callback from a browser that did not start the sign-in; cancelled it")
+		http.Error(w, sessionOtherBrowser, http.StatusBadRequest)
 		return
 	}
 	// A session without a provider is still waiting for consent.
@@ -811,15 +839,20 @@ func (h *endpoints) storeKey(kind, id string) string {
 	return hashStoreKey(kind, h.cfg.Token.Issuer, id)
 }
 
-// createSession stamps sess with the current time, stores it under a new
-// ID bound to nonce (see sessionKey), and returns the ID.
+// createSession stores sess under a new ID, bound to nonce (see
+// bindingHash), and returns the ID. A new session is stamped with the
+// current time; one carried over from consent keeps its CreatedAt, so that
+// a sign-in lasts at most the session timeout in all.
 func (h *endpoints) createSession(ctx context.Context, sess *AuthSession, nonce string) (string, error) {
 	id, err := randomID()
 	if err != nil {
 		return "", err
 	}
-	sess.CreatedAt = time.Now()
-	if err := h.store.CreateSession(ctx, h.sessionKey(id, nonce), sess); err != nil {
+	if sess.CreatedAt.IsZero() {
+		sess.CreatedAt = time.Now()
+	}
+	sess.BindingHash = bindingHash(nonce)
+	if err := h.store.CreateSession(ctx, h.storeKey(kindSession, id), sess); err != nil {
 		return "", err
 	}
 	return id, nil
@@ -849,16 +882,30 @@ func (h *endpoints) createPendingProvision(ctx context.Context, id string, pp *P
 // consumeSession consumes an auth session and treats one that is no longer
 // fresh as a miss, so a Store without expiry logic of its own never hands
 // back an expired session. A malformed ID is a miss without a store lookup.
-// It returns (nil, nil) on a miss. nonce is as for createSession.
-func (h *endpoints) consumeSession(ctx context.Context, id, nonce string) (*AuthSession, error) {
+// It returns (nil, false, nil) on a miss. nonce is the one in the browser's
+// binding cookie, or "" for none. When it is not the session's, the session
+// is consumed all the same and consumeSession returns (nil, true, nil), so a
+// sign-in that reaches another browser cannot be finished anywhere.
+func (h *endpoints) consumeSession(ctx context.Context, id, nonce string) (sess *AuthSession, otherBrowser bool, err error) {
 	if !validID(id) {
-		return nil, nil
+		return nil, false, nil
 	}
-	sess, err := h.store.ConsumeSession(ctx, h.sessionKey(id, nonce))
+	sess, err = h.store.ConsumeSession(ctx, h.storeKey(kindSession, id))
+	bound := false
+	if err == nil && sess == nil && nonce != "" {
+		// Sessions stored by v0.15.0 and earlier are keyed by the ID and
+		// the nonce together, so finding one proves the nonce. Remove once
+		// no such session can still be live.
+		sess, err = h.store.ConsumeSession(ctx, h.storeKey(kindSession, id+"."+nonce))
+		bound = sess != nil
+	}
 	if err != nil || sess == nil || !h.fresh(kindSession, sess.CreatedAt, h.cfg.Session.Timeout) {
-		return nil, err
+		return nil, false, err
 	}
-	return sess, nil
+	if !bound && subtle.ConstantTimeCompare([]byte(sess.BindingHash), []byte(bindingHash(nonce))) != 1 {
+		return nil, true, nil
+	}
+	return sess, false, nil
 }
 
 // consumeCode is consumeSession for authorization codes, checked against the
@@ -953,15 +1000,16 @@ type consentPageData struct {
 // provider in providers, posting back to /authorize. The page cannot be
 // framed, so another site cannot trick the user into clicking it.
 func (h *endpoints) renderConsent(w http.ResponseWriter, info *DeviceInfo, redirect *url.URL, providers []string, consentID string) {
+	device := info.DeviceName
+	if device == "" {
+		device = info.Hostname
+	}
 	data := consentPageData{
-		Device:    info.DeviceName,
-		Details:   strings.TrimSpace(info.OS + " " + info.Arch),
+		Device:    displayText(device, maxDisplayedDeviceRunes),
+		Details:   displayText(strings.TrimSpace(info.OS+" "+info.Arch), maxDisplayedDeviceRunes),
 		ReturnTo:  redirect.Host,
 		Providers: providers,
 		Consent:   consentID,
-	}
-	if data.Device == "" {
-		data.Device = info.Hostname
 	}
 	var buf bytes.Buffer
 	if err := consentPage.Execute(&buf, data); err != nil {
@@ -979,8 +1027,35 @@ func (h *endpoints) renderConsent(w http.ResponseWriter, info *DeviceInfo, redir
 	w.Write(buf.Bytes())
 }
 
+// maxDisplayedDeviceRunes caps how much of the device's own description the
+// consent page shows. Whoever sent the link chose that text, so it is kept
+// to a label rather than room for a message.
+const maxDisplayedDeviceRunes = 64
+
+// displayText returns s for showing on a page: without control, format
+// (bidi override) and other unprintable characters or invalid UTF-8, and
+// cut to at most limit runes, with an ellipsis when cut.
+func displayText(s string, limit int) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range s {
+		if r == utf8.RuneError || !unicode.IsPrint(r) {
+			continue
+		}
+		if n == limit {
+			b.WriteString("…")
+			break
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return b.String()
+}
+
 // consentPage is the page renderConsent shows. The form has no action, so
-// it posts to the page's own URL, wherever ZDAS is mounted.
+// it posts to the page's own URL, wherever ZDAS is mounted. The device's
+// description is shown as code, apart from ZDAS's own text, and the warning
+// comes before the buttons.
 var consentPage = template.Must(template.New("consent").Parse(`<!DOCTYPE html>
 <html>
 <head>
@@ -992,19 +1067,21 @@ var consentPage = template.Must(template.New("consent").Parse(`<!DOCTYPE html>
   h1 { font-size: 1.4em; font-weight: 600; margin-bottom: 16px; }
   p { line-height: 1.4; }
   .note { font-size: 0.9em; color: #666; }
+  code { background: #f5f5f5; padding: 1px 4px; border-radius: 4px; }
   button { display: block; width: 100%; padding: 14px 20px; margin: 8px 0; background: #f5f5f5; border: 1px solid #ddd; border-radius: 8px; color: #333; font-size: 1em; text-align: left; cursor: pointer; }
   button:hover { background: #e8e8e8; border-color: #ccc; }
 </style>
 </head>
 <body>
 <h1>Sign in to OpenZiti</h1>
-<p>An app asked to sign you in to an OpenZiti network{{with .Device}} from a device that calls itself <strong>{{.}}</strong>{{end}}{{with .Details}} ({{.}}){{end}}.</p>
-<p>Continue only if you just started this yourself, on your own device.</p>
+<p>An app asked to sign you in to an OpenZiti network.</p>
+{{with .Device}}<p class="note">The app describes the device as <code>{{.}}</code>{{with $.Details}} (<code>{{.}}</code>){{end}}. That description comes from the app, not from this site.</p>
+{{end}}<p><strong>Continue only if you started this yourself, just now, on your own device.</strong> If someone sent you this link, or later asks for the address your browser shows, stop: they are trying to enroll a device as you.</p>
 <form method="post">
 <input type="hidden" name="consent" value="{{.Consent}}">
 {{range .Providers}}<button type="submit" name="idp" value="{{.}}">Continue with {{.}}</button>
 {{end}}</form>
-<p class="note">After you sign in, your browser returns to the app at {{.ReturnTo}}. Don't copy that address or paste it anywhere: it carries your sign-in.</p>
+<p class="note">After you sign in, your browser returns to the app at {{.ReturnTo}}. Don't copy that address or send it to anyone: it carries your sign-in.</p>
 </body>
 </html>
 `))

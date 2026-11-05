@@ -20,8 +20,9 @@ import (
 // lowercase hex characters and fresh for every Create call. The derivation
 // also binds the entry's kind and the configured token issuer, so an entry
 // can only be consumed as the kind and by the ZDAS configuration that
-// created it, and, for an auth session, the nonce in the cookie that ties it
-// to the browser that started it.
+// created it. An auth session also carries the hash of the nonce in the
+// cookie that ties it to the browser that started it (BindingHash), never
+// the nonce itself.
 //
 // Consume methods return the entry for a key and remove it so that it cannot
 // be returned again, atomically: when several callers consume the same key
@@ -42,7 +43,8 @@ import (
 // codes and pending provisions, which need an upstream login, are refused
 // instead. ZDAS imposes no cap on a Store, and every /authorize request
 // creates an entry, so bound /authorize with Config.RateLimit or in front of
-// ZDAS.
+// ZDAS. A Store that refuses entries when full lets a flood refuse every
+// user; one that evicts the oldest does not.
 type Store interface {
 	CreateSession(ctx context.Context, key string, s *AuthSession) error
 	ConsumeSession(ctx context.Context, key string) (*AuthSession, error)

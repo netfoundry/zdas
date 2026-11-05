@@ -95,11 +95,11 @@ type Config struct {
 
 // RateLimitConfig controls rate limiting on the /authorize endpoint. The
 // per-client limit applies to GET and POST alike, so a sign-in takes two
-// requests from it. The global limit applies only to GET, the request that
-// stores a session, across all clients together. A zero rate turns that
-// limit off. The zero Config has no limits; LoadConfig, which the zdas
-// binary uses, starts from 2 per second with a burst of 10 per client, and 5
-// per second with a burst of 500 in all.
+// requests from it. The global limit applies only to a valid GET, the
+// request that stores a session, across all clients together. A zero rate
+// turns that limit off. The zero Config has no limits; LoadConfig, which the
+// zdas binary uses, starts from 2 per second with a burst of 10 per client,
+// and no global limit.
 //
 // A client is the peer address of the connection: an IPv4 address, or an
 // IPv6 /64. Behind a reverse proxy, list the proxy in TrustedProxies so that
@@ -112,23 +112,22 @@ type RateLimitConfig struct {
 	AuthorizeBurst     int      `yaml:"authorize_burst"`      // peak burst per client
 	TrustedProxies     []string `yaml:"trusted_proxies"`      // IP addresses or CIDR prefixes
 
-	// GlobalPerSecond and GlobalBurst cap GET /authorize for all clients
-	// together, so that a flood from many addresses gets 429s rather than
-	// filling the session store. The built-in store holds 10,000 sessions
-	// and evicts the oldest beyond that, so keep GlobalPerSecond times
-	// session.timeout in seconds, plus GlobalBurst, under 10,000.
+	// GlobalPerSecond and GlobalBurst cap valid GET /authorize requests
+	// from all clients together. It is off by default: once a few
+	// addresses use it up, it refuses everyone, which is worse than the
+	// built-in store's own answer to a flood. That store holds 10,000
+	// sessions and drops the oldest beyond that, so an attacker has to
+	// create 10,000 sessions within one user's sign-in to drop it. Set it
+	// to keep a shared Store small, and expect it to refuse real users
+	// under a flood.
 	GlobalPerSecond float64 `yaml:"global_per_second"` // sustained rate, all clients; 0 = disabled
 	GlobalBurst     int     `yaml:"global_burst"`      // peak burst, all clients
 }
 
-// defaultRateLimit is the rate limiting LoadConfig starts from. With the
-// default 10-minute session timeout, the global limit stores at most
-// 5*600+500 = 3,500 sessions from GET /authorize at a time.
+// defaultRateLimit is the rate limiting LoadConfig starts from.
 var defaultRateLimit = RateLimitConfig{
 	AuthorizePerSecond: 2,
 	AuthorizeBurst:     10,
-	GlobalPerSecond:    5,
-	GlobalBurst:        500,
 }
 
 // TLSConfig selects and configures the TLS serving mode.

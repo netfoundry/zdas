@@ -206,7 +206,7 @@ func TestStoreStaleEntriesAreMisses(t *testing.T) {
 			}
 			w = httptest.NewRecorder()
 			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=x&state="+sid, nil))
-			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "session not found or expired") {
+			if w.Code != http.StatusBadRequest || w.Body.String() != sessionMissing+"\n" {
 				t.Errorf("session: status = %d, body = %s; want 400 not found", w.Code, w.Body.String())
 			}
 
@@ -299,13 +299,17 @@ func TestStoreKeysAreHashedAndStamped(t *testing.T) {
 	nonce := liveCookie(t, w, state).Value
 
 	keys := store.keys()
-	want := hashStoreKey(kindSession, "https://zdas.example.com", state+"."+nonce)
+	want := hashStoreKey(kindSession, "https://zdas.example.com", state)
 	if len(keys) != 1 || keys[0] != want {
 		t.Fatalf("store keys = %v, want [%s]", keys, want)
 	}
 	sess, err := store.ConsumeSession(t.Context(), want)
 	if err != nil || sess == nil {
 		t.Fatalf("ConsumeSession = %v, %v", sess, err)
+	}
+	// The store keeps only a hash of the cookie's nonce.
+	if sess.BindingHash != bindingHash(nonce) || strings.Contains(sess.BindingHash, nonce) {
+		t.Errorf("BindingHash = %q, want the hash of the cookie nonce", sess.BindingHash)
 	}
 	if time.Since(sess.CreatedAt) > time.Minute {
 		t.Errorf("session CreatedAt = %v, want now", sess.CreatedAt)
