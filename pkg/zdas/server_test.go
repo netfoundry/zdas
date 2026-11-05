@@ -403,13 +403,20 @@ func TestNewServerChecksProviders(t *testing.T) {
 		{"github with an oidc policy", ProviderConfig{Type: ProviderTypeGitHub, Name: "gh", ClientID: "c", ClientSecret: "s", AllowedEmailDomains: []string{"corp.example"}}, "allowed_email_domains and required_claims are for oidc"},
 		{"oidc with a github policy", ProviderConfig{Type: ProviderTypeOIDC, Name: "kc", ClientID: "c", OIDCIssuerURL: "https://idp.invalid", AllowedOrgs: []string{"acme"}}, "allowed_orgs is for github"},
 		{"policy and allow_any_user", ProviderConfig{Type: ProviderTypeGitHub, Name: "gh", ClientID: "c", ClientSecret: "s", AllowedOrgs: []string{"acme"}, AllowAnyUser: true}, "conflicts"},
+		{"no name", ProviderConfig{Type: ProviderTypeGitHub, ClientID: "c", ClientSecret: "s", AllowAnyUser: true}, "name is required"},
+		{"github without a secret", ProviderConfig{Type: ProviderTypeGitHub, Name: "gh", ClientID: "c", AllowAnyUser: true}, "client_id and client_secret are required"},
+		{"oidc without an issuer", ProviderConfig{Type: ProviderTypeOIDC, Name: "kc", ClientID: "c", AllowAnyUser: true}, "client_id and oidc_issuer_url are required"},
+		{"require_userinfo without fetch", ProviderConfig{Type: ProviderTypeOIDC, Name: "kc", ClientID: "c", OIDCIssuerURL: "https://idp.invalid", RequireUserInfo: true, AllowAnyUser: true}, "require_userinfo needs fetch_userinfo"},
+		{"required claim with no values", ProviderConfig{Type: ProviderTypeOIDC, Name: "kc", ClientID: "c", OIDCIssuerURL: "https://idp.invalid", RequiredClaims: map[string][]string{"groups": nil}}, "required_claims.groups lists no values"},
+		{"no type", ProviderConfig{Name: "x", AllowAnyUser: true}, "type is required"},
+		{"unknown type", ProviderConfig{Type: "saml", Name: "x", AllowAnyUser: true}, "unknown type"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := replicaConfig(t)
 			cfg.Providers = []ProviderConfig{tc.pc}
 			_, err := NewServer(cfg, slog.Default())
-			if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), tc.pc.Name) {
+			if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), `"`+tc.pc.Name+`"`) {
 				t.Errorf("NewServer = %v, want an error naming %q and containing %q", err, tc.pc.Name, tc.want)
 			}
 		})

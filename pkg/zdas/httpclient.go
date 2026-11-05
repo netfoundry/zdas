@@ -118,6 +118,22 @@ func tlsClient(tlsCfg *tls.Config) *http.Client {
 	return &http.Client{Timeout: outboundTimeout, Transport: t}
 }
 
+// boundedClient returns a copy of c with ZDAS's response size cap on its
+// transport, and with outboundTimeout when c has no timeout, so that a
+// client ZDAS did not build gets the limits its own client has.
+func boundedClient(c *http.Client) *http.Client {
+	bc := *c
+	base := c.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	bc.Transport = limitedBodyTransport{base: base}
+	if bc.Timeout == 0 {
+		bc.Timeout = outboundTimeout
+	}
+	return &bc
+}
+
 // baseTransport returns a copy of http.DefaultTransport to configure. An
 // embedder may have replaced that with another RoundTripper, such as one
 // that adds tracing; ZDAS needs an *http.Transport to set its own dialer and

@@ -128,8 +128,6 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 				return nil, fmt.Errorf("register provider %q: %w", pc.Name, err)
 			}
 			logger.Info("registered configured provider", "name", pc.Name, "type", pc.Type)
-		default:
-			return nil, fmt.Errorf("provider %q: unknown type %q (config not validated?)", pc.Name, pc.Type)
 		}
 	}
 
@@ -212,6 +210,10 @@ func (h *Handler) Stop() {
 // query parameter: the user enrolling can change the URL, and could
 // otherwise send someone else's pending ID, or choose claims for any
 // identity.
+//
+// ZDAS keeps a shallow copy of claims until /token, so claims may be
+// reused or changed after CompleteProvision returns, but values nested
+// inside them, such as a slice of groups, must not be.
 func (h *Handler) CompleteProvision(w http.ResponseWriter, r *http.Request, pendingID string, claims map[string]any, err error) {
 	h.srv.handlers.completeProvision(w, r, pendingID, claims, err)
 }

@@ -39,7 +39,7 @@ Anyone on the internet can reach these routes:
 - **PKCE (S256)** is required from the tunneler, and ZDAS uses its own PKCE toward OIDC IdPs. A `code_challenge` must be a canonical S256 value.
 - **Redirect URIs** are loopback-only by default (RFC 8252). An allow-list entry for a host other than loopback must match exactly.
 - **Consent:** nothing goes to an IdP until the user clicks on a ZDAS page that can't be framed. A link alone therefore can't sign in someone whose IdP session is still live.
-- **Browser binding:** the sign-in is bound to the browser that started it by a SameSite=Lax cookie. The consent post and the IdP's callback are accepted only from that browser. One that arrives from any other browser cancels the sign-in, so it can't be finished anywhere afterwards.
+- **Browser binding:** the sign-in is bound to the browser that started it by a SameSite=Lax cookie. The consent post and the IdP's callback are accepted only from that browser. One that names the sign-in from any other browser cancels it. See [Phishing with a sign-in link](#phishing-with-a-sign-in-link) for what that does and doesn't stop.
 - **One callback per provider:** a response at another provider's callback is refused, and so is a response whose `iss` names another issuer. This stops one IdP getting a code meant for another (RFC 9700 section 4.4, RFC 9207).
 
 **Tokens**
@@ -68,8 +68,8 @@ Anyone on the internet can reach these routes:
 - **Restrict configured providers.** For GitHub, Google and other public IdPs, `allow_any_user: true` means anyone at all can enroll.
 - **Register redirect URIs:** register `<external_url>/callback/<provider name>` with each IdP's client.
 - **Behind a reverse proxy,** set `rate_limit.trusted_proxies`, and serve ZDAS over HTTPS.
-- **The reconciler identity:** give it only `identity.read` and `identity.update`, and guard its identity file as you would an identity admin's. `identity.update` can still change every field of any non-admin identity except its permissions. That includes its role attributes, which decide service access through existing policies, its auth policy, and its external ID, which decides who can sign in as it with a token.
-- **Discovered providers:** restrict one by configuring a provider with the signer's name, issuer and client ID, and a policy.
+- **The reconciler identity:** give it only `identity.read` and `identity.update`, and guard its identity file as you would an identity admin's. `identity.update` can still change every field of any non-admin identity except its permissions. That includes its role attributes, which decide service access through existing policies, its auth policy, and its external ID, which decides who can sign in as it with a token. So whoever holds the file can take over any non-admin identity, and with it every permission that identity has, such as another operator identity's.
+- **Discovered providers:** restrict one by configuring a provider with the signer's name, issuer, client ID and scopes, and a policy.
 - **Fallback:** with fallback on, let ZDAS's signer allow enroll-to-cert only.
 - **Prefer enroll-to-cert.** After enrollment, the device signs in with its own certificate rather than with a ZDAS token.
 
@@ -130,9 +130,13 @@ ZDAS is an authorization server for OpenZiti tunnelers, not a general OIDC provi
 
 A phisher can start a sign-in themselves, with a PKCE challenge they hold, and get a victim to sign in to it. The code then goes to a loopback address on the victim's machine, where nothing listens, so the phisher still needs the victim to send back the address the browser shows. ZDAS can't tell that from a real sign-in, since a loopback redirect doesn't show who owns the port (RFC 8252).
 
-ZDAS makes that harder in two ways.
-- **The consent page** comes before the IdP, so a link alone doesn't sign anyone in. It warns, before its buttons, not to continue with a link someone sent and not to send the resulting address to anyone. It shows the device's own description as a short label, without hidden characters, because whoever sent the link chose it.
-- **The browser binding** covers the step after the IdP. A phisher can consent in their own browser and send the victim the IdP's address instead, which skips the consent page when the IdP approves without asking. The victim's browser then reaches `/callback` without the cookie, which cancels the sign-in, so the address the victim might send back is useless. The page it shows says so, and warns against sending it.
+ZDAS makes that harder, but can't prevent it: a victim who sends back that address hands over the sign-in.
+- **The consent page** comes before the IdP, so a link alone doesn't sign anyone in. It warns, before its buttons, not to continue with a link someone sent and not to send the resulting address to anyone. It shows the device's own description as a short label, without hidden characters and marked as unchecked, because whoever sent the link chose it.
+- **The browser binding** covers the step after the IdP. A phisher can consent in their own browser and send the victim the IdP's address instead, which skips the consent page when the IdP approves without asking. If the victim's browser then reaches `/callback` with the sign-in's ID but without its cookie, the sign-in is cancelled, and the address the victim might send back is useless.
+- **The phisher can get around the binding** by editing `state` in the IdP's address before sending it. The victim's browser then names no sign-in, nothing is cancelled, and the phisher can finish with the address the victim sends back. Nothing in that address ties the IdP's code to the sign-in except `state`, so ZDAS can't cancel it.
+- **The warning** covers both cases: any `/callback` that carries a code or an error but finishes nothing tells the user not to send the page's address to anyone.
+
+The binding also means a sign-in can't be moved between browsers on purpose. A user who opens an emailed sign-in link in another app, or whose app hands off to a different browser, must start again and finish in the browser the app opens. And anyone who learns a sign-in's ID while it is in progress, from the IdP's address or the picker's, can cancel it with one request, though not take it over.
 
 The real fix is enroll-to-cert, which ends the flow with a certificate that only the device holds.
 
@@ -140,17 +144,17 @@ The real fix is enroll-to-cert, which ends the flow with a certificate that only
 
 ZDAS uses each external JWT signer the controller lists that allows enrollment as an upstream provider, with no policy of its own, since the controller admin chose the signer and its IdP. So a discovered provider admits every user its issuer signs in, and ZDAS logs a warning the first time each one appears.
 
-To restrict one, configure a provider with the signer's name, issuer and client ID, plus a policy. ZDAS then uses it in place of the discovered one, and keeps the same callback URL.
+To restrict one, configure a provider with the signer's name, issuer and client ID, plus a policy. ZDAS then uses it in place of the discovered one, and keeps the same callback URL. A discovered provider requests `openid`, `profile` and `email` plus the signer's own scopes, while a configured provider's `scopes` replace those defaults, so list them all, including any a policy on `groups` needs. The signer's audience isn't carried over.
 
 ### Mirrored controller data
 
 ZDAS serves copies of two of the controller's public responses: the network JWTs at `/network-jwts`, and the external JWT signers at `/external-jwt-signers` and `/edge/client/v1/external-jwt-signers`. A tunneler pointed at ZDAS's URL can then find the network and its signers there.
 
 - **The data is public:** the controller serves both to anyone, so on a public controller ZDAS exposes nothing new. On a controller that is not reachable from the internet, ZDAS is what makes them public.
-- **ZDAS becomes a source of trust:** a tunneler that enrolls from ZDAS's URL trusts the controller and CA the network JWT names. ZDAS fetches it over TLS checked against the CA from `controller.identity_file` or `ca_bundle`, or the system roots, or over plain HTTP if `controller.api_url` uses it, and passes it on as received. Serve ZDAS over HTTPS, and use an `https://` controller URL, wherever tunnelers bootstrap from it.
+- **ZDAS becomes a source of trust:** a tunneler that enrolls from ZDAS's URL trusts the controller and CA the network JWT names. ZDAS fetches it over TLS checked against the identity file's CA, against `ca_bundle` together with the system roots, or against the system roots alone, or over plain HTTP if `controller.api_url` uses it, and passes it on as received. Serve ZDAS over HTTPS, and use an `https://` controller URL, wherever tunnelers bootstrap from it.
 
 ### Store eviction
 
-When the built-in store is full, it drops the oldest sign-in still in progress instead of refusing new ones. Sign-ins start before anyone authenticates, so refusing them would let anonymous requests lock everyone out. To drop one user's sign-in, an attacker has to create 10,000 sessions within the minute or so that user takes, which the per-client limit makes expensive. Each sign-in lasts at most the session timeout, from `/authorize` to `/callback`.
+When the built-in store is full, it drops the oldest sign-in still in progress instead of refusing new ones. Sign-ins start before anyone authenticates, so refusing them would let anonymous requests lock everyone out. To drop a user's sign-in, an attacker has to create 10,000 sessions within the minute or so that user takes, either before or after the consent click. With the default per-client limit, that takes about 77 IPv4 addresses or 5 IPv6 /48s, and the same flood drops every sign-in in progress, not just one. The per-client limit raises the cost of that; it doesn't rule it out. Each sign-in lasts at most the session timeout in all, from `/authorize` to `/callback`, so time on the consent page comes out of the time left for the IdP.
 
-A limit on `/authorize` for all clients together (`global_per_second`) is off by default for the same reason. Once a few addresses use it up, it refuses everyone. It is there for a shared Store that has to stay small, and then only valid requests spend it.
+A limit on `/authorize` for all clients together (`global_per_second`) is off by default for the same reason. Once a few addresses use it up, it refuses everyone. It is there for a shared Store that has to stay small, and then only valid requests spend it. Each replica enforces its own, so a Store shared by N replicas sees up to N times the rate.

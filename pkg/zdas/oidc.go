@@ -106,8 +106,9 @@ type OIDCProviderConfig struct {
 	// internal addresses. go-oidc reads discovery documents and key sets
 	// whole, so the client should also bound response sizes. nil uses the
 	// client in the ctx passed to NewOIDCProvider (oidc.ClientContext) if
-	// there is one, for all of those requests, or else ZDAS's own client,
-	// which has a timeout and caps responses at 2 MB.
+	// there is one, for all of those requests, with ZDAS's 2 MB response
+	// cap added and ZDAS's timeout if it has none, or else ZDAS's own
+	// client, which has both.
 	HTTPClient *http.Client
 
 	// Logger receives userinfo fetch warnings. nil uses slog.Default().
@@ -124,8 +125,8 @@ func NewOIDCProvider(ctx context.Context, cfg OIDCProviderConfig) (*OIDCProvider
 	client := cfg.HTTPClient
 	if client == nil {
 		client = httpClient
-		if c, ok := ctx.Value(oauth2.HTTPClient).(*http.Client); ok {
-			client = c
+		if c, ok := ctx.Value(oauth2.HTTPClient).(*http.Client); ok && c != nil {
+			client = boundedClient(c)
 		}
 	}
 	ctx = oidc.ClientContext(ctx, client)

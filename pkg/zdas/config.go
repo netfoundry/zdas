@@ -113,13 +113,15 @@ type RateLimitConfig struct {
 	TrustedProxies     []string `yaml:"trusted_proxies"`      // IP addresses or CIDR prefixes
 
 	// GlobalPerSecond and GlobalBurst cap valid GET /authorize requests
-	// from all clients together. It is off by default: once a few
-	// addresses use it up, it refuses everyone, which is worse than the
-	// built-in store's own answer to a flood. That store holds 10,000
-	// sessions and drops the oldest beyond that, so an attacker has to
-	// create 10,000 sessions within one user's sign-in to drop it. Set it
-	// to keep a shared Store small, and expect it to refuse real users
-	// under a flood.
+	// from all clients together, in this process. It is off by default:
+	// once a few addresses use it up, it refuses everyone, which is worse
+	// than the built-in store's own answer to a flood. That store holds
+	// 10,000 sessions and drops the oldest beyond that, so an attacker has
+	// to create 10,000 sessions within one user's sign-in to drop it: about
+	// 77 IPv4 addresses or 5 IPv6 /48s at the default per-client limit for
+	// a sign-in that takes a minute. Set it to keep a shared Store small,
+	// remembering each replica enforces its own, and expect it to refuse
+	// real users under a flood.
 	GlobalPerSecond float64 `yaml:"global_per_second"` // sustained rate, all clients; 0 = disabled
 	GlobalBurst     int     `yaml:"global_burst"`      // peak burst, all clients
 }
@@ -431,6 +433,9 @@ func (c *Config) Validate() error {
 // would ignore. Validate and NewServer both run it, so a Config built in
 // code fails closed too.
 func (p ProviderConfig) check() error {
+	if p.Name == "" {
+		return errors.New("name is required")
+	}
 	switch p.Type {
 	case ProviderTypeGitHub:
 		if p.ClientID == "" || p.ClientSecret == "" {

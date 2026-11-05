@@ -23,16 +23,27 @@ func newTestEndpoints(cfg Config, keys *KeySet, reg *ProviderRegistry, store *me
 	return newEndpoints(cfg, keys, nil, reg, store, nil, nil, p, slog.Default())
 }
 
-// seedSession stores sess as /authorize would, but without binding it to a
-// browser, so that a /callback without a cookie finds it. It returns the
-// session ID.
+// testBindingNonce is the binding nonce seedSession binds sessions to.
+const testBindingNonce = "0123456789abcdef0123456789abcdef"
+
+// seedSession stores sess as /authorize would, bound to testBindingNonce,
+// and returns the session ID. seededRequest builds a request from the
+// browser that holds it.
 func seedSession(t *testing.T, h *endpoints, sess *AuthSession) string {
 	t.Helper()
-	id, err := h.createSession(context.Background(), sess, "")
+	id, err := h.createSession(context.Background(), sess, testBindingNonce)
 	if err != nil {
 		t.Fatalf("createSession: %v", err)
 	}
 	return id
+}
+
+// seededRequest returns a GET for target from the browser that holds the
+// binding cookie for the session seedSession returned as sessID.
+func seededRequest(target, sessID string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.AddCookie(&http.Cookie{Name: bindingCookieName(sessID), Value: testBindingNonce})
+	return req
 }
 
 // seedPendingProvision stores pp as a provisioner redirect would, and
@@ -377,8 +388,8 @@ func TestConsentRequiresBindingCookie(t *testing.T) {
 	// A cross-site form post carries no SameSite=Lax cookie. It is refused,
 	// and it cancels the sign-in, so the page can't be used afterwards.
 	form, cookie = newPage()
-	if w := post(form); w.Code != http.StatusBadRequest || w.Header().Get("Location") != "" {
-		t.Errorf("without cookie: %d %q, want 400", w.Code, w.Header().Get("Location"))
+	if w := post(form); w.Code != http.StatusBadRequest || w.Header().Get("Location") != "" || w.Body.String() != sessionWarning+"\n" {
+		t.Errorf("without cookie: %d %q %s, want 400 and the warning", w.Code, w.Header().Get("Location"), w.Body.String())
 	}
 	if !strings.Contains(logs.String(), "consent posted from a browser that did not start the sign-in") {
 		t.Errorf("cancelled consent not logged: %s", logs.String())
@@ -825,7 +836,7 @@ func TestCallbackToTokenFullFlow(t *testing.T) {
 
 	// Simulate /callback from upstream.
 	callbackURL := "/callback?code=upstream-code&state=" + sessID
-	req := httptest.NewRequest(http.MethodGet, callbackURL, nil)
+	req := seededRequest(callbackURL, sessID)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -925,7 +936,7 @@ func TestCallbackErrorMapping(t *testing.T) {
 				target += "&" + tc.query
 			}
 			w := httptest.NewRecorder()
-			h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
+			h.mux().ServeHTTP(w, seededRequest(target, sessID))
 			loc, err := url.Parse(w.Header().Get("Location"))
 			if err != nil || w.Code != http.StatusFound {
 				t.Fatalf("status = %d, Location = %q", w.Code, w.Header().Get("Location"))
@@ -1220,6 +1231,8 @@ func TestDisplayText(t *testing.T) {
 		{"abcdef", 3, "abc…"},
 		{"日本語のデバイス", 4, "日本語の…"}, // cut on runes, not bytes
 		{"abc", 3, "abc"},
+		{"e\u0301\u0302\u0303\u0304x", 64, "e\u0301\u0302x"}, // at most two marks on a character
+		{"\u0301\u0302\u0303", 64, "\u0301\u0302"},           // and on none
 	}
 	for _, tc := range cases {
 		if got := displayText(tc.in, tc.limit); got != tc.want {
@@ -1256,5 +1269,71 @@ func TestConsentPageShowsDeviceAsLabel(t *testing.T) {
 	warning, button := strings.Index(body, "trying to enroll a device as you"), strings.Index(body, "<button")
 	if warning < 0 || button < 0 || warning > button {
 		t.Errorf("warning at %d, first button at %d; want the warning first", warning, button)
+	}
+}
+
+// TestConsentPageFallsBackToHostname verifies that a device name with
+// nothing printable in it gives way to the hostname, rather than leaving the
+// page with no description.
+func TestConsentPageFallsBackToHostname(t *testing.T) {
+	h, _ := setupHandlers(t)
+	page := httptest.NewRecorder()
+	h.mux().ServeHTTP(page, httptest.NewRequest(http.MethodGet, authorizeURL(t, url.Values{
+		"device_name": {"\u202e\u200b"}, "hostname": {"build-box"},
+	}), nil))
+	if !strings.Contains(page.Body.String(), "<code>build-box</code>") {
+		t.Errorf("page doesn't fall back to the hostname: %s", page.Body)
+	}
+	if !strings.Contains(page.Body.String(), "this site can't check it") {
+		t.Errorf("page doesn't say the description is unchecked: %s", page.Body)
+	}
+}
+
+// TestConsentWithNoProviders verifies that a consent post when no provider
+// is left gets a server error, not an instruction to choose one.
+func TestConsentWithNoProviders(t *testing.T) {
+	h, _ := setupHandlers(t)
+	h.registry = NewProviderRegistry()
+	form := url.Values{"consent": {mustID(t)}, "idp": {""}}
+	req := httptest.NewRequest(http.MethodPost, "/authorize", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	h.mux().ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
+// TestIDPSelectorConsentRetry verifies that, on the external picker's path,
+// a consent post with no or an unknown provider is refused without using up
+// the session or its cookie, so the picker can post again.
+func TestIDPSelectorConsentRetry(t *testing.T) {
+	mux := idpSelectorHandlers(t, "https://app.example.com/pick")
+	start := httptest.NewRecorder()
+	mux.ServeHTTP(start, httptest.NewRequest(http.MethodGet, authorizeURL(t, nil), nil))
+	loc, err := url.Parse(start.Header().Get("Location"))
+	if err != nil || start.Code != http.StatusFound || loc.Host != "app.example.com" {
+		t.Fatalf("authorize: %d %s, want a redirect to the picker", start.Code, start.Header().Get("Location"))
+	}
+	id := loc.Query().Get("consent")
+	post := func(idp string) *httptest.ResponseRecorder {
+		form := url.Values{"consent": {id}, "idp": {idp}}
+		req := httptest.NewRequest(http.MethodPost, "/authorize", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		for _, c := range start.Result().Cookies() {
+			req.AddCookie(c)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w
+	}
+	for _, idp := range []string{"", "nope"} {
+		w := post(idp)
+		if w.Code != http.StatusBadRequest || w.Header().Get("Location") != "" || len(w.Result().Cookies()) != 0 {
+			t.Errorf("idp %q: %d %q, cookies %v; want 400, no redirect, the cookie left alone", idp, w.Code, w.Header().Get("Location"), w.Result().Cookies())
+		}
+	}
+	if w := post("github"); w.Code != http.StatusSeeOther || !strings.HasPrefix(w.Header().Get("Location"), "https://stub/github") {
+		t.Errorf("choosing again: %d %s, want 303 to github", w.Code, w.Header().Get("Location"))
 	}
 }
