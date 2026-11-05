@@ -104,10 +104,11 @@ type OIDCProviderConfig struct {
 	// issuers are chosen by someone it does not fully trust uses it to
 	// control where those requests may go, e.g. with a dialer that refuses
 	// internal addresses. go-oidc reads discovery documents and key sets
-	// whole, so the client should also bound response sizes. nil uses
-	// ZDAS's own client, which has a timeout and caps responses at 2 MB,
-	// except that discovery and keys use the client in ctx
-	// (oidc.ClientContext) if there is one.
+	// whole, so the client should also bound response sizes. nil uses the
+	// client in the ctx passed to NewOIDCProvider (oidc.ClientContext) if
+	// there is one, for all of those requests, with ZDAS's 2 MB response
+	// cap added and ZDAS's timeout if it has none, or else ZDAS's own
+	// client, which has both.
 	HTTPClient *http.Client
 
 	// Logger receives userinfo fetch warnings. nil uses slog.Default().
@@ -117,16 +118,18 @@ type OIDCProviderConfig struct {
 // NewOIDCProvider creates an OIDCProvider from the given config. It creates an
 // ID token verifier bound to the provider's OIDC discovery data.
 func NewOIDCProvider(ctx context.Context, cfg OIDCProviderConfig) (*OIDCProvider, error) {
-	// go-oidc keeps the client it finds in ctx for later key fetches.
+	// One client makes every request to the issuer, so that a client that
+	// limits where requests go also covers the token and userinfo
+	// endpoints, which the issuer's discovery document names. go-oidc keeps
+	// the client it finds in ctx for later key fetches.
 	client := cfg.HTTPClient
-	if client != nil {
-		ctx = oidc.ClientContext(ctx, client)
-	} else {
+	if client == nil {
 		client = httpClient
-		if _, ok := ctx.Value(oauth2.HTTPClient).(*http.Client); !ok {
-			ctx = oidc.ClientContext(ctx, httpClient)
+		if c, ok := ctx.Value(oauth2.HTTPClient).(*http.Client); ok && c != nil {
+			client = boundedClient(c)
 		}
 	}
+	ctx = oidc.ClientContext(ctx, client)
 	provider, err := oidc.NewProvider(ctx, cfg.Issuer)
 	if err != nil {
 		return nil, fmt.Errorf("oidc discovery for %q: %w", cfg.Issuer, err)

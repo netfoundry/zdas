@@ -34,8 +34,13 @@ type Server struct {
 
 // NewServer creates a fully-wired Server. Call Start to begin serving. cfg
 // must have its defaults applied, by LoadConfig or Config.ApplyDefaults;
-// NewServer fails if a setting it cannot do without is unset.
+// NewServer fails if a setting it cannot do without is unset, and on a
+// configured provider Validate would also reject, such as one with neither
+// a policy nor AllowAnyUser. A nil logger uses slog.Default().
 func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, retErr error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if err := cfg.checkRequired(); err != nil {
 		return nil, fmt.Errorf("config: %w (was ApplyDefaults called?)", err)
 	}
@@ -84,6 +89,9 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 	// rather than discovered from the controller).
 	configuredNames := make(map[string]struct{}, len(cfg.Providers))
 	for _, pc := range cfg.Providers {
+		if err := pc.check(); err != nil {
+			return nil, fmt.Errorf("provider %q: %w", pc.Name, err)
+		}
 		configuredNames[pc.Name] = struct{}{}
 		switch pc.Type {
 		case ProviderTypeGitHub:
@@ -120,8 +128,6 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 				return nil, fmt.Errorf("register provider %q: %w", pc.Name, err)
 			}
 			logger.Info("registered configured provider", "name", pc.Name, "type", pc.Type)
-		default:
-			return nil, fmt.Errorf("provider %q: unknown type %q (config not validated?)", pc.Name, pc.Type)
 		}
 	}
 
@@ -204,6 +210,10 @@ func (h *Handler) Stop() {
 // query parameter: the user enrolling can change the URL, and could
 // otherwise send someone else's pending ID, or choose claims for any
 // identity.
+//
+// ZDAS keeps a shallow copy of claims until /token, so claims may be
+// reused or changed after CompleteProvision returns, but values nested
+// inside them, such as a slice of groups, must not be.
 func (h *Handler) CompleteProvision(w http.ResponseWriter, r *http.Request, pendingID string, claims map[string]any, err error) {
 	h.srv.handlers.completeProvision(w, r, pendingID, claims, err)
 }

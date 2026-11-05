@@ -42,9 +42,12 @@ controller:
   #   ziti edge create identity zdas-reconciler \
   #     --permissions identity.read,identity.update -o zdas-reconciler.jwt
   #   ziti edge enroll zdas-reconciler.jwt -o zdas-reconciler.json
-  # identity.update can still change any identity's name and role
-  # attributes, so guard this file. ZDAS warns at startup if the identity is
-  # a full admin.
+  # identity.update still lets it change every field of any identity that
+  # isn't an admin, except its permissions: its name, role attributes,
+  # external ID and auth policy among them. A changed external ID lets
+  # whoever holds that ID sign in as the identity, so whoever holds this file
+  # can take over any non-admin identity. Guard it as you would an identity
+  # admin's. ZDAS warns at startup if the identity is a full admin.
   # identity_file: "/path/to/zdas-reconciler.json"
   # PEM CA bundle for controllers using a private CA (when no identity file).
   # Not needed when the controller has a publicly-trusted cert.
@@ -64,6 +67,11 @@ fallback:
 # discovered from the controller automatically; use this section for providers
 # that aren't registered as ext-jwt-signers (e.g., GitHub) or for embedding
 # scenarios where the controller doesn't know about them.
+# A discovered provider admits every user its issuer signs in. To restrict
+# one, configure a provider here with the signer's name, issuer and client
+# ID, and a policy; ZDAS then uses it in place of the discovered one. Its
+# scopes replace the defaults, so list openid, profile and email plus any the
+# signer adds or the policy needs.
 # providers:
 #   - type: "github"
 #     name: "github"
@@ -111,20 +119,24 @@ token:
   # matching the audience of ZDAS's signer on that network.
   # provisioner_audiences: ["network-a", "network-b"]
 
-# Session settings
+# Session settings. timeout covers a whole sign-in, from the tunneler
+# opening /authorize to the IdP's callback, consent page included.
 session:
   timeout: "10m"
   code_expiry: "60s"
 
-# Rate limiting on /authorize, on by default with the values below. Every
-# GET /authorize stores a session before anyone signs in, and a sign-in is
-# two requests (the page, then the user's click).
-#   - Per client: a client is the connection's peer address (an IPv4
-#     address or an IPv6 /64). Requests over the limit get 429.
-#   - Global: GET /authorize from all clients together, so a flood from many
-#     addresses gets 429s instead of evicting real sign-ins. Keep
-#     global_per_second x session.timeout (in seconds) + global_burst under
-#     10,000, the sessions the built-in store holds.
+# Rate limiting on /authorize. Every GET /authorize stores a session before
+# anyone signs in, and a sign-in is two requests (the page, then the user's
+# click). Refused requests get 429 and are logged, with counts, at most once
+# a minute.
+#   - Per client, on by default: a client is the connection's peer address
+#     (an IPv4 address or an IPv6 /64).
+#   - Global, off by default: valid GET /authorize from all clients
+#     together, per replica. A few addresses can use it up and so refuse
+#     everyone, which is worse than the built-in store's answer to a flood:
+#     it holds 10,000 sessions and drops the oldest, which takes about 77
+#     IPv4 addresses or 5 IPv6 /48s to do within a one-minute sign-in. Set
+#     it only to keep a shared store small.
 # Set a rate to 0 to turn that limit off, e.g. when something in front of
 # ZDAS already limits /authorize.
 #
@@ -136,8 +148,8 @@ session:
 rate_limit:
   authorize_per_second: 2
   authorize_burst: 10
-  global_per_second: 5
-  global_burst: 500
+  # global_per_second: 5
+  # global_burst: 500
   # trusted_proxies: ["10.0.0.0/8"]
 
 # Where /authorize may send the browser back with a code. Unset (the

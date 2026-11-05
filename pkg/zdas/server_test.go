@@ -27,6 +27,7 @@ func TestNewServerRegistersConfiguredOIDCProvider(t *testing.T) {
 			Name:          "my-keycloak",
 			ClientID:      "test-client",
 			OIDCIssuerURL: idpServer.URL,
+			AllowAnyUser:  true,
 		},
 	}
 
@@ -66,6 +67,7 @@ func TestNewServerRegistersConfiguredOIDCProviderWithSecret(t *testing.T) {
 			ClientID:      "gcid",
 			ClientSecret:  "gcsecret",
 			OIDCIssuerURL: idpServer.URL,
+			AllowAnyUser:  true,
 		},
 	}
 
@@ -98,12 +100,13 @@ func TestNewServerOIDCProviderDiscoveryFailure(t *testing.T) {
 			Name:          "broken",
 			ClientID:      "c",
 			OIDCIssuerURL: "http://127.0.0.1:1", // unreachable
+			AllowAnyUser:  true,
 		},
 	}
 
 	_, err := NewServer(cfg, slog.Default())
-	if err == nil {
-		t.Fatal("expected NewServer to fail when configured OIDC provider is unreachable")
+	if err == nil || !strings.Contains(err.Error(), "oidc discovery") {
+		t.Fatalf("NewServer = %v, want an oidc discovery error for an unreachable provider", err)
 	}
 }
 
@@ -384,4 +387,48 @@ func TestNewServerWiresPolicyAndStoreLogger(t *testing.T) {
 	if srv.store.logger == nil {
 		t.Error("built-in store has no logger")
 	}
+}
+
+// TestNewServerChecksProviders verifies that NewServer refuses a configured
+// provider Validate would refuse, so a Config built in code without
+// Validate fails closed.
+func TestNewServerChecksProviders(t *testing.T) {
+	cases := []struct {
+		name string
+		pc   ProviderConfig
+		want string
+	}{
+		{"github without a policy", ProviderConfig{Type: ProviderTypeGitHub, Name: "gh", ClientID: "c", ClientSecret: "s"}, "anyone who can sign in"},
+		{"oidc without a policy", ProviderConfig{Type: ProviderTypeOIDC, Name: "kc", ClientID: "c", OIDCIssuerURL: "https://idp.invalid"}, "anyone who can sign in"},
+		{"github with an oidc policy", ProviderConfig{Type: ProviderTypeGitHub, Name: "gh", ClientID: "c", ClientSecret: "s", AllowedEmailDomains: []string{"corp.example"}}, "allowed_email_domains and required_claims are for oidc"},
+		{"oidc with a github policy", ProviderConfig{Type: ProviderTypeOIDC, Name: "kc", ClientID: "c", OIDCIssuerURL: "https://idp.invalid", AllowedOrgs: []string{"acme"}}, "allowed_orgs is for github"},
+		{"policy and allow_any_user", ProviderConfig{Type: ProviderTypeGitHub, Name: "gh", ClientID: "c", ClientSecret: "s", AllowedOrgs: []string{"acme"}, AllowAnyUser: true}, "conflicts"},
+		{"no name", ProviderConfig{Type: ProviderTypeGitHub, ClientID: "c", ClientSecret: "s", AllowAnyUser: true}, "name is required"},
+		{"github without a secret", ProviderConfig{Type: ProviderTypeGitHub, Name: "gh", ClientID: "c", AllowAnyUser: true}, "client_id and client_secret are required"},
+		{"oidc without an issuer", ProviderConfig{Type: ProviderTypeOIDC, Name: "kc", ClientID: "c", AllowAnyUser: true}, "client_id and oidc_issuer_url are required"},
+		{"require_userinfo without fetch", ProviderConfig{Type: ProviderTypeOIDC, Name: "kc", ClientID: "c", OIDCIssuerURL: "https://idp.invalid", RequireUserInfo: true, AllowAnyUser: true}, "require_userinfo needs fetch_userinfo"},
+		{"required claim with no values", ProviderConfig{Type: ProviderTypeOIDC, Name: "kc", ClientID: "c", OIDCIssuerURL: "https://idp.invalid", RequiredClaims: map[string][]string{"groups": nil}}, "required_claims.groups lists no values"},
+		{"no type", ProviderConfig{Name: "x", AllowAnyUser: true}, "type is required"},
+		{"unknown type", ProviderConfig{Type: "saml", Name: "x", AllowAnyUser: true}, "unknown type"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := replicaConfig(t)
+			cfg.Providers = []ProviderConfig{tc.pc}
+			_, err := NewServer(cfg, slog.Default())
+			if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), `"`+tc.pc.Name+`"`) {
+				t.Errorf("NewServer = %v, want an error naming %q and containing %q", err, tc.pc.Name, tc.want)
+			}
+		})
+	}
+}
+
+// TestNewServerNilLogger verifies that NewServer works with a nil logger,
+// as the provider constructors do.
+func TestNewServerNilLogger(t *testing.T) {
+	srv, err := NewServer(replicaConfig(t), nil)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	srv.Shutdown(context.Background())
 }

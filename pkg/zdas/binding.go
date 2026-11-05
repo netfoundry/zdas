@@ -1,6 +1,8 @@
 package zdas
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/url"
 )
@@ -25,22 +27,25 @@ func bindingCookieScope(externalURL string) (path string, secure bool) {
 	return u.Path, u.Scheme == "https"
 }
 
-// sessionKey returns the store key for session id. A session /authorize
-// creates is stored under its ID and the nonce in the browser's binding
-// cookie together, so a /callback without that cookie misses and leaves the
-// session for the browser that has it. With an empty nonce, as for a
-// /callback without the cookie, the key is the bare ID's, under which
-// /authorize stores nothing.
-func (h *endpoints) sessionKey(id, nonce string) string {
-	if nonce != "" {
-		id += "." + nonce
-	}
-	return h.storeKey(kindSession, id)
+// bindingHash returns what a session keeps of the nonce in its browser's
+// binding cookie: its SHA-256 in hex. The store holds only the hash, so
+// reading it does not give anyone the cookie.
+//
+// A session is stored under its bare ID, so a request that names it but
+// lacks the cookie still finds it, and consumes it. That cancels a sign-in
+// whose session ID reaches the wrong browser: a phisher who consents in
+// their own browser and sends the victim the IdP's address as ZDAS issued
+// it finds the session gone by the time the victim's /callback address gets
+// back to them. One who edits the state in that address before sending it
+// is not stopped here; handleCallback warns the victim instead.
+func bindingHash(nonce string) string {
+	sum := sha256.Sum256([]byte(nonce))
+	return hex.EncodeToString(sum[:])
 }
 
 // startSession stores sess bound to a new nonce and sets a cookie holding
-// the nonce, so that only the browser that started the flow can complete or
-// cancel it at /callback. It returns the session ID.
+// the nonce, so that only the browser that started the flow can complete
+// it. It returns the session ID.
 func (h *endpoints) startSession(w http.ResponseWriter, r *http.Request, sess *AuthSession) (string, error) {
 	nonce, err := randomID()
 	if err != nil {
@@ -54,12 +59,13 @@ func (h *endpoints) startSession(w http.ResponseWriter, r *http.Request, sess *A
 	return id, nil
 }
 
-// consumeBoundSession consumes the session named by state, looked up with
-// the binding cookie r carries, and expires that cookie. It returns
-// (nil, nil) on a miss, including for a browser without the right cookie.
-func (h *endpoints) consumeBoundSession(w http.ResponseWriter, r *http.Request, state string) (*AuthSession, error) {
+// consumeBoundSession consumes the session named by state, checked against
+// the binding cookie r carries, and expires that cookie. otherBrowser
+// reports a session consumed for a browser without the right cookie; see
+// consumeSession.
+func (h *endpoints) consumeBoundSession(w http.ResponseWriter, r *http.Request, state string) (sess *AuthSession, otherBrowser bool, err error) {
 	if !validID(state) {
-		return nil, nil
+		return nil, false, nil
 	}
 	var nonce string
 	if c, err := r.Cookie(bindingCookieName(state)); err == nil {

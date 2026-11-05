@@ -95,11 +95,11 @@ type Config struct {
 
 // RateLimitConfig controls rate limiting on the /authorize endpoint. The
 // per-client limit applies to GET and POST alike, so a sign-in takes two
-// requests from it. The global limit applies only to GET, the request that
-// stores a session, across all clients together. A zero rate turns that
-// limit off. The zero Config has no limits; LoadConfig, which the zdas
-// binary uses, starts from 2 per second with a burst of 10 per client, and 5
-// per second with a burst of 500 in all.
+// requests from it. The global limit applies only to a valid GET, the
+// request that stores a session, across all clients together. A zero rate
+// turns that limit off. The zero Config has no limits; LoadConfig, which the
+// zdas binary uses, starts from 2 per second with a burst of 10 per client,
+// and no global limit.
 //
 // A client is the peer address of the connection: an IPv4 address, or an
 // IPv6 /64. Behind a reverse proxy, list the proxy in TrustedProxies so that
@@ -112,23 +112,24 @@ type RateLimitConfig struct {
 	AuthorizeBurst     int      `yaml:"authorize_burst"`      // peak burst per client
 	TrustedProxies     []string `yaml:"trusted_proxies"`      // IP addresses or CIDR prefixes
 
-	// GlobalPerSecond and GlobalBurst cap GET /authorize for all clients
-	// together, so that a flood from many addresses gets 429s rather than
-	// filling the session store. The built-in store holds 10,000 sessions
-	// and evicts the oldest beyond that, so keep GlobalPerSecond times
-	// session.timeout in seconds, plus GlobalBurst, under 10,000.
+	// GlobalPerSecond and GlobalBurst cap valid GET /authorize requests
+	// from all clients together, in this process. It is off by default:
+	// once a few addresses use it up, it refuses everyone, which is worse
+	// than the built-in store's own answer to a flood. That store holds
+	// 10,000 sessions and drops the oldest beyond that, so an attacker has
+	// to create 10,000 sessions within one user's sign-in to drop it: about
+	// 77 IPv4 addresses or 5 IPv6 /48s at the default per-client limit for
+	// a sign-in that takes a minute. Set it to keep a shared Store small,
+	// remembering each replica enforces its own, and expect it to refuse
+	// real users under a flood.
 	GlobalPerSecond float64 `yaml:"global_per_second"` // sustained rate, all clients; 0 = disabled
 	GlobalBurst     int     `yaml:"global_burst"`      // peak burst, all clients
 }
 
-// defaultRateLimit is the rate limiting LoadConfig starts from. With the
-// default 10-minute session timeout, the global limit stores at most
-// 5*600+500 = 3,500 sessions from GET /authorize at a time.
+// defaultRateLimit is the rate limiting LoadConfig starts from.
 var defaultRateLimit = RateLimitConfig{
 	AuthorizePerSecond: 2,
 	AuthorizeBurst:     10,
-	GlobalPerSecond:    5,
-	GlobalBurst:        500,
 }
 
 // TLSConfig selects and configures the TLS serving mode.
@@ -385,39 +386,8 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("providers[%d]: duplicate name %q", i, p.Name)
 		}
 		names[p.Name] = struct{}{}
-		switch p.Type {
-		case ProviderTypeGitHub:
-			if p.ClientID == "" || p.ClientSecret == "" {
-				return fmt.Errorf("providers[%d] (%s): client_id and client_secret are required for github", i, p.Name)
-			}
-			if len(p.AllowedEmailDomains) > 0 || len(p.RequiredClaims) > 0 {
-				return fmt.Errorf("providers[%d] (%s): allowed_email_domains and required_claims are for oidc; use allowed_orgs for github", i, p.Name)
-			}
-		case ProviderTypeOIDC:
-			if p.ClientID == "" || p.OIDCIssuerURL == "" {
-				return fmt.Errorf("providers[%d] (%s): client_id and oidc_issuer_url are required for oidc", i, p.Name)
-			}
-			if p.RequireUserInfo && !p.FetchUserInfo {
-				return fmt.Errorf("providers[%d] (%s): require_userinfo needs fetch_userinfo", i, p.Name)
-			}
-			if len(p.AllowedOrgs) > 0 {
-				return fmt.Errorf("providers[%d] (%s): allowed_orgs is for github; use allowed_email_domains or required_claims for oidc", i, p.Name)
-			}
-			for claim, values := range p.RequiredClaims {
-				if len(values) == 0 {
-					return fmt.Errorf("providers[%d] (%s): required_claims.%s lists no values", i, p.Name, claim)
-				}
-			}
-		case "":
-			return fmt.Errorf("providers[%d] (%s): type is required", i, p.Name)
-		default:
-			return fmt.Errorf("providers[%d] (%s): unknown type %q", i, p.Name, p.Type)
-		}
-		switch {
-		case !p.hasPolicy() && !p.AllowAnyUser:
-			return fmt.Errorf("providers[%d] (%s): anyone who can sign in to this provider could enroll; restrict it (allowed_orgs for github, allowed_email_domains or required_claims for oidc) or set allow_any_user: true", i, p.Name)
-		case p.hasPolicy() && p.AllowAnyUser:
-			return fmt.Errorf("providers[%d] (%s): allow_any_user conflicts with the provider's restrictions", i, p.Name)
+		if err := p.check(); err != nil {
+			return fmt.Errorf("providers[%d] (%s): %w", i, p.Name, err)
 		}
 	}
 	if !strings.Contains(c.Claims.NameTemplate, "{username}") || !strings.Contains(c.Claims.NameTemplate, "{device_name}") {
@@ -455,6 +425,52 @@ func (c *Config) Validate() error {
 		}
 	}
 	return c.Claims.checkNames()
+}
+
+// check returns an error for a provider config ZDAS cannot run, or would
+// run more openly than it says: a provider with no policy and no explicit
+// allow_any_user, or with a policy meant for the other type, which that type
+// would ignore. Validate and NewServer both run it, so a Config built in
+// code fails closed too.
+func (p ProviderConfig) check() error {
+	if p.Name == "" {
+		return errors.New("name is required")
+	}
+	switch p.Type {
+	case ProviderTypeGitHub:
+		if p.ClientID == "" || p.ClientSecret == "" {
+			return errors.New("client_id and client_secret are required for github")
+		}
+		if len(p.AllowedEmailDomains) > 0 || len(p.RequiredClaims) > 0 {
+			return errors.New("allowed_email_domains and required_claims are for oidc; use allowed_orgs for github")
+		}
+	case ProviderTypeOIDC:
+		if p.ClientID == "" || p.OIDCIssuerURL == "" {
+			return errors.New("client_id and oidc_issuer_url are required for oidc")
+		}
+		if p.RequireUserInfo && !p.FetchUserInfo {
+			return errors.New("require_userinfo needs fetch_userinfo")
+		}
+		if len(p.AllowedOrgs) > 0 {
+			return errors.New("allowed_orgs is for github; use allowed_email_domains or required_claims for oidc")
+		}
+		for claim, values := range p.RequiredClaims {
+			if len(values) == 0 {
+				return fmt.Errorf("required_claims.%s lists no values", claim)
+			}
+		}
+	case "":
+		return errors.New("type is required")
+	default:
+		return fmt.Errorf("unknown type %q", p.Type)
+	}
+	switch {
+	case !p.hasPolicy() && !p.AllowAnyUser:
+		return errors.New("anyone who can sign in to this provider could enroll; restrict it (allowed_orgs for github, allowed_email_domains or required_claims for oidc) or set allow_any_user: true")
+	case p.hasPolicy() && p.AllowAnyUser:
+		return errors.New("allow_any_user conflicts with the provider's restrictions")
+	}
+	return nil
 }
 
 // checkRequired returns an error for a setting NewServer cannot work
