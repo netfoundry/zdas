@@ -42,9 +42,12 @@ controller:
   #   ziti edge create identity zdas-reconciler \
   #     --permissions identity.read,identity.update -o zdas-reconciler.jwt
   #   ziti edge enroll zdas-reconciler.jwt -o zdas-reconciler.json
-  # identity.update can still change any identity's name and role
-  # attributes, so guard this file. ZDAS warns at startup if the identity is
-  # a full admin.
+  # identity.update still lets it change every field of any identity that
+  # isn't an admin, except its permissions: its name, role attributes,
+  # external ID and auth policy among them. A changed external ID lets
+  # whoever holds that ID sign in as the identity. Guard this file as you
+  # would an identity admin's. ZDAS warns at startup if the identity is a
+  # full admin.
   # identity_file: "/path/to/zdas-reconciler.json"
   # PEM CA bundle for controllers using a private CA (when no identity file).
   # Not needed when the controller has a publicly-trusted cert.
@@ -64,6 +67,9 @@ fallback:
 # discovered from the controller automatically; use this section for providers
 # that aren't registered as ext-jwt-signers (e.g., GitHub) or for embedding
 # scenarios where the controller doesn't know about them.
+# A discovered provider admits every user its issuer signs in. To restrict
+# one, configure a provider here with the signer's name, issuer and client
+# ID, and a policy; ZDAS then uses it in place of the discovered one.
 # providers:
 #   - type: "github"
 #     name: "github"

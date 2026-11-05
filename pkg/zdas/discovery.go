@@ -317,6 +317,12 @@ func (d *signerDiscovery) buildProvider(ctx context.Context, s signerEntry) *OID
 	})
 	if err == nil {
 		d.logger.Info("discovered oidc provider", "name", s.Name, "issuer", s.ExternalAuthURL)
+		if _, seen := d.built[s.Name]; !seen {
+			// A discovered provider has no policy of its own, so say so
+			// once, the first time it appears.
+			d.logger.Warn("discovered provider admits every user its issuer signs in; to restrict who may enroll, configure a provider with this name and a policy",
+				"name", s.Name, "issuer", s.ExternalAuthURL)
+		}
 		return p
 	}
 	if prev, ok := d.built[s.Name]; ok && prev.signer.equal(s) {
