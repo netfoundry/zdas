@@ -229,6 +229,7 @@ func TestIntegrationGitHubFlow(t *testing.T) {
 				ClientSecret:  "test-gh-secret",
 				UsernameField: "login",
 				UserIDField:   "id",
+				AllowAnyUser:  true,
 			},
 		},
 		Claims: ClaimsConfig{

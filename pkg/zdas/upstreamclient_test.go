@@ -3,6 +3,7 @@ package zdas
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/coreos/go-oidc/v3/oidc"
 )
 
 var errRefused = errors.New("refused by the test transport")
@@ -48,12 +51,12 @@ func (rt *recordingTransport) seen() []string {
 // TestOIDCProviderSendsEveryRequestThroughHTTPClient verifies that discovery,
 // the signing keys, the token exchange and userinfo all use
 // OIDCProviderConfig.HTTPClient, so an embedder controls every request the
-// provider makes to the issuer.
+// provider makes to the issuer, even when ctx carries a client too.
 func TestOIDCProviderSendsEveryRequestThroughHTTPClient(t *testing.T) {
 	server, _ := mockOIDCServerWithUserInfo(t, map[string]any{"sub": "user-42"},
 		jsonUserInfo(t, map[string]any{"sub": "user-42", "groups": []string{"eng"}}))
 	rt := &recordingTransport{}
-	ctx := context.Background()
+	ctx := oidc.ClientContext(context.Background(), &http.Client{Transport: &recordingTransport{refuse: true}})
 	p, err := NewOIDCProvider(ctx, OIDCProviderConfig{
 		Name:            "test-idp",
 		Issuer:          server.URL,
@@ -157,8 +160,8 @@ func upstreamClientConfig(t *testing.T, configured, signer string) Config {
 		TLS:         TLSConfig{Mode: TLSModeNone},
 		Controller:  ControllerConfig{APIURL: ctrlServer.URL, SelfIssuer: "https://zdas.test"},
 		Providers: []ProviderConfig{
-			{Type: ProviderTypeOIDC, Name: "configured", ClientID: "test-client", OIDCIssuerURL: configured},
-			{Type: ProviderTypeGitHub, Name: "github", ClientID: "gh-client", ClientSecret: "gh-secret"},
+			{Type: ProviderTypeOIDC, Name: "configured", ClientID: "test-client", OIDCIssuerURL: configured, AllowAnyUser: true},
+			{Type: ProviderTypeGitHub, Name: "github", ClientID: "gh-client", ClientSecret: "gh-secret", AllowAnyUser: true},
 		},
 		Claims:  defaultClaimsConfig(),
 		Token:   TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
@@ -338,5 +341,56 @@ func TestPublicHTTPClient(t *testing.T) {
 	}
 	if c.Transport.(limitedBodyTransport).base.(*http.Transport).Proxy != nil {
 		t.Error("client uses proxy settings")
+	}
+}
+
+// TestOIDCProviderSendsEveryRequestThroughContextClient verifies that,
+// without OIDCProviderConfig.HTTPClient, the client in the ctx passed to
+// NewOIDCProvider makes every request to the issuer, including the token
+// exchange and userinfo, whose addresses come from the issuer's own
+// discovery document.
+func TestOIDCProviderSendsEveryRequestThroughContextClient(t *testing.T) {
+	server, _ := mockOIDCServerWithUserInfo(t, map[string]any{"sub": "user-42"},
+		jsonUserInfo(t, map[string]any{"sub": "user-42"}))
+	rt := &recordingTransport{}
+	ctx := oidc.ClientContext(context.Background(), &http.Client{Transport: rt})
+	p, err := NewOIDCProvider(ctx, OIDCProviderConfig{
+		Name:            "test-idp",
+		Issuer:          server.URL,
+		ClientID:        "test-client",
+		FetchUserInfo:   true,
+		RequireUserInfo: true,
+	})
+	if err != nil {
+		t.Fatalf("NewOIDCProvider: %v", err)
+	}
+	if _, err := p.ExchangeAndIdentify(context.Background(), "fake-code", server.URL+"/callback"); err != nil {
+		t.Fatalf("ExchangeAndIdentify: %v", err)
+	}
+	host := server.Listener.Addr().String()
+	seen := rt.seen()
+	for _, path := range []string{"/.well-known/openid-configuration", "/jwks", "/token", "/userinfo"} {
+		if !slices.Contains(seen, host+path) {
+			t.Errorf("%s did not go through the context's client; it saw %v", path, seen)
+		}
+	}
+}
+
+// TestClientsWithReplacedDefaultTransport verifies that ZDAS's clients work
+// when an embedder has replaced http.DefaultTransport with a RoundTripper
+// that is not an *http.Transport, as tracing wrappers do.
+func TestClientsWithReplacedDefaultTransport(t *testing.T) {
+	orig := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = orig })
+	http.DefaultTransport = &recordingTransport{refuse: true}
+
+	public := PublicHTTPClient()
+	if _, ok := public.Transport.(limitedBodyTransport).base.(*http.Transport); !ok {
+		t.Errorf("PublicHTTPClient transport = %T, want an *http.Transport underneath", public.Transport)
+	}
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	tc := tlsClient(tlsCfg)
+	if tr, ok := tc.Transport.(*http.Transport); !ok || tr.TLSClientConfig != tlsCfg || tr.Proxy == nil {
+		t.Errorf("tlsClient transport = %#v, want an *http.Transport with the TLS config and a proxy func", tc.Transport)
 	}
 }

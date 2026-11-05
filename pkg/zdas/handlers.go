@@ -569,7 +569,7 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 		claims = ComposeClaims(h.cfg.Claims, h.cfg.Fallback, identity, sess.DeviceInfo, sess.FallbackNonce)
 	}
 
-	claims = withNonce(claims, sess.TunnelerNonce)
+	claims = ownClaims(claims, sess.TunnelerNonce)
 	if err := checkClaims(h.cfg.Token, claims); err != nil {
 		h.handleProvisionerError(w, r, fmt.Errorf("provisioner returned claims that cannot be signed: %w", err),
 			sess.TunnelerRedirectURI, sess.TunnelerState, "provider", sess.UpstreamProviderName)
@@ -767,7 +767,7 @@ func (h *endpoints) completeProvision(w http.ResponseWriter, r *http.Request, pe
 		err = errors.New("CompleteProvision called with neither claims nor an error")
 	}
 	if err == nil {
-		claims = withNonce(claims, pp.TunnelerNonce)
+		claims = ownClaims(claims, pp.TunnelerNonce)
 		if cerr := checkClaims(h.cfg.Token, claims); cerr != nil {
 			err = fmt.Errorf("CompleteProvision called with claims that cannot be signed: %w", cerr)
 		}
