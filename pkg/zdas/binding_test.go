@@ -5,6 +5,7 @@ import (
 	"html"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"regexp"
@@ -218,7 +219,7 @@ func TestCallbackRequiresBindingCookie(t *testing.T) {
 				}
 				w := httptest.NewRecorder()
 				mux.ServeHTTP(w, req)
-				if w.Code != http.StatusBadRequest || w.Body.String() != sessionOtherBrowser+"\n" {
+				if w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
 					t.Fatalf("wrong browser: status = %d, body = %s; want 400 and the warning", w.Code, w.Body.String())
 				}
 				if loc := w.Header().Get("Location"); loc != "" {
@@ -228,8 +229,8 @@ func TestCallbackRequiresBindingCookie(t *testing.T) {
 				// The sign-in is gone, for the browser that started it too.
 				w = httptest.NewRecorder()
 				mux.ServeHTTP(w, browserRequest(started, target))
-				if w.Code != http.StatusBadRequest || w.Body.String() != sessionMissing+"\n" {
-					t.Errorf("right browser afterwards: status = %d, body = %s; want 400 not found", w.Code, w.Body.String())
+				if w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
+					t.Errorf("right browser afterwards: status = %d, body = %s; want 400 and the warning", w.Code, w.Body.String())
 				}
 				if loc := w.Header().Get("Location"); loc != "" {
 					t.Errorf("right browser afterwards: Location = %q, want none", loc)
@@ -289,22 +290,96 @@ func TestCallbackFromRightBrowser(t *testing.T) {
 	}
 }
 
-// TestLegacyBoundSession verifies that a session stored the way v0.15.0 and
-// earlier stored it, under its ID and nonce together, is still consumed by
-// the browser with that nonce, and by no other.
-func TestLegacyBoundSession(t *testing.T) {
+// TestOldSessionKeysAreNotRead verifies that sessions stored the way v0.15.0
+// stored them, under kind "session" with the ID alone or the ID and nonce
+// together, are never consumed, from any browser. Reading them would let a
+// sign-in started before an upgrade finish without the binding check.
+func TestOldSessionKeysAreNotRead(t *testing.T) {
 	h, _ := setupHandlers(t)
 	ctx := t.Context()
 	id, nonce := mustID(t), mustID(t)
-	sess := &AuthSession{DeviceInfo: &DeviceInfo{}, UpstreamProviderName: "x", CreatedAt: time.Now()}
-	if err := h.store.CreateSession(ctx, h.storeKey(kindSession, id+"."+nonce), sess); err != nil {
+	issuer := h.cfg.Token.Issuer
+	for _, key := range []string{hashStoreKey("session", issuer, id), hashStoreKey("session", issuer, id+"."+nonce)} {
+		sess := &AuthSession{DeviceInfo: &DeviceInfo{}, UpstreamProviderName: "x", CreatedAt: time.Now()}
+		if err := h.store.CreateSession(ctx, key, sess); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, n := range []string{"", nonce} {
+		if sess, other, err := h.consumeSession(ctx, id, n); sess != nil || other || err != nil {
+			t.Errorf("nonce %q: %v, %v, %v; want a miss", n, sess, other, err)
+		}
+	}
+
+	// And the other way: a session stored now is not under the key a
+	// v0.15.0 replica computes for a request without a cookie, so such a
+	// replica, sharing the Store, can't take it from any browser.
+	newID, err := h.createSession(ctx, &AuthSession{DeviceInfo: &DeviceInfo{}}, nonce)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if sess, other, err := h.consumeSession(ctx, id, ""); sess != nil || other || err != nil {
-		t.Errorf("without the nonce: %v, %v, %v; want a miss", sess, other, err)
+	if got, err := h.store.ConsumeSession(ctx, hashStoreKey("session", issuer, newID)); got != nil || err != nil {
+		t.Errorf("new session found under v0.15.0's key: %v, %v", got, err)
 	}
-	if sess, other, err := h.consumeSession(ctx, id, nonce); sess == nil || other || err != nil {
-		t.Errorf("with the nonce: %v, %v, %v; want the session", sess, other, err)
+}
+
+// TestSessionWithoutBindingHashIsRefused verifies that a session that comes
+// back from the Store without its BindingHash, as from a Store that
+// predates the field, is treated as missing for every browser, rather than
+// matching a request with no cookie.
+func TestSessionWithoutBindingHashIsRefused(t *testing.T) {
+	h, _ := setupHandlers(t)
+	var logs strings.Builder
+	h.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	for _, nonce := range []string{"", testBindingNonce} {
+		id := mustID(t)
+		sess := &AuthSession{DeviceInfo: &DeviceInfo{}, UpstreamProviderName: "x", CreatedAt: time.Now()}
+		if err := h.store.CreateSession(t.Context(), h.storeKey(kindSession, id), sess); err != nil {
+			t.Fatal(err)
+		}
+		if got, other, err := h.consumeSession(t.Context(), id, nonce); got != nil || other || err != nil {
+			t.Errorf("nonce %q: %v, %v, %v; want a miss", nonce, got, other, err)
+		}
+	}
+	if !strings.Contains(logs.String(), "without BindingHash") {
+		t.Errorf("store fault not logged: %s", logs.String())
+	}
+	if _, err := h.createSession(t.Context(), &AuthSession{DeviceInfo: &DeviceInfo{}}, ""); err == nil {
+		t.Error("createSession accepted an empty binding nonce")
+	}
+}
+
+// TestCallbackMissWarns verifies that a /callback with a code or an error
+// that names no session waiting for one warns against sending the address
+// on. That covers a phisher who edits state in the IdP's address before
+// sending it, so that the victim's browser cancels nothing.
+func TestCallbackMissWarns(t *testing.T) {
+	mux := bindingHandlers(t, "https://zdas.example.com")
+	attacker, sessID := startAuthorize(t, mux)
+	for _, target := range []string{
+		"/callback/mock-idp?code=c",
+		"/callback/mock-idp?code=c&state=" + mustID(t),
+		"/callback/mock-idp?code=c&state=garbage",
+		"/callback/mock-idp?error=access_denied&state=" + mustID(t),
+	} {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
+		if w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
+			t.Errorf("%s: %d %s, want 400 and the warning", target, w.Code, w.Body.String())
+		}
+	}
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback/mock-idp?state="+mustID(t), nil))
+	if w.Body.String() != sessionMissing+"\n" {
+		t.Errorf("miss with neither code nor error: %s, want the plain message", w.Body.String())
+	}
+	// The attacker's own session is untouched by the edited addresses: the
+	// binding can't tie the victim's code to it, so the warning is what is
+	// left.
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, browserRequest(attacker, "/callback/mock-idp?code=c&state="+sessID))
+	if w.Code != http.StatusFound {
+		t.Errorf("attacker's session after edited callbacks: %d, want it still live", w.Code)
 	}
 }
 
@@ -350,8 +425,104 @@ func TestSignInLastsOneSessionTimeout(t *testing.T) {
 		time.Sleep(2 * time.Minute)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, browserRequest(consented, "/callback/mock-idp?code=c&state="+state))
-		if w.Code != http.StatusBadRequest || w.Body.String() != sessionMissing+"\n" {
-			t.Errorf("callback 11 minutes after /authorize: %d %s, want 400 not found", w.Code, w.Body.String())
+		if w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
+			t.Errorf("callback 11 minutes after /authorize: %d %s, want 400 and the warning", w.Code, w.Body.String())
 		}
 	})
+}
+
+// jarBrowser drives a handler the way a browser does: a cookie jar decides
+// which cookies each request carries, by domain, path, Secure and expiry,
+// rather than a test replaying every cookie it was sent.
+type jarBrowser struct {
+	h   http.Handler
+	jar *cookiejar.Jar
+}
+
+func newJarBrowser(t *testing.T, h http.Handler) *jarBrowser {
+	t.Helper()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &jarBrowser{h: h, jar: jar}
+}
+
+func (b *jarBrowser) do(req *http.Request) *httptest.ResponseRecorder {
+	for _, c := range b.jar.Cookies(req.URL) {
+		req.AddCookie(c)
+	}
+	w := httptest.NewRecorder()
+	b.h.ServeHTTP(w, req)
+	b.jar.SetCookies(req.URL, w.Result().Cookies())
+	return w
+}
+
+func (b *jarBrowser) get(target string) *httptest.ResponseRecorder {
+	return b.do(httptest.NewRequest(http.MethodGet, target, nil))
+}
+
+func (b *jarBrowser) post(target string, form url.Values) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, target, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return b.do(req)
+}
+
+// TestBindingWithBrowserCookies runs a sign-in under a mount prefix over
+// https, with browsers whose cookie jars choose what they send. The binding
+// cookie must reach consent and /callback under the prefix, the expired one
+// from /authorize must be gone, and a second browser must not finish it.
+func TestBindingWithBrowserCookies(t *testing.T) {
+	const base = "https://zdas.example.com/enroll"
+	mux := http.StripPrefix("/enroll", bindingHandlers(t, base))
+	_, challenge := generateTestPKCE(t)
+	authorize := base + "/authorize?" + url.Values{
+		"redirect_uri":          {"http://localhost:20314/auth/callback"},
+		"response_type":         {"code"},
+		"state":                 {"tstate"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"device_name":           {"laptop"},
+	}.Encode()
+	start := func(b *jarBrowser) string {
+		t.Helper()
+		page := b.get(authorize)
+		field := consentFieldRe.FindStringSubmatch(page.Body.String())
+		if page.Code != http.StatusOK || field == nil {
+			t.Fatalf("authorize: %d %s", page.Code, page.Body)
+		}
+		w := b.post(base+"/authorize", url.Values{"consent": {field[1]}, "idp": {"mock-idp"}})
+		loc, err := url.Parse(w.Header().Get("Location"))
+		if w.Code != http.StatusSeeOther || err != nil {
+			t.Fatalf("consent: %d %s", w.Code, w.Body)
+		}
+		return loc.Query().Get("state")
+	}
+
+	user := newJarBrowser(t, mux)
+	state := start(user)
+	u, _ := url.Parse(base + "/callback/mock-idp")
+	if n := len(user.jar.Cookies(u)); n != 1 {
+		t.Errorf("cookies for /callback = %d, want only the live binding cookie", n)
+	}
+	if outside, _ := url.Parse("https://zdas.example.com/callback/mock-idp"); len(user.jar.Cookies(outside)) != 0 {
+		t.Error("the binding cookie is sent outside the mount prefix")
+	}
+	if insecure, _ := url.Parse("http://zdas.example.com/enroll/callback/mock-idp"); len(user.jar.Cookies(insecure)) != 0 {
+		t.Error("the binding cookie is sent over plain http")
+	}
+	w := user.get(base + "/callback/mock-idp?code=c&state=" + state)
+	if w.Code != http.StatusFound || !strings.HasPrefix(w.Header().Get("Location"), "http://localhost:20314/auth/callback?") {
+		t.Fatalf("callback from the user's browser: %d %s", w.Code, w.Header().Get("Location"))
+	}
+
+	attacker := newJarBrowser(t, mux)
+	state = start(attacker)
+	victim := newJarBrowser(t, mux)
+	if w := victim.get(base + "/callback/mock-idp?code=c&state=" + state); w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
+		t.Errorf("callback from another browser: %d %s, want 400 and the warning", w.Code, w.Body)
+	}
+	if w := attacker.get(base + "/callback/mock-idp?code=c&state=" + state); w.Code == http.StatusFound {
+		t.Errorf("the browser that started the sign-in finished it after another browser cancelled it")
+	}
 }

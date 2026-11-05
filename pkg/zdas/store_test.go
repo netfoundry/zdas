@@ -206,7 +206,7 @@ func TestStoreStaleEntriesAreMisses(t *testing.T) {
 			}
 			w = httptest.NewRecorder()
 			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=x&state="+sid, nil))
-			if w.Code != http.StatusBadRequest || w.Body.String() != sessionMissing+"\n" {
+			if w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
 				t.Errorf("session: status = %d, body = %s; want 400 not found", w.Code, w.Body.String())
 			}
 

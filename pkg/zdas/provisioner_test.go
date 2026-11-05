@@ -89,7 +89,7 @@ func TestProvisionerImmediateClaims(t *testing.T) {
 
 	// Simulate callback.
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+	mux.ServeHTTP(w, seededRequest("/callback?code=c&state="+sessID, sessID))
 	if w.Code != http.StatusFound {
 		t.Fatalf("callback status = %d, body = %s", w.Code, w.Body.String())
 	}
@@ -164,7 +164,7 @@ func TestProvisionerInteractiveRedirect(t *testing.T) {
 
 	// Callback should redirect to the picker page with a pending_id.
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+	mux.ServeHTTP(w, seededRequest("/callback?code=c&state="+sessID, sessID))
 	if w.Code != http.StatusFound {
 		t.Fatalf("callback status = %d", w.Code)
 	}
@@ -253,7 +253,7 @@ func runProvisionerCallback(t *testing.T, p EnrollmentProvisioner) *httptest.Res
 	})
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+	mux.ServeHTTP(w, seededRequest("/callback?code=c&state="+sessID, sessID))
 	return w
 }
 
@@ -610,7 +610,7 @@ func TestProvisionerReceivesEnrollmentMethod(t *testing.T) {
 	})
 
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+	mux.ServeHTTP(w, seededRequest("/callback?code=c&state="+sessID, sessID))
 	if w.Code != http.StatusFound {
 		t.Fatalf("callback status = %d, body = %s", w.Code, w.Body.String())
 	}
@@ -724,7 +724,7 @@ func TestProvisionCompleteTracksFallback(t *testing.T) {
 	})
 
 	cb := httptest.NewRecorder()
-	h.mux().ServeHTTP(cb, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+	h.mux().ServeHTTP(cb, seededRequest("/callback?code=c&state="+sessID, sessID))
 	pick, err := url.Parse(cb.Header().Get("Location"))
 	if err != nil || pick.Query().Get("pending_id") == "" {
 		t.Fatalf("callback: status = %d, Location = %q; want a picker redirect", cb.Code, cb.Header().Get("Location"))
@@ -821,7 +821,7 @@ func TestCallbackDoesNotTrackFailedEnrollment(t *testing.T) {
 	})
 
 	w := httptest.NewRecorder()
-	h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+	h.mux().ServeHTTP(w, seededRequest("/callback?code=c&state="+sessID, sessID))
 	if loc, _ := url.Parse(w.Header().Get("Location")); loc == nil || loc.Query().Get("error") != "server_error" {
 		t.Fatalf("status = %d, Location = %q; want a server_error redirect", w.Code, w.Header().Get("Location"))
 	}
@@ -867,7 +867,7 @@ func TestProvisionerReceivesPendingID(t *testing.T) {
 			UpstreamProviderName: "mock-idp",
 		})
 		w := httptest.NewRecorder()
-		h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+		h.mux().ServeHTTP(w, seededRequest("/callback?code=c&state="+sessID, sessID))
 		return w
 	}
 
@@ -938,7 +938,7 @@ func TestProvisionerAudienceCheckedAtCallback(t *testing.T) {
 			DeviceInfo: &DeviceInfo{DeviceName: "laptop"}, UpstreamProviderName: "mock-idp",
 		})
 		w := httptest.NewRecorder()
-		h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+		h.mux().ServeHTTP(w, seededRequest("/callback?code=c&state="+sessID, sessID))
 		loc, _ := url.Parse(w.Header().Get("Location"))
 		if got := loc.Query().Get("code") != ""; got != tc.ok {
 			t.Errorf("aud %q: Location %s, want code=%v", tc.aud, loc, tc.ok)
@@ -975,7 +975,7 @@ func TestNonceReachesToken(t *testing.T) {
 			DeviceInfo: &DeviceInfo{DeviceName: "laptop"}, UpstreamProviderName: "mock-idp",
 		})
 		w := httptest.NewRecorder()
-		h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+		h.mux().ServeHTTP(w, seededRequest("/callback?code=c&state="+sessID, sessID))
 		if got := codeClaims(h, w)["nonce"]; got != "n-1" {
 			t.Errorf("nonce = %v, want n-1", got)
 		}
@@ -1014,7 +1014,7 @@ func TestNonceKeptForInteractiveProvision(t *testing.T) {
 		DeviceInfo: &DeviceInfo{DeviceName: "laptop"}, UpstreamProviderName: "mock-idp",
 	})
 	w := httptest.NewRecorder()
-	h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+	h.mux().ServeHTTP(w, seededRequest("/callback?code=c&state="+sessID, sessID))
 	loc, _ := url.Parse(w.Header().Get("Location"))
 	pp := consumePending(h, loc.Query().Get("pending_id"))
 	if pp == nil || pp.TunnelerNonce != "n-3" {
@@ -1036,27 +1036,36 @@ func TestStoredClaimsAreCopies(t *testing.T) {
 		return ac.Claims
 	}
 
-	t.Run("Provision", func(t *testing.T) {
-		ks, _ := GenerateKeySet()
-		reg := NewProviderRegistry()
-		_ = reg.Register(&callbackProvider{name: "mock-idp", issuer: "https://mock-idp", identity: &UpstreamIdentity{Subject: "u1", Username: "alice", Issuer: "https://mock-idp"}})
-		store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
-		t.Cleanup(store.stop)
-		provisioned := map[string]any{"device_identity_name": "alice-laptop", "device_external_id": "e1", "sub": "e1"}
-		cfg := Config{ExternalURL: "https://zdas.test", Claims: defaultClaimsConfig(), Token: TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: time.Minute}}
-		h := newTestEndpoints(cfg, ks, reg, store, &immediateProvisioner{claims: provisioned})
-		sessID := seedSession(t, h, &AuthSession{
-			TunnelerRedirectURI: "http://localhost:20314/auth/callback", TunnelerState: "s",
-			TunnelerCodeChallenge: "c", TunnelerCodeChallengeMethod: "S256",
-			DeviceInfo: &DeviceInfo{DeviceName: "laptop"}, UpstreamProviderName: "mock-idp",
+	for _, nonce := range []string{"", "n-1"} {
+		t.Run("Provision/nonce="+nonce, func(t *testing.T) {
+			ks, _ := GenerateKeySet()
+			reg := NewProviderRegistry()
+			_ = reg.Register(&callbackProvider{name: "mock-idp", issuer: "https://mock-idp", identity: &UpstreamIdentity{Subject: "u1", Username: "alice", Issuer: "https://mock-idp"}})
+			store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+			t.Cleanup(store.stop)
+			provisioned := map[string]any{"device_identity_name": "alice-laptop", "device_external_id": "e1", "sub": "e1"}
+			cfg := Config{ExternalURL: "https://zdas.test", Claims: defaultClaimsConfig(), Token: TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: time.Minute}}
+			h := newTestEndpoints(cfg, ks, reg, store, &immediateProvisioner{claims: provisioned})
+			sessID := seedSession(t, h, &AuthSession{
+				TunnelerRedirectURI: "http://localhost:20314/auth/callback", TunnelerState: "s", TunnelerNonce: nonce,
+				TunnelerCodeChallenge: "c", TunnelerCodeChallengeMethod: "S256",
+				DeviceInfo: &DeviceInfo{DeviceName: "laptop"}, UpstreamProviderName: "mock-idp",
+			})
+			w := httptest.NewRecorder()
+			h.mux().ServeHTTP(w, seededRequest("/callback?code=c&state="+sessID, sessID))
+			provisioned["device_identity_name"] = "bob-laptop"
+			stored := codeClaims(h, w)
+			if got := stored["device_identity_name"]; got != "alice-laptop" {
+				t.Errorf("stored name = %v after the provisioner changed its map, want alice-laptop", got)
+			}
+			if _, set := provisioned["nonce"]; set {
+				t.Error("the nonce was written into the provisioner's map")
+			}
+			if nonce != "" && stored["nonce"] != nonce {
+				t.Errorf("stored nonce = %v, want %s", stored["nonce"], nonce)
+			}
 		})
-		w := httptest.NewRecorder()
-		h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
-		provisioned["device_identity_name"] = "bob-laptop"
-		if got := codeClaims(h, w)["device_identity_name"]; got != "alice-laptop" {
-			t.Errorf("stored name = %v after the provisioner changed its map, want alice-laptop", got)
-		}
-	})
+	}
 
 	t.Run("CompleteProvision", func(t *testing.T) {
 		h, _ := setupProvisionComplete(t)

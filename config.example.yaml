@@ -45,9 +45,9 @@ controller:
   # identity.update still lets it change every field of any identity that
   # isn't an admin, except its permissions: its name, role attributes,
   # external ID and auth policy among them. A changed external ID lets
-  # whoever holds that ID sign in as the identity. Guard this file as you
-  # would an identity admin's. ZDAS warns at startup if the identity is a
-  # full admin.
+  # whoever holds that ID sign in as the identity, so whoever holds this file
+  # can take over any non-admin identity. Guard it as you would an identity
+  # admin's. ZDAS warns at startup if the identity is a full admin.
   # identity_file: "/path/to/zdas-reconciler.json"
   # PEM CA bundle for controllers using a private CA (when no identity file).
   # Not needed when the controller has a publicly-trusted cert.
@@ -69,7 +69,9 @@ fallback:
 # scenarios where the controller doesn't know about them.
 # A discovered provider admits every user its issuer signs in. To restrict
 # one, configure a provider here with the signer's name, issuer and client
-# ID, and a policy; ZDAS then uses it in place of the discovered one.
+# ID, and a policy; ZDAS then uses it in place of the discovered one. Its
+# scopes replace the defaults, so list openid, profile and email plus any the
+# signer adds or the policy needs.
 # providers:
 #   - type: "github"
 #     name: "github"
@@ -117,7 +119,8 @@ token:
   # matching the audience of ZDAS's signer on that network.
   # provisioner_audiences: ["network-a", "network-b"]
 
-# Session settings
+# Session settings. timeout covers a whole sign-in, from the tunneler
+# opening /authorize to the IdP's callback, consent page included.
 session:
   timeout: "10m"
   code_expiry: "60s"
@@ -129,10 +132,11 @@ session:
 #   - Per client, on by default: a client is the connection's peer address
 #     (an IPv4 address or an IPv6 /64).
 #   - Global, off by default: valid GET /authorize from all clients
-#     together. A few addresses can use it up and so refuse everyone, which
-#     is worse than the built-in store's answer to a flood (it holds 10,000
-#     sessions and drops the oldest). Set it only to keep a shared store
-#     small.
+#     together, per replica. A few addresses can use it up and so refuse
+#     everyone, which is worse than the built-in store's answer to a flood:
+#     it holds 10,000 sessions and drops the oldest, which takes about 77
+#     IPv4 addresses or 5 IPv6 /48s to do within a one-minute sign-in. Set
+#     it only to keep a shared store small.
 # Set a rate to 0 to turn that limit off, e.g. when something in front of
 # ZDAS already limits /authorize.
 #

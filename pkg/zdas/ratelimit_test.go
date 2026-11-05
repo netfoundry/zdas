@@ -444,8 +444,11 @@ func TestGlobalLimitSpentOnlyByValidRequests(t *testing.T) {
 // TestDefaultRateLimitSurvivesFlood drives GET /authorize from a few
 // attacker addresses, each at its per-client rate, under the LoadConfig
 // defaults, and requires that a legitimate user from a fresh address is
-// never refused. A global limit shared by all clients fails this: a few
-// addresses use it up and everyone else gets 429.
+// never refused, and that a sign-in held open for a minute during the flood
+// is not evicted. A global limit shared by all clients fails the first: a
+// few addresses use it up and everyone else gets 429. The second holds
+// while the flood creates fewer than the store's 10,000 sessions in that
+// minute; about 77 IPv4 addresses or 5 IPv6 /48s would create more.
 func TestDefaultRateLimitSurvivesFlood(t *testing.T) {
 	ipv4 := func(n int) []string {
 		out := make([]string, n)
@@ -499,13 +502,24 @@ func TestDefaultRateLimitSurvivesFlood(t *testing.T) {
 				perSec := int(time.Second / step)
 				steps := int(12 * time.Minute / step)
 				probeFrom := int(10 * time.Minute / step)
+				consentAt := probeFrom + int(time.Minute/step)
 				probes, refused := 0, 0
+				var held *httptest.ResponseRecorder
 				for i := range steps {
 					send(tc.attackers[i%n], validURL)
 					if i >= probeFrom && i%perSec == 0 {
 						probes++
 						if send(fmt.Sprintf("198.51.100.%d:1", probes%250+1), validURL) == http.StatusTooManyRequests {
 							refused++
+						}
+					}
+					switch i {
+					case probeFrom:
+						held = httptest.NewRecorder()
+						mux.ServeHTTP(held, httptest.NewRequest(http.MethodGet, validURL, nil))
+					case consentAt:
+						if w := consent(t, mux, held, ""); w.Code != http.StatusSeeOther {
+							t.Errorf("sign-in held for a minute during the flood: consent %d, want 303", w.Code)
 						}
 					}
 					time.Sleep(step)

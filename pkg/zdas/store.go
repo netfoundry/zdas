@@ -57,7 +57,11 @@ type Store interface {
 // Entry kinds, folded into store keys so that an ID of one kind can never
 // select an entry of another.
 const (
-	kindSession   = "session"
+	// kindSession changed in v0.16.0, when sessions moved to their bare ID
+	// with a BindingHash. A v0.15.0 replica sharing the Store derives a
+	// different key, so it misses these sessions rather than accepting
+	// them from any browser, and v0.16.0 misses its sessions in turn.
+	kindSession   = "session.v2"
 	kindCode      = "code"
 	kindProvision = "provision"
 )

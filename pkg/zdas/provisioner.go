@@ -104,7 +104,10 @@ type ProvisionResult struct {
 	// Claims to include in the ZDAS JWT. When non-empty, ZDAS mints the
 	// token immediately. The map should include at minimum the identity
 	// name claim and external ID claim from ClaimsConfig, and a registered
-	// claim such as sub must have the type the JWT spec gives it.
+	// claim such as sub must have the type the JWT spec gives it. ZDAS
+	// keeps a shallow copy until /token, so the provisioner may reuse or
+	// change the map after Provision returns, but not values nested inside
+	// it, such as a slice of groups.
 	Claims map[string]any
 
 	// RedirectURL, when non-empty and Claims is empty, redirects the browser

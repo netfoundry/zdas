@@ -28,18 +28,17 @@ func bindingCookieScope(externalURL string) (path string, secure bool) {
 }
 
 // bindingHash returns what a session keeps of the nonce in its browser's
-// binding cookie: its SHA-256 in hex, or "" for no nonce. The store holds
-// only the hash, so reading it does not give anyone the cookie.
+// binding cookie: its SHA-256 in hex. The store holds only the hash, so
+// reading it does not give anyone the cookie.
 //
 // A session is stored under its bare ID, so a request that names it but
 // lacks the cookie still finds it, and consumes it. That cancels a sign-in
-// that reaches the wrong browser: a phisher who consents in their own
-// browser and sends the victim the IdP's address finds the session gone by
-// the time the victim's /callback address gets back to them.
+// whose session ID reaches the wrong browser: a phisher who consents in
+// their own browser and sends the victim the IdP's address as ZDAS issued
+// it finds the session gone by the time the victim's /callback address gets
+// back to them. One who edits the state in that address before sending it
+// is not stopped here; handleCallback warns the victim instead.
 func bindingHash(nonce string) string {
-	if nonce == "" {
-		return ""
-	}
 	sum := sha256.Sum256([]byte(nonce))
 	return hex.EncodeToString(sum[:])
 }

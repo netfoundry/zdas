@@ -394,3 +394,37 @@ func TestClientsWithReplacedDefaultTransport(t *testing.T) {
 		t.Errorf("tlsClient transport = %#v, want an *http.Transport with the TLS config and a proxy func", tc.Transport)
 	}
 }
+
+// TestOIDCProviderBoundsContextClient verifies that a client taken from ctx
+// gets ZDAS's response size cap and, when it has none, ZDAS's timeout,
+// since it now makes the token and userinfo requests too.
+func TestOIDCProviderBoundsContextClient(t *testing.T) {
+	var issuer string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"padding":                strings.Repeat("x", maxResponseBytes),
+			"issuer":                 issuer,
+			"authorization_endpoint": issuer + "/authorize",
+			"token_endpoint":         issuer + "/token",
+			"jwks_uri":               issuer + "/jwks",
+		})
+	}))
+	t.Cleanup(srv.Close)
+	issuer = srv.URL
+	ctx := oidc.ClientContext(context.Background(), &http.Client{})
+	if _, err := NewOIDCProvider(ctx, OIDCProviderConfig{Name: "big", Issuer: issuer, ClientID: "c"}); err == nil {
+		t.Error("oversized discovery document accepted through a ctx client")
+	}
+
+	bc := boundedClient(&http.Client{})
+	if bc.Timeout != outboundTimeout {
+		t.Errorf("timeout = %v, want %v for a client with none", bc.Timeout, outboundTimeout)
+	}
+	if _, ok := bc.Transport.(limitedBodyTransport); !ok {
+		t.Errorf("transport = %T, want limitedBodyTransport", bc.Transport)
+	}
+	if bc := boundedClient(&http.Client{Timeout: time.Second}); bc.Timeout != time.Second {
+		t.Errorf("timeout = %v, want the client's own", bc.Timeout)
+	}
+}
