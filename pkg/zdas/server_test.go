@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -404,6 +405,10 @@ func TestNewServerChecksProviders(t *testing.T) {
 		{"oidc with a github policy", ProviderConfig{Type: ProviderTypeOIDC, Name: "kc", ClientID: "c", OIDCIssuerURL: "https://idp.invalid", AllowedOrgs: []string{"acme"}}, "allowed_orgs is for github"},
 		{"policy and allow_any_user", ProviderConfig{Type: ProviderTypeGitHub, Name: "gh", ClientID: "c", ClientSecret: "s", AllowedOrgs: []string{"acme"}, AllowAnyUser: true}, "conflicts"},
 		{"no name", ProviderConfig{Type: ProviderTypeGitHub, ClientID: "c", ClientSecret: "s", AllowAnyUser: true}, "name is required"},
+		{"dot-dot name", ProviderConfig{Type: ProviderTypeGitHub, Name: "..", ClientID: "c", ClientSecret: "s", AllowAnyUser: true}, "can't be a callback path segment"},
+		{"control character in name", ProviderConfig{Type: ProviderTypeGitHub, Name: "gh\n", ClientID: "c", ClientSecret: "s", AllowAnyUser: true}, "control characters"},
+		{"invalid UTF-8 in name", ProviderConfig{Type: ProviderTypeGitHub, Name: "gh\xff", ClientID: "c", ClientSecret: "s", AllowAnyUser: true}, "not valid UTF-8"},
+		{"long name", ProviderConfig{Type: ProviderTypeGitHub, Name: strings.Repeat("g", maxProviderNameLength+1), ClientID: "c", ClientSecret: "s", AllowAnyUser: true}, "longer than"},
 		{"github without a secret", ProviderConfig{Type: ProviderTypeGitHub, Name: "gh", ClientID: "c", AllowAnyUser: true}, "client_id and client_secret are required"},
 		{"oidc without an issuer", ProviderConfig{Type: ProviderTypeOIDC, Name: "kc", ClientID: "c", AllowAnyUser: true}, "client_id and oidc_issuer_url are required"},
 		{"require_userinfo without fetch", ProviderConfig{Type: ProviderTypeOIDC, Name: "kc", ClientID: "c", OIDCIssuerURL: "https://idp.invalid", RequireUserInfo: true, AllowAnyUser: true}, "require_userinfo needs fetch_userinfo"},
@@ -416,7 +421,7 @@ func TestNewServerChecksProviders(t *testing.T) {
 			cfg := replicaConfig(t)
 			cfg.Providers = []ProviderConfig{tc.pc}
 			_, err := NewServer(cfg, slog.Default())
-			if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), `"`+tc.pc.Name+`"`) {
+			if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), strconv.Quote(tc.pc.Name)) {
 				t.Errorf("NewServer = %v, want an error naming %q and containing %q", err, tc.pc.Name, tc.want)
 			}
 		})

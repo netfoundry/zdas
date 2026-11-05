@@ -534,6 +534,9 @@ func TestValidateProviderPolicy(t *testing.T) {
 		{"oidc any user", with(oidc, func(p *ProviderConfig) { p.AllowAnyUser = true }), ""},
 		{"oidc with orgs", with(oidc, func(p *ProviderConfig) { p.AllowedOrgs = []string{"acme"} }), "is for github"},
 		{"oidc claim without values", with(oidc, func(p *ProviderConfig) { p.RequiredClaims = map[string][]string{"groups": nil} }), "lists no values"},
+		{"dot name", with(gh, func(p *ProviderConfig) { p.Name = "."; p.AllowAnyUser = true }), "callback path segment"},
+		{"name with a space", with(oidc, func(p *ProviderConfig) { p.Name = "Keycloak Prod"; p.AllowAnyUser = true }), ""},
+		{"name at the length limit", with(oidc, func(p *ProviderConfig) { p.Name = strings.Repeat("k", maxProviderNameLength); p.AllowAnyUser = true }), ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

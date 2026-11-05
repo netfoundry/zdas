@@ -446,9 +446,10 @@ func TestGlobalLimitSpentOnlyByValidRequests(t *testing.T) {
 // defaults, and requires that a legitimate user from a fresh address is
 // never refused, and that a sign-in held open for a minute during the flood
 // is not evicted. A global limit shared by all clients fails the first: a
-// few addresses use it up and everyone else gets 429. The second holds
-// while the flood creates fewer than the store's 10,000 sessions in that
-// minute; about 77 IPv4 addresses or 5 IPv6 /48s would create more.
+// few addresses use it up and everyone else gets 429, which the v0.15.0
+// case shows. The second holds while the flood creates fewer than the
+// store's 10,000 sessions in that minute; TestEvictionThreshold finds where
+// it stops holding.
 func TestDefaultRateLimitSurvivesFlood(t *testing.T) {
 	ipv4 := func(n int) []string {
 		out := make([]string, n)
@@ -461,13 +462,19 @@ func TestDefaultRateLimitSurvivesFlood(t *testing.T) {
 	for i := range site {
 		site[i] = fmt.Sprintf("[2001:db8:1:%x::1]:1", i)
 	}
+	// v0.15.0's example config turned a global limit on.
+	withGlobal := defaultRateLimit
+	withGlobal.GlobalPerSecond, withGlobal.GlobalBurst = 5, 500
 	cases := []struct {
-		name      string
-		attackers []string
+		name        string
+		attackers   []string
+		limits      RateLimitConfig
+		wantRefused bool
 	}{
-		{"3 IPv4", ipv4(3)},
-		{"30 IPv4", ipv4(30)},
-		{"one IPv6 /48", site},
+		{"3 IPv4", ipv4(3), defaultRateLimit, false},
+		{"30 IPv4", ipv4(30), defaultRateLimit, false},
+		{"one IPv6 /48", site, defaultRateLimit, false},
+		{"3 IPv4 with v0.15.0's global limit", ipv4(3), withGlobal, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -481,7 +488,7 @@ func TestDefaultRateLimitSurvivesFlood(t *testing.T) {
 					ExternalURL: "https://zdas.example.com",
 					Claims:      defaultClaimsConfig(),
 					Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
-					RateLimit:   defaultRateLimit,
+					RateLimit:   tc.limits,
 				}
 				mux := newTestEndpoints(cfg, ks, reg, store, nil).mux()
 				validURL := authorizeURL(t, nil)
@@ -513,6 +520,10 @@ func TestDefaultRateLimitSurvivesFlood(t *testing.T) {
 							refused++
 						}
 					}
+					if tc.wantRefused {
+						time.Sleep(step)
+						continue
+					}
 					switch i {
 					case probeFrom:
 						held = httptest.NewRecorder()
@@ -524,10 +535,101 @@ func TestDefaultRateLimitSurvivesFlood(t *testing.T) {
 					}
 					time.Sleep(step)
 				}
-				if refused > 0 {
+				if tc.wantRefused && refused == 0 {
+					t.Errorf("none of %d legitimate requests refused; the global limit should refuse them", probes)
+				}
+				if !tc.wantRefused && refused > 0 {
 					t.Errorf("%d of %d legitimate requests refused with 429", refused, probes)
 				}
 			})
+		})
+	}
+}
+
+// TestEvictionThreshold checks the figures docs/security.md and
+// config.example.yaml give for the defaults: attackers who each spend their
+// burst and then send at their per-client rate evict a sign-in held for a
+// minute before consent from 77 IPv4 addresses, or from 5 IPv6 /48s, but
+// not from one fewer.
+func TestEvictionThreshold(t *testing.T) {
+	ipv4 := func(n int) [][]string {
+		out := make([][]string, n)
+		for i := range out {
+			out[i] = []string{fmt.Sprintf("10.%d.%d.1:1", i/250, i%250)}
+		}
+		return out
+	}
+	ipv6 := func(n int) [][]string { // each group is one /48, as many /64s as its site bucket covers
+		out := make([][]string, n)
+		for i := range out {
+			for j := range siteRateMultiplier {
+				out[i] = append(out[i], fmt.Sprintf("[2001:db8:%x:%x::1]:1", i+1, j))
+			}
+		}
+		return out
+	}
+	const hold = time.Minute
+	evicted := func(t *testing.T, groups [][]string) (gone bool) {
+		synctest.Test(t, func(t *testing.T) {
+			ks, _ := GenerateKeySet()
+			reg := NewProviderRegistry()
+			_ = reg.Register(&stubProvider{name: "test-idp", issuer: "https://test-idp"})
+			store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+			defer store.stop()
+			cfg := Config{
+				ExternalURL: "https://zdas.example.com",
+				Claims:      defaultClaimsConfig(),
+				Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
+				RateLimit:   defaultRateLimit,
+			}
+			mux := newTestEndpoints(cfg, ks, reg, store, nil).mux()
+			validURL := authorizeURL(t, nil)
+			page := httptest.NewRecorder()
+			mux.ServeHTTP(page, httptest.NewRequest(http.MethodGet, validURL, nil))
+			for elapsed := time.Duration(0); elapsed <= hold; elapsed += 500 * time.Millisecond {
+				for _, g := range groups {
+					for _, addr := range g {
+						sends := 1
+						if elapsed == 0 {
+							sends = defaultRateLimit.AuthorizeBurst
+						}
+						for range sends {
+							req := httptest.NewRequest(http.MethodGet, validURL, nil)
+							req.RemoteAddr = addr
+							w := httptest.NewRecorder()
+							mux.ServeHTTP(w, req)
+							if w.Code != http.StatusOK {
+								t.Fatalf("attacker %s refused: %d; the attack should stay under the limits", addr, w.Code)
+							}
+						}
+					}
+				}
+				if elapsed < hold {
+					time.Sleep(500 * time.Millisecond)
+				}
+			}
+			switch w := consent(t, mux, page, ""); w.Code {
+			case http.StatusSeeOther:
+			case http.StatusBadRequest:
+				gone = true
+			default:
+				t.Fatalf("consent: %d %s, want 303, or 400 for an evicted sign-in", w.Code, w.Body)
+			}
+		})
+		return gone
+	}
+	for _, tc := range []struct {
+		name   string
+		groups func(int) [][]string
+		n      int
+	}{{"IPv4 addresses", ipv4, 77}, {"IPv6 /48s", ipv6, 5}} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !evicted(t, tc.groups(tc.n)) {
+				t.Errorf("%d %s did not evict the held sign-in", tc.n, tc.name)
+			}
+			if evicted(t, tc.groups(tc.n-1)) {
+				t.Errorf("%d %s evicted the held sign-in", tc.n-1, tc.name)
+			}
 		})
 	}
 }

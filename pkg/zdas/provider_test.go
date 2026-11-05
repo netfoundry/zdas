@@ -83,9 +83,24 @@ func TestRegistryResolveEmptyHintMultiple(t *testing.T) {
 
 func TestRegistryResolveUnknown(t *testing.T) {
 	r := NewProviderRegistry()
+	if err := r.Register(&stubProvider{name: "known", issuer: "https://known"}); err != nil {
+		t.Fatal(err)
+	}
 	_, err := r.Resolve("nope")
 	if err == nil || !strings.Contains(err.Error(), "unknown idp") {
 		t.Errorf("expected unknown idp error, got %v", err)
+	}
+}
+
+// TestRegistryResolveEmpty verifies that an empty registry is
+// ErrNoProviders whatever the hint, so a caller can tell an outage from a
+// bad choice.
+func TestRegistryResolveEmpty(t *testing.T) {
+	r := NewProviderRegistry()
+	for _, hint := range []string{"", "nope", "https://issuer"} {
+		if _, err := r.Resolve(hint); !errors.Is(err, ErrNoProviders) {
+			t.Errorf("Resolve(%q) = %v, want ErrNoProviders", hint, err)
+		}
 	}
 }
 

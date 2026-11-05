@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -35,6 +36,7 @@ type endpoints struct {
 	rateLimiter *ipRateLimiter        // nil when rate limiting is disabled
 	globalLimit *rate.Limiter         // GET /authorize for all clients; nil when disabled
 	rejections  *rejectionLog         // counts and logs what the limits refuse
+	misses      callbackMissLog       // counts and logs callbacks that finish no sign-in
 	redirects   []*url.URL            // parsed cfg.AllowedRedirectURIs; nil keeps the loopback default
 	logger      *slog.Logger
 
@@ -64,6 +66,7 @@ func newEndpoints(cfg Config, keys *KeySet, verifyKeys []*KeySet, registry *Prov
 	h.cookiePath, h.cookieSecure = bindingCookieScope(cfg.ExternalURL)
 	h.rateLimiter = newIPRateLimiter(cfg.RateLimit, logger)
 	h.rejections = newRejectionLog(logger)
+	h.misses.log.Interval = callbackMissLogInterval
 	if rl := cfg.RateLimit; rl.GlobalPerSecond > 0 {
 		h.globalLimit = rate.NewLimiter(rate.Limit(rl.GlobalPerSecond), defaultBurst(rl.GlobalPerSecond, rl.GlobalBurst))
 	}
@@ -83,6 +86,8 @@ func (h *endpoints) mux() *http.ServeMux {
 	mux.HandleFunc("POST /authorize", h.handleConsent)
 	mux.HandleFunc("GET /callback", h.handleCallback)
 	mux.HandleFunc("GET /callback/{provider}", h.handleCallback)
+	mux.HandleFunc("/callback", h.handleStrayCallback)
+	mux.HandleFunc("/callback/", h.handleStrayCallback)
 	mux.HandleFunc("POST /token", h.handleToken)
 	return mux
 }
@@ -249,6 +254,11 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		fallbackNonce = nonce
 	} else if len(deviceName) > 255 {
 		oidcErrorRedirect(w, r, redirectURI, state, "invalid_request", "device_name too long (max 255 characters)")
+		return
+	} else if displayText(deviceName, maxDisplayedDeviceRunes) == "" {
+		// The consent page would show the hostname instead, while the
+		// identity is named after this.
+		oidcErrorRedirect(w, r, redirectURI, state, "invalid_request", "device_name must contain visible characters")
 		return
 	} else if strings.Contains(deviceName, ":") {
 		// The external ID hashes issuer, subject and device name joined by
@@ -419,19 +429,17 @@ func (h *endpoints) handleConsent(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, upstreamURL, http.StatusSeeOther)
 }
 
-// sessionMissing is the /callback response when no session matches and
-// the request carries neither a code nor an error.
-const sessionMissing = "sign-in not found or expired; start again from the app"
-
 // sessionWarning is the response to a consent post or /callback that
-// cannot be finished: from a browser that did not start the sign-in, which
-// cancels it, or a /callback with a code or an error that names no session
-// waiting for one. A phisher who starts a sign-in in their own browser and
-// sends the victim the IdP's address needs the victim to send back the
-// address this lands on, so the text warns against exactly that.
-const sessionWarning = "This sign-in can't be finished here: it has expired, was cancelled, or was started in a different browser. " +
-	"If you were signing in yourself, start again from the app and finish in the browser it opens. " +
-	"If someone sent you a sign-in link, or asks you to send them this page's address, don't: it would let them enroll a device as you."
+// finishes no sign-in: from a browser that did not start it, which cancels
+// it, or a /callback that names no session waiting for one. A phisher who
+// starts a sign-in in their own browser and sends the victim the IdP's
+// address needs the victim to send back the address this lands on, so the
+// text warns against exactly that, first. It also follows a reload after a
+// sign-in that worked, so it ends with what to do then.
+const sessionWarning = "This sign-in can't be finished here. " +
+	"If someone sent you a sign-in link, or asks you to send them this page's address, don't: it would let them enroll a device as you. " +
+	"If you were signing in yourself, it has expired, was cancelled, or was started in a different browser: start again from the app and finish in the browser it opens. " +
+	"If you had already finished, you can close this page."
 
 func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -453,15 +461,14 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	// A session without a provider is still waiting for consent.
 	if sess == nil || sess.UpstreamProviderName == "" {
-		// A phisher who started the sign-in can edit state in the IdP's
-		// address, so that the victim's browser names no session here and
-		// cancels nothing, then finish it with the address the victim sends
-		// back. So a miss that carries a code or an error warns too.
-		msg := sessionMissing
-		if code != "" || q.Get("error") != "" {
-			msg = sessionWarning
-		}
-		http.Error(w, msg, http.StatusBadRequest)
+		// A phisher who started the sign-in can edit the IdP's address so
+		// that the victim's browser names no session here and cancels
+		// nothing, then finish it with the address the victim sends back.
+		// The edit can also move the code out of the query (into a
+		// fragment, a JWT or a form post), so every miss warns, whatever the
+		// query holds.
+		h.misses.add(h.logger, r, code != "")
+		http.Error(w, sessionWarning, http.StatusBadRequest)
 		return
 	}
 
@@ -618,6 +625,59 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	h.logger.Info("callback complete, redirecting to tunneler", "provider", provider.Name(), "device", deviceLog)
 	http.Redirect(w, r, redir, http.StatusFound)
+}
+
+// maxCallbackFormBytes caps the body a stray POST to /callback is read for
+// its state. A form_post response can carry an ID token next to it.
+const maxCallbackFormBytes = 64 << 10
+
+// handleStrayCallback answers what reaches /callback other than a GET of a
+// provider's callback: another method, such as an IdP's form_post response,
+// or a path below a callback, which GitHub accepts as a redirect_uri. ZDAS
+// never asks for either, so it comes from an IdP address someone edited.
+// The session its state names is consumed, cancelling a phisher's sign-in
+// as handleCallback does for another browser, and the browser is warned.
+func (h *endpoints) handleStrayCallback(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxCallbackFormBytes)
+	sess, otherBrowser, err := h.consumeBoundSession(w, r, r.FormValue("state"))
+	if err != nil {
+		h.logger.Error("consume session", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if sess != nil || otherBrowser {
+		h.logger.Warn("sign-in response at a callback ZDAS never asked for; cancelled it", "method", r.Method, "path", r.URL.Path)
+	}
+	h.misses.add(h.logger, r, r.FormValue("code") != "")
+	http.Error(w, sessionWarning, http.StatusBadRequest)
+}
+
+// callbackMissLogInterval is the least time between log lines about
+// callbacks that finish no sign-in.
+const callbackMissLogInterval = time.Minute
+
+// callbackMissLog counts the /callback requests that finish no sign-in, and
+// logs how many at most once per callbackMissLogInterval. One that carries a
+// code can be a phisher's edited IdP address, so operators can see them
+// without a flood filling the log.
+type callbackMissLog struct {
+	count    atomic.Int64
+	withCode atomic.Int64
+	log      rate.Sometimes
+}
+
+// add counts one miss, whether it carried a code, and logs the counts since
+// the last line when callbackMissLogInterval has passed. It reads nothing
+// from r but its method and path, so the log never reads a request body.
+func (l *callbackMissLog) add(logger *slog.Logger, r *http.Request, hadCode bool) {
+	l.count.Add(1)
+	if hadCode {
+		l.withCode.Add(1)
+	}
+	l.log.Do(func() {
+		logger.Warn("callbacks finished no sign-in; one with a code may be from an edited sign-in link",
+			"count", l.count.Swap(0), "with_code", l.withCode.Swap(0), "last_method", r.Method, "last_path", r.URL.Path)
+	})
 }
 
 // maxTokenRequestBytes caps a /token request body. A real one is a few
@@ -1058,24 +1118,30 @@ const maxDisplayedDeviceRunes = 64
 const maxCombiningMarks = 2
 
 // displayText returns s for showing on a page: without control, format
-// (bidi override) and other unprintable characters or invalid UTF-8, with
-// at most maxCombiningMarks marks on any character, and cut to at most
-// limit runes, with an ellipsis when cut.
+// (bidi override) and other unprintable characters, characters that print
+// as blank, invalid UTF-8, leading or trailing spaces and marks with no
+// character before them, with at most maxCombiningMarks marks on any
+// character, and cut to at most limit
+// characters and their marks, with an ellipsis when cut. It returns "" for
+// text that would show as nothing.
 func displayText(s string, limit int) string {
 	var b strings.Builder
 	n, marks := 0, 0
 	for _, r := range s {
-		if r == utf8.RuneError || !unicode.IsPrint(r) {
+		if r == utf8.RuneError || !unicode.IsPrint(r) || printsBlank(r) || (r == ' ' && n == 0) {
 			continue
 		}
 		if unicode.Is(unicode.M, r) {
-			if marks == maxCombiningMarks {
+			// A mark with no character before it shows as nothing, or
+			// stacks over ZDAS's own text.
+			if n == 0 || marks == maxCombiningMarks {
 				continue
 			}
 			marks++
-		} else {
-			marks = 0
+			b.WriteRune(r)
+			continue
 		}
+		marks = 0
 		if n == limit {
 			b.WriteString("…")
 			break
@@ -1083,7 +1149,18 @@ func displayText(s string, limit int) string {
 		b.WriteRune(r)
 		n++
 	}
-	return b.String()
+	return strings.TrimRight(b.String(), " ")
+}
+
+// printsBlank reports whether r is a printable character that renders as
+// blank space: Hangul fillers, the Braille blank and Khmer's inherent
+// vowels.
+func printsBlank(r rune) bool {
+	switch r {
+	case '\u115F', '\u1160', '\u17B4', '\u17B5', '\u2800', '\u3164', '\uFFA0':
+		return true
+	}
+	return false
 }
 
 // consentPage is the page renderConsent shows. The form has no action, so

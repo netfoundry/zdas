@@ -34,8 +34,14 @@ type limitedBodyTransport struct {
 	base http.RoundTripper
 }
 
+// A nil base is http.DefaultTransport at the time of the request, as for
+// an http.Client with no Transport.
 func (t limitedBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := t.base.RoundTrip(req)
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	resp, err := base.RoundTrip(req)
 	if err != nil {
 		return nil, err
 	}
@@ -120,14 +126,13 @@ func tlsClient(tlsCfg *tls.Config) *http.Client {
 
 // boundedClient returns a copy of c with ZDAS's response size cap on its
 // transport, and with outboundTimeout when c has no timeout, so that a
-// client ZDAS did not build gets the limits its own client has.
+// client ZDAS did not build gets the limits its own client has. The copy
+// keeps c's cookie jar and redirect policy.
 func boundedClient(c *http.Client) *http.Client {
 	bc := *c
-	base := c.Transport
-	if base == nil {
-		base = http.DefaultTransport
+	if _, ok := c.Transport.(limitedBodyTransport); !ok {
+		bc.Transport = limitedBodyTransport{base: c.Transport}
 	}
-	bc.Transport = limitedBodyTransport{base: base}
 	if bc.Timeout == 0 {
 		bc.Timeout = outboundTimeout
 	}
