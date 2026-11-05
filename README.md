@@ -28,7 +28,7 @@ Tunneler          ZDAS              Upstream IdP       OpenZiti Controller
 
 ZDAS discovers upstream IdPs automatically by polling the controller's public `external-jwt-signers` endpoint - no parallel IdP configuration needed. Non-OIDC providers like GitHub (which issues opaque tokens, not JWTs) can be configured directly.
 
-Before sending the browser to an IdP, ZDAS shows a page where the user continues: a button for each available identity provider, or one when there is only one. This click is the user's consent. Without it, a link someone else built could sign in a user whose IdP session is still live, with no prompt at all. The page shows the device as the device describes itself. It also warns that the address the browser returns to carries the sign-in and must not be pasted anywhere. An embedding application can show its own picker instead (`idp_selector_url`); see `Config.IDPSelectorURL` for what that page must do.
+Before sending the browser to an IdP, ZDAS shows a page where the user continues: a button for each available identity provider, or one when there is only one. This click is the user's consent. Without it, a link someone else built could sign in a user whose IdP session is still live, with no prompt at all. The page shows the device as the device describes itself. It also warns, before its buttons, against continuing from a link someone sent, and against sending anyone the address the browser returns to. An embedding application can show its own picker instead (`idp_selector_url`); see `Config.IDPSelectorURL` for what that page must do.
 
 See [docs/security.md](docs/security.md) for the security model: what ZDAS enforces, what a deployment must do, and the reasoning behind its design decisions.
 
@@ -85,7 +85,7 @@ Key settings:
 | `controller.api_url` | OpenZiti controller URL, e.g. `https://ctrl.example.com:1280`. A client or management API URL also works. | (required) |
 | `controller.identity_file` | OpenZiti identity JSON (cert, key, CA) for the management API. It needs only the `identity.read` and `identity.update` permissions (`ziti edge create identity <name> --permissions identity.read,identity.update`); ZDAS warns if it is a full admin. | (optional, required for fallback) |
 | `fallback.enabled` | Allow enrollment without device info from unmodified tunnelers | `false` |
-| `rate_limit` | Limits on `/authorize`, per client and for everyone together. Behind a reverse proxy, also set `rate_limit.trusted_proxies`, or the per-client limit applies to everyone at once. | 2/s (burst 10) per client, 5/s (burst 500) in all |
+| `rate_limit` | Limits on `/authorize`, per client, and optionally for everyone together. Behind a reverse proxy, also set `rate_limit.trusted_proxies`, or the per-client limit applies to everyone at once. | 2/s (burst 10) per client; no global limit |
 | `claims.name_template` | Template for identity names. Placeholders: `{username}`, `{device_name}`, `{hostname}`, `{os}`, `{arch}` | `{username}-{device_name}` |
 | `token.expiry` | How long enrollment tokens are valid | `5m` |
 | `tls.mode` | `none`, `static`, or `acme` | `none` |
@@ -103,7 +103,7 @@ Updated tunnelers send device info as query parameters on the authorize URL:
 
 Each IdP sends the browser back to ZDAS at `<external_url>/callback/<provider name>`, so register that URL as a redirect URI with each IdP's client. For a discovered signer, that's the signer's client, and the provider name is the signer's name. A response that arrives at another provider's callback is refused. That stops an IdP mix-up, where one IdP gets a code meant for another (RFC 9700 section 4.4). ZDAS also checks the response's `iss` (RFC 9207) when the IdP sends one. Until every registration has been updated, `legacy_callback: true` keeps sending the old shared `<external_url>/callback`. That setting is deprecated and will be removed.
 
-The IdP sign-in must finish in the browser the tunneler opened. ZDAS ties each enrollment to that browser with a cookie, so a sign-in completed anywhere else, such as another browser or a phone following an emailed magic link, is rejected at `/callback` with `400 session not found or expired`. The user has to start again from the tunneler. A callback from the wrong browser leaves the enrollment in place, so it can't be used to cancel someone else's.
+The IdP sign-in must finish in the browser the tunneler opened. ZDAS ties each enrollment to that browser with a cookie. A sign-in completed anywhere else, such as another browser or a phone following an emailed magic link, is refused at `/callback` and cancelled, so the user has to start again from the tunneler. Cancelling it means a phisher who started the sign-in can't finish it with the address the victim's browser ends up on.
 
 Unmodified tunnelers work without changes when `fallback.enabled` is true. They enroll with a temporary name (e.g., `jsmith-pending-a3f9b2`) that ZDAS reconciles to the real hostname after the tunneler connects.
 

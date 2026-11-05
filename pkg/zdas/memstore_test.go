@@ -140,3 +140,36 @@ func TestMemStoreLogsEviction(t *testing.T) {
 		t.Errorf("eviction warnings = %d, want 1: %s", n, buf.String())
 	}
 }
+
+// TestMemStoreEvictionLogCountsDrops verifies that the eviction warning
+// says how many sessions were dropped since the previous one.
+func TestMemStoreEvictionLogCountsDrops(t *testing.T) {
+	s := newMemStore(time.Hour, time.Minute, time.Hour)
+	t.Cleanup(s.stop)
+	var buf bytes.Buffer
+	s.logger = slog.New(slog.NewTextHandler(&buf, nil))
+	s.lastEvicted = time.Now() // as if a warning just went out
+	for i := range maxStoreEntries + 3 {
+		if err := s.CreateSession(t.Context(), fmt.Sprint(i), &AuthSession{CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("warned within the interval: %s", buf.String())
+	}
+	s.lastEvicted = time.Now().Add(-evictionLogInterval)
+	if err := s.CreateSession(t.Context(), "last", &AuthSession{CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "dropped=4") {
+		t.Errorf("warning = %s, want dropped=4", buf.String())
+	}
+	buf.Reset()
+	s.lastEvicted = time.Now().Add(-evictionLogInterval)
+	if err := s.CreateSession(t.Context(), "after", &AuthSession{CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "dropped=1") {
+		t.Errorf("next warning = %s, want dropped=1, counted from the last one", buf.String())
+	}
+}

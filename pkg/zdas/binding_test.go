@@ -1,13 +1,16 @@
 package zdas
 
 import (
+	"bytes"
 	"html"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"regexp"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -72,6 +75,12 @@ func authorizeAndConsent(t *testing.T, h http.Handler, target, idp string) *http
 // a provider whose callback always succeeds.
 func bindingHandlers(t *testing.T, externalURL string) http.Handler {
 	t.Helper()
+	return bindingEndpoints(t, externalURL).mux()
+}
+
+// bindingEndpoints returns the endpoints bindingHandlers serves.
+func bindingEndpoints(t *testing.T, externalURL string) *endpoints {
+	t.Helper()
 	ks, err := GenerateKeySet()
 	if err != nil {
 		t.Fatalf("GenerateKeySet: %v", err)
@@ -91,7 +100,7 @@ func bindingHandlers(t *testing.T, externalURL string) http.Handler {
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: externalURL, Audience: "ziti-enrolltocert", Expiry: 5 * time.Minute},
 	}
-	return newTestEndpoints(cfg, ks, reg, store, nil).mux()
+	return newTestEndpoints(cfg, ks, reg, store, nil)
 }
 
 // startAuthorize runs /authorize and consents, and returns the consent
@@ -174,6 +183,9 @@ func TestAuthorizeSetsBindingCookie(t *testing.T) {
 	}
 }
 
+// TestCallbackRequiresBindingCookie verifies that /callback from a browser
+// without the session's binding cookie is refused and cancels the sign-in,
+// so the browser that started it can't finish it afterwards either.
 func TestCallbackRequiresBindingCookie(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -206,33 +218,93 @@ func TestCallbackRequiresBindingCookie(t *testing.T) {
 				}
 				w := httptest.NewRecorder()
 				mux.ServeHTTP(w, req)
-				if w.Code != http.StatusBadRequest {
-					t.Fatalf("wrong browser: status = %d, want 400, body = %s", w.Code, w.Body.String())
+				if w.Code != http.StatusBadRequest || w.Body.String() != sessionOtherBrowser+"\n" {
+					t.Fatalf("wrong browser: status = %d, body = %s; want 400 and the warning", w.Code, w.Body.String())
 				}
 				if loc := w.Header().Get("Location"); loc != "" {
 					t.Errorf("wrong browser: Location = %q, want none", loc)
 				}
 
-				// The session is still there for the browser that started it.
+				// The sign-in is gone, for the browser that started it too.
 				w = httptest.NewRecorder()
 				mux.ServeHTTP(w, browserRequest(started, target))
-				if w.Code != http.StatusFound {
-					t.Fatalf("right browser: status = %d, want 302, body = %s", w.Code, w.Body.String())
+				if w.Code != http.StatusBadRequest || w.Body.String() != sessionMissing+"\n" {
+					t.Errorf("right browser afterwards: status = %d, body = %s; want 400 not found", w.Code, w.Body.String())
 				}
-				if !strings.HasPrefix(w.Header().Get("Location"), "http://localhost:20314/auth/callback?") {
-					t.Errorf("right browser: Location = %q, want the tunneler callback", w.Header().Get("Location"))
-				}
-				cleared := false
-				for _, c := range w.Result().Cookies() {
-					if c.Name == bindingCookieName(sessID) && c.MaxAge < 0 {
-						cleared = true
-					}
-				}
-				if !cleared {
-					t.Error("binding cookie not expired after the session was consumed")
+				if loc := w.Header().Get("Location"); loc != "" {
+					t.Errorf("right browser afterwards: Location = %q, want none", loc)
 				}
 			})
 		}
+	}
+}
+
+// TestCallbackSkippingConsentIsCancelled walks the phish that skips the
+// consent page: the attacker consents in their own browser and sends the
+// victim the IdP's address. An IdP that approves without asking sends the
+// victim's browser to /callback, which cancels the sign-in, so when the
+// victim sends that address back, the attacker's browser can't finish it.
+func TestCallbackSkippingConsentIsCancelled(t *testing.T) {
+	h := bindingEndpoints(t, "https://zdas.example.com")
+	var logs bytes.Buffer
+	h.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	mux := h.mux()
+	attacker, sessID := startAuthorize(t, mux)
+	callback := "/callback/mock-idp?code=c&state=" + sessID
+
+	victim := httptest.NewRecorder()
+	mux.ServeHTTP(victim, httptest.NewRequest(http.MethodGet, callback, nil))
+	if victim.Code != http.StatusBadRequest || !strings.Contains(victim.Body.String(), "don't") {
+		t.Fatalf("victim's browser: status = %d, body = %s; want 400 and the warning", victim.Code, victim.Body.String())
+	}
+	if !strings.Contains(logs.String(), "did not start the sign-in") {
+		t.Errorf("cancelled sign-in not logged: %s", logs.String())
+	}
+
+	pasted := httptest.NewRecorder()
+	mux.ServeHTTP(pasted, browserRequest(attacker, callback))
+	if pasted.Code == http.StatusFound || pasted.Header().Get("Location") != "" {
+		t.Fatalf("attacker's browser finished the sign-in: %d %s", pasted.Code, pasted.Header().Get("Location"))
+	}
+}
+
+// TestCallbackFromRightBrowser verifies that the browser with the binding
+// cookie completes the sign-in and has the cookie expired.
+func TestCallbackFromRightBrowser(t *testing.T) {
+	mux := bindingHandlers(t, "https://zdas.example.com")
+	started, sessID := startAuthorize(t, mux)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, browserRequest(started, "/callback/mock-idp?code=c&state="+sessID))
+	if w.Code != http.StatusFound || !strings.HasPrefix(w.Header().Get("Location"), "http://localhost:20314/auth/callback?") {
+		t.Fatalf("status = %d, Location = %q; want 302 to the tunneler callback", w.Code, w.Header().Get("Location"))
+	}
+	cleared := false
+	for _, c := range w.Result().Cookies() {
+		if c.Name == bindingCookieName(sessID) && c.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Error("binding cookie not expired after the session was consumed")
+	}
+}
+
+// TestLegacyBoundSession verifies that a session stored the way v0.15.0 and
+// earlier stored it, under its ID and nonce together, is still consumed by
+// the browser with that nonce, and by no other.
+func TestLegacyBoundSession(t *testing.T) {
+	h, _ := setupHandlers(t)
+	ctx := t.Context()
+	id, nonce := mustID(t), mustID(t)
+	sess := &AuthSession{DeviceInfo: &DeviceInfo{}, UpstreamProviderName: "x", CreatedAt: time.Now()}
+	if err := h.store.CreateSession(ctx, h.storeKey(kindSession, id+"."+nonce), sess); err != nil {
+		t.Fatal(err)
+	}
+	if sess, other, err := h.consumeSession(ctx, id, ""); sess != nil || other || err != nil {
+		t.Errorf("without the nonce: %v, %v, %v; want a miss", sess, other, err)
+	}
+	if sess, other, err := h.consumeSession(ctx, id, nonce); sess == nil || other || err != nil {
+		t.Errorf("with the nonce: %v, %v, %v; want the session", sess, other, err)
 	}
 }
 
@@ -255,4 +327,31 @@ func TestBindingCookieScope(t *testing.T) {
 			t.Errorf("bindingCookieScope(%q) = %q, %v; want %q, %v", tc.externalURL, path, secure, tc.wantPath, tc.wantSecure)
 		}
 	}
+}
+
+// TestSignInLastsOneSessionTimeout verifies that consent does not restart
+// the session's clock: a sign-in has the session timeout in all, from
+// /authorize to /callback.
+func TestSignInLastsOneSessionTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mux := bindingHandlers(t, "https://zdas.example.com")
+		page := httptest.NewRecorder()
+		mux.ServeHTTP(page, httptest.NewRequest(http.MethodGet, authorizeURL(t, nil), nil))
+		time.Sleep(9 * time.Minute)
+		consented := consent(t, mux, page, "")
+		if consented.Code != http.StatusSeeOther {
+			t.Fatalf("consent: %d", consented.Code)
+		}
+		loc, err := url.Parse(consented.Header().Get("Location"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		state := loc.Query().Get("state")
+		time.Sleep(2 * time.Minute)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, browserRequest(consented, "/callback/mock-idp?code=c&state="+state))
+		if w.Code != http.StatusBadRequest || w.Body.String() != sessionMissing+"\n" {
+			t.Errorf("callback 11 minutes after /authorize: %d %s, want 400 not found", w.Code, w.Body.String())
+		}
+	})
 }

@@ -43,6 +43,7 @@ func TestStore(t *testing.T, newStore func(t *testing.T) zdas.Store) {
 			ZDASCodeVerifier:     "verifier",
 			UpstreamProviderName: "keycloak",
 			CallbackURL:          "https://zdas.example.com/callback/keycloak",
+			BindingHash:          "bindinghash",
 			CreatedAt:            time.Now(),
 		}
 		requireAllSet(t, want)

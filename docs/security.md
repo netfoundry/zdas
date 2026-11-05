@@ -36,7 +36,7 @@ Anyone on the internet can reach `/authorize`, `/callback` and `/token`.
 - **PKCE (S256)** is required from the tunneler, and ZDAS uses its own PKCE toward OIDC IdPs. A `code_challenge` must be a canonical S256 value.
 - **Redirect URIs** are loopback-only by default (RFC 8252). An allow-list entry for a host other than loopback must match exactly.
 - **Consent:** nothing goes to an IdP until the user clicks on a ZDAS page that can't be framed. A link alone therefore can't sign in someone whose IdP session is still live.
-- **Browser binding:** the sign-in is bound to the browser that started it by a SameSite=Lax cookie. The consent post and the IdP's callback are accepted only from that browser.
+- **Browser binding:** the sign-in is bound to the browser that started it by a SameSite=Lax cookie. The consent post and the IdP's callback are accepted only from that browser. One that arrives from any other browser cancels the sign-in, so it can't be finished anywhere afterwards.
 - **One callback per provider:** a response at another provider's callback is refused, and so is a response whose `iss` names another issuer. This stops one IdP getting a code meant for another (RFC 9700 section 4.4, RFC 9207).
 
 **Tokens**
@@ -50,7 +50,8 @@ Anyone on the internet can reach `/authorize`, `/callback` and `/token`.
 
 **Resource limits**
 - Request parameters, form bodies and headers have size limits.
-- The `zdas` binary rate-limits `/authorize` per client and in total.
+- The `zdas` binary rate-limits `/authorize` per client. A limit for all clients together is available, but off by default; see [Store eviction](#store-eviction).
+- Requests the limits refuse are logged, with counts, at most once a minute.
 - The built-in store holds a bounded number of sign-ins. When full, it drops the oldest sign-in still in progress, rather than refusing new ones, and logs a warning.
 
 **The controller**
@@ -120,6 +121,18 @@ ZDAS is an authorization server for OpenZiti tunnelers, not a general OIDC provi
 - **One token:** the `id_token` is the same token as the `access_token`.
 - **Not implemented:** `client_id` registration, `prompt`, `max_age`, and refresh tokens.
 
+### Phishing with a sign-in link
+
+A phisher can start a sign-in themselves, with a PKCE challenge they hold, and get a victim to sign in to it. The code then goes to a loopback address on the victim's machine, where nothing listens, so the phisher still needs the victim to send back the address the browser shows. ZDAS can't tell that from a real sign-in, since a loopback redirect doesn't show who owns the port (RFC 8252).
+
+ZDAS makes that harder in two ways.
+- **The consent page** comes before the IdP, so a link alone doesn't sign anyone in. It warns, before its buttons, not to continue with a link someone sent and not to send the resulting address to anyone. It shows the device's own description as a short label, without hidden characters, because whoever sent the link chose it.
+- **The browser binding** covers the step after the IdP. A phisher can consent in their own browser and send the victim the IdP's address instead, which skips the consent page when the IdP approves without asking. The victim's browser then reaches `/callback` without the cookie, which cancels the sign-in, so the address the victim might send back is useless. The page it shows says so, and warns against sending it.
+
+The real fix is enroll-to-cert, which ends the flow with a certificate that only the device holds.
+
 ### Store eviction
 
-When the built-in store is full, it drops the oldest sign-in still in progress instead of refusing new ones. Sign-ins start before anyone authenticates, so refusing them would let anonymous requests lock everyone out. The global rate limit keeps a flood from reaching that point.
+When the built-in store is full, it drops the oldest sign-in still in progress instead of refusing new ones. Sign-ins start before anyone authenticates, so refusing them would let anonymous requests lock everyone out. To drop one user's sign-in, an attacker has to create 10,000 sessions within the minute or so that user takes, which the per-client limit makes expensive. Each sign-in lasts at most the session timeout, from `/authorize` to `/callback`.
+
+A limit on `/authorize` for all clients together (`global_per_second`) is off by default for the same reason. Once a few addresses use it up, it refuses everyone. It is there for a shared Store that has to stay small, and then only valid requests spend it.

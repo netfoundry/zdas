@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -379,27 +381,202 @@ func TestGlobalRateLimit(t *testing.T) {
 	}
 }
 
-// TestLoadConfigRateLimitDefaults verifies that LoadConfig turns rate
-// limiting on unless the file turns it off, and that the zero Config has
-// none.
+// TestLoadConfigRateLimitDefaults verifies that LoadConfig turns the
+// per-client limit on unless the file turns it off, leaves the global limit
+// off unless the file sets it, and that the zero Config has none.
 func TestLoadConfigRateLimitDefaults(t *testing.T) {
 	cfg, err := LoadConfig(writeTempConfig(t, minimalYAML))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.RateLimit.AuthorizePerSecond != 2 || cfg.RateLimit.AuthorizeBurst != 10 || cfg.RateLimit.GlobalPerSecond != 5 || cfg.RateLimit.GlobalBurst != 500 {
+	if cfg.RateLimit.AuthorizePerSecond != 2 || cfg.RateLimit.AuthorizeBurst != 10 || cfg.RateLimit.GlobalPerSecond != 0 || cfg.RateLimit.GlobalBurst != 0 {
 		t.Errorf("default rate limit = %+v", cfg.RateLimit)
 	}
-	cfg, err = LoadConfig(writeTempConfig(t, minimalYAML+"rate_limit:\n  authorize_per_second: 0\n  trusted_proxies: [10.0.0.0/8]\n"))
+	cfg, err = LoadConfig(writeTempConfig(t, minimalYAML+"rate_limit:\n  authorize_per_second: 0\n  global_per_second: 5\n  trusted_proxies: [10.0.0.0/8]\n"))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
 	if cfg.RateLimit.AuthorizePerSecond != 0 || cfg.RateLimit.GlobalPerSecond != 5 {
-		t.Errorf("rate limit with per-client turned off = %+v, want global still on", cfg.RateLimit)
+		t.Errorf("rate limit with per-client off and global set = %+v", cfg.RateLimit)
 	}
 	var zero Config
 	zero.ApplyDefaults()
 	if zero.RateLimit.AuthorizePerSecond != 0 || zero.RateLimit.GlobalPerSecond != 0 {
 		t.Errorf("ApplyDefaults turned rate limiting on: %+v", zero.RateLimit)
+	}
+}
+
+// TestGlobalLimitSpentOnlyByValidRequests verifies that an invalid GET
+// /authorize, which stores no session, leaves the global limit alone.
+func TestGlobalLimitSpentOnlyByValidRequests(t *testing.T) {
+	ks, _ := GenerateKeySet()
+	reg := NewProviderRegistry()
+	_ = reg.Register(&stubProvider{name: "test-idp", issuer: "https://test-idp"})
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
+	cfg := Config{
+		ExternalURL: "https://zdas.example.com",
+		Claims:      defaultClaimsConfig(),
+		Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
+		RateLimit:   RateLimitConfig{GlobalPerSecond: 0.001, GlobalBurst: 1},
+	}
+	mux := newTestEndpoints(cfg, ks, reg, store, nil).mux()
+	get := func(addr, target string) int {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req.RemoteAddr = addr
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		return w.Code
+	}
+	for i := range 5 {
+		if code := get(fmt.Sprintf("203.0.113.%d:1", i+1), "/authorize"); code != http.StatusBadRequest {
+			t.Fatalf("invalid request %d: %d, want 400", i, code)
+		}
+	}
+	if code := get("198.51.100.1:1", authorizeURL(t, nil)); code != http.StatusOK {
+		t.Errorf("valid request after invalid ones: %d, want 200", code)
+	}
+	if code := get("198.51.100.2:1", authorizeURL(t, nil)); code != http.StatusTooManyRequests {
+		t.Errorf("valid request past the burst: %d, want 429", code)
+	}
+}
+
+// TestDefaultRateLimitSurvivesFlood drives GET /authorize from a few
+// attacker addresses, each at its per-client rate, under the LoadConfig
+// defaults, and requires that a legitimate user from a fresh address is
+// never refused. A global limit shared by all clients fails this: a few
+// addresses use it up and everyone else gets 429.
+func TestDefaultRateLimitSurvivesFlood(t *testing.T) {
+	ipv4 := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("203.0.113.%d:1", i+1)
+		}
+		return out
+	}
+	site := make([]string, 16) // 16 /64s in one IPv6 /48
+	for i := range site {
+		site[i] = fmt.Sprintf("[2001:db8:1:%x::1]:1", i)
+	}
+	cases := []struct {
+		name      string
+		attackers []string
+	}{
+		{"3 IPv4", ipv4(3)},
+		{"30 IPv4", ipv4(30)},
+		{"one IPv6 /48", site},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ks, _ := GenerateKeySet()
+				reg := NewProviderRegistry()
+				_ = reg.Register(&stubProvider{name: "test-idp", issuer: "https://test-idp"})
+				store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+				defer store.stop()
+				cfg := Config{
+					ExternalURL: "https://zdas.example.com",
+					Claims:      defaultClaimsConfig(),
+					Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
+					RateLimit:   defaultRateLimit,
+				}
+				mux := newTestEndpoints(cfg, ks, reg, store, nil).mux()
+				validURL := authorizeURL(t, nil)
+				send := func(addr, target string) int {
+					req := httptest.NewRequest(http.MethodGet, target, nil)
+					req.RemoteAddr = addr
+					w := httptest.NewRecorder()
+					mux.ServeHTTP(w, req)
+					return w.Code
+				}
+
+				// Each attacker sends a valid request every 500ms, its 2/s
+				// per-client rate, staggered evenly, for 10 simulated
+				// minutes; a legitimate user tries once a second for the
+				// last 2.
+				n := len(tc.attackers)
+				step := 500 * time.Millisecond / time.Duration(n)
+				perSec := int(time.Second / step)
+				steps := int(12 * time.Minute / step)
+				probeFrom := int(10 * time.Minute / step)
+				probes, refused := 0, 0
+				for i := range steps {
+					send(tc.attackers[i%n], validURL)
+					if i >= probeFrom && i%perSec == 0 {
+						probes++
+						if send(fmt.Sprintf("198.51.100.%d:1", probes%250+1), validURL) == http.StatusTooManyRequests {
+							refused++
+						}
+					}
+					time.Sleep(step)
+				}
+				if refused > 0 {
+					t.Errorf("%d of %d legitimate requests refused with 429", refused, probes)
+				}
+			})
+		})
+	}
+}
+
+// TestRejectionLog verifies that refused requests are logged with counts,
+// at most once per rejectionLogInterval.
+func TestRejectionLog(t *testing.T) {
+	var buf bytes.Buffer
+	l := newRejectionLog(slog.New(slog.NewTextHandler(&buf, nil)))
+	now := time.Now()
+	l.now = func() time.Time { return now }
+
+	l.add(rejectClient)
+	if !strings.Contains(buf.String(), "per_client=1 global=0") {
+		t.Fatalf("first refusal not logged with its count: %s", buf.String())
+	}
+	buf.Reset()
+	l.add(rejectGlobal)
+	l.add(rejectClient)
+	if buf.Len() != 0 {
+		t.Errorf("logged again within the interval: %s", buf.String())
+	}
+	now = now.Add(rejectionLogInterval)
+	l.add(rejectGlobal)
+	if !strings.Contains(buf.String(), "per_client=1 global=2") {
+		t.Errorf("summary after the interval = %s, want per_client=1 global=2", buf.String())
+	}
+}
+
+// TestAuthorizeRefusalsAreLogged verifies that the handlers count what the
+// limits refuse.
+func TestAuthorizeRefusalsAreLogged(t *testing.T) {
+	ks, _ := GenerateKeySet()
+	reg := NewProviderRegistry()
+	_ = reg.Register(&stubProvider{name: "test-idp", issuer: "https://test-idp"})
+	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+	t.Cleanup(store.stop)
+	var buf bytes.Buffer
+	cfg := Config{
+		ExternalURL: "https://zdas.example.com",
+		Claims:      defaultClaimsConfig(),
+		Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
+		RateLimit:   RateLimitConfig{AuthorizePerSecond: 0.001, AuthorizeBurst: 1, GlobalPerSecond: 0.001, GlobalBurst: 1},
+	}
+	h := newEndpoints(cfg, ks, nil, reg, store, nil, nil, nil, slog.New(slog.NewTextHandler(&buf, nil)))
+	mux := h.mux()
+	for _, addr := range []string{"1.1.1.1:1", "1.1.1.1:1", "2.2.2.2:1"} {
+		req := httptest.NewRequest(http.MethodGet, authorizeURL(t, nil), nil)
+		req.RemoteAddr = addr
+		mux.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	form := url.Values{"consent": {mustID(t)}, "idp": {"test-idp"}}
+	req := httptest.NewRequest(http.MethodPost, "/authorize", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.RemoteAddr = "1.1.1.1:1"
+	mux.ServeHTTP(httptest.NewRecorder(), req)
+	// The second request is refused by the per-client limit and logged. The
+	// third, refused by the global limit, and the consent post, refused by
+	// the per-client limit, are counted for the next summary.
+	if !strings.Contains(buf.String(), "per_client=1 global=0") {
+		t.Errorf("per-client refusal not logged: %s", buf.String())
+	}
+	if got := h.rejections.counts; got != [numRejectReasons]int{rejectClient: 1, rejectGlobal: 1} {
+		t.Errorf("refusals counted since the summary = %v, want 1 per-client and 1 global", got)
 	}
 }

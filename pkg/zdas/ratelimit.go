@@ -54,6 +54,57 @@ type rateLimitBucket struct {
 	lastSeen time.Time
 }
 
+// rejectionLogInterval is the least time between summaries of refused
+// requests.
+const rejectionLogInterval = time.Minute
+
+// rejectReason says which limit refused a request.
+type rejectReason int
+
+const (
+	rejectClient rejectReason = iota // the per-client or per-site limit
+	rejectGlobal                     // the global limit
+	numRejectReasons
+)
+
+// rejectionLog counts the requests the rate limits refuse and logs how many,
+// at most once per rejectionLogInterval, so that an operator can see users
+// being refused without a flood filling the log.
+type rejectionLog struct {
+	logger *slog.Logger
+	now    func() time.Time
+
+	mu     sync.Mutex
+	counts [numRejectReasons]int // by rejectReason, since the last summary
+	last   time.Time
+}
+
+func newRejectionLog(logger *slog.Logger) *rejectionLog {
+	return &rejectionLog{logger: logger, now: time.Now}
+}
+
+// add counts one refused request, and logs the counts since the last
+// summary when rejectionLogInterval has passed since it.
+func (l *rejectionLog) add(reason rejectReason) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.counts[reason]++
+	now := l.now()
+	if !l.last.IsZero() && now.Sub(l.last) < rejectionLogInterval {
+		return
+	}
+	l.logger.Warn("rate limits refused /authorize requests",
+		"per_client", l.counts[rejectClient], "global", l.counts[rejectGlobal])
+	l.counts = [numRejectReasons]int{}
+	l.last = now
+}
+
+// tooManyRequests writes the response to a request a rate limit refused.
+func tooManyRequests(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "1")
+	http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+}
+
 // defaultBurst returns burst, or twice perSecond, at least 1, when burst is
 // not set.
 func defaultBurst(perSecond float64, burst int) int {

@@ -22,6 +22,7 @@ type AuthSession struct {
 	ZDASCodeVerifier            string      // ZDAS's own PKCE verifier for upstream (empty for non-PKCE providers)
 	UpstreamProviderName        string
 	CallbackURL                 string // the redirect_uri sent upstream; empty before consent, and in sessions from before it was kept
+	BindingHash                 string // SHA-256 of the browser's binding cookie nonce, in hex; see bindingHash
 	CreatedAt                   time.Time
 }
 
