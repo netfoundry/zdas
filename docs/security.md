@@ -23,12 +23,15 @@ ZDAS holds no long-lived user state. Its signing key is ephemeral unless an embe
 | Party | Trusted to |
 |-------|------------|
 | The operator, through config | choose the configured IdPs, the policies on them, the controller, and the redirect URIs ZDAS accepts |
-| The controller admin | choose the external JWT signers that ZDAS discovers. A discovered signer is used as the admin configured it, with no further restriction. |
+| The controller admin | choose the external JWT signers that ZDAS discovers. A discovered signer is used as the admin configured it, with no further restriction; see [Discovered providers](#discovered-providers). |
 | An upstream IdP | say who the user is, within the policy configured for that IdP |
 | The user | sign in as themselves. ZDAS does not trust the device details a tunneler sends to be anything but labels. |
 | The embedding application, if any | run its provisioner and pages on the server side, and choose the claims and audience for each enrollment |
 
-Anyone on the internet can reach `/authorize`, `/callback` and `/token`.
+Anyone on the internet can reach these routes:
+- `/authorize` (GET and POST), `/callback` and `/callback/<provider>`, and `/token`
+- `/.well-known/openid-configuration` and `/.well-known/jwks.json`
+- `/network-jwts`, `/external-jwt-signers` and `/edge/client/v1/external-jwt-signers`, copies of the controller's own public data; see [Mirrored controller data](#mirrored-controller-data)
 
 ## What ZDAS enforces
 
@@ -56,6 +59,7 @@ Anyone on the internet can reach `/authorize`, `/callback` and `/token`.
 
 **The controller**
 - The fallback reconciler needs only the `identity.read` and `identity.update` permissions, and ZDAS warns if it is given a full admin.
+- Each discovered provider is logged with a warning the first time it appears, since it has no policy.
 - Fallback logins are refused while ZDAS's own signer allows enroll-to-token, for the reason under [Fallback identities](#fallback-identities) below.
 
 ## What a deployment must do
@@ -64,14 +68,15 @@ Anyone on the internet can reach `/authorize`, `/callback` and `/token`.
 - **Restrict configured providers.** For GitHub, Google and other public IdPs, `allow_any_user: true` means anyone at all can enroll.
 - **Register redirect URIs:** register `<external_url>/callback/<provider name>` with each IdP's client.
 - **Behind a reverse proxy,** set `rate_limit.trusted_proxies`, and serve ZDAS over HTTPS.
-- **The reconciler identity:** give it only `identity.read` and `identity.update`, and protect its identity file. `identity.update` can still rename any identity and change its role attributes, which decide service access through existing policies.
+- **The reconciler identity:** give it only `identity.read` and `identity.update`, and guard its identity file as you would an identity admin's. `identity.update` can still change every field of any non-admin identity except its permissions. That includes its role attributes, which decide service access through existing policies, its auth policy, and its external ID, which decides who can sign in as it with a token.
+- **Discovered providers:** restrict one by configuring a provider with the signer's name, issuer and client ID, and a policy.
 - **Fallback:** with fallback on, let ZDAS's signer allow enroll-to-cert only.
 - **Prefer enroll-to-cert.** After enrollment, the device signs in with its own certificate rather than with a ZDAS token.
 
 **Embedders**
 - **Provisioning:** finish interactive provisioning with `Handler.CompleteProvision`, taking the pending ID and the claims from your own server-side state, never from the request.
 - **A picker of your own (`IDPSelectorURL`):** it is where the user consents. It must be on the same site as ZDAS, must not be frameable, and must POST `consent` and `idp` back on the user's click.
-- **More than one network:** if you serve several OpenZiti networks, register ZDAS's signer on each with its own audience. List those audiences in `token.provisioner_audiences`, and set each enrollment's `aud` to the network you chose.
+- **More than one network:** if you serve several OpenZiti networks, register ZDAS's signer on each with its own audience. List those audiences in `token.provisioner_audiences`, and set each enrollment's `aud` to the network you chose. A provisioner that sets no `aud` gets `token.audience`. One signing key then signs for every network, so whoever gets it can mint tokens for all of them. Where networks must not share that risk, run a separate ZDAS, with its own key and issuer, for each.
 - **Issuers you don't control:** if someone you don't fully trust chooses upstream issuers, pass `WithUpstreamHTTPClient`. `PublicHTTPClient` connects only to public addresses.
 - **Your own `http.Server`:** set `MaxHeaderBytes`, and rate-limit `/authorize` (`RateLimitConfig`), since a `Config` built in code has no limits.
 
@@ -130,6 +135,19 @@ ZDAS makes that harder in two ways.
 - **The browser binding** covers the step after the IdP. A phisher can consent in their own browser and send the victim the IdP's address instead, which skips the consent page when the IdP approves without asking. The victim's browser then reaches `/callback` without the cookie, which cancels the sign-in, so the address the victim might send back is useless. The page it shows says so, and warns against sending it.
 
 The real fix is enroll-to-cert, which ends the flow with a certificate that only the device holds.
+
+### Discovered providers
+
+ZDAS uses each external JWT signer the controller lists that allows enrollment as an upstream provider, with no policy of its own, since the controller admin chose the signer and its IdP. So a discovered provider admits every user its issuer signs in, and ZDAS logs a warning the first time each one appears.
+
+To restrict one, configure a provider with the signer's name, issuer and client ID, plus a policy. ZDAS then uses it in place of the discovered one, and keeps the same callback URL.
+
+### Mirrored controller data
+
+ZDAS serves copies of two of the controller's public responses: the network JWTs at `/network-jwts`, and the external JWT signers at `/external-jwt-signers` and `/edge/client/v1/external-jwt-signers`. A tunneler pointed at ZDAS's URL can then find the network and its signers there.
+
+- **The data is public:** the controller serves both to anyone, so on a public controller ZDAS exposes nothing new. On a controller that is not reachable from the internet, ZDAS is what makes them public.
+- **ZDAS becomes a source of trust:** a tunneler that enrolls from ZDAS's URL trusts the controller and CA the network JWT names. ZDAS fetches it over TLS checked against the CA from `controller.identity_file` or `ca_bundle`, or the system roots, or over plain HTTP if `controller.api_url` uses it, and passes it on as received. Serve ZDAS over HTTPS, and use an `https://` controller URL, wherever tunnelers bootstrap from it.
 
 ### Store eviction
 

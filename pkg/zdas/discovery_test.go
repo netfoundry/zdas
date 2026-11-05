@@ -729,3 +729,26 @@ func TestDiscoverySelfAllowsTokenEnrollment(t *testing.T) {
 		t.Error("cert-only self signer reported as allowing enroll-to-token; another signer's setting leaked in")
 	}
 }
+
+// TestDiscoveryWarnsAboutOpenProvider verifies that a discovered provider,
+// which has no policy, is logged with a warning when it first appears, and
+// not again on every poll.
+func TestDiscoveryWarnsAboutOpenProvider(t *testing.T) {
+	ctrl, _ := mockControllerAndIDPs(t, []signerEntry{
+		{Name: "keycloak", ClientID: "kc-client", EnrollToCertEnabled: true},
+	})
+	var logs strings.Builder
+	d := newSignerDiscovery(ControllerConfig{APIURL: ctrl.URL, SelfIssuer: "https://zdas.example.com"},
+		http.DefaultClient, nil, NewProviderRegistry(), nil, slog.New(slog.NewTextHandler(&logs, nil)))
+	for range 2 {
+		if err := d.poll(context.Background()); err != nil {
+			t.Fatalf("poll: %v", err)
+		}
+	}
+	if n := strings.Count(logs.String(), "discovered provider admits every user"); n != 1 {
+		t.Errorf("open-provider warnings = %d, want 1: %s", n, logs.String())
+	}
+	if !strings.Contains(logs.String(), "name=keycloak") {
+		t.Errorf("warning doesn't name the provider: %s", logs.String())
+	}
+}
