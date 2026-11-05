@@ -1021,3 +1021,54 @@ func TestNonceKeptForInteractiveProvision(t *testing.T) {
 		t.Errorf("pending provision = %+v, want TunnelerNonce n-3", pp)
 	}
 }
+
+// TestStoredClaimsAreCopies verifies that the code ZDAS stores keeps its
+// own copy of the claims, so a provisioner that changes or reuses its map
+// afterwards, with or without a nonce, can't change the token minted later.
+func TestStoredClaimsAreCopies(t *testing.T) {
+	codeClaims := func(h *endpoints, w *httptest.ResponseRecorder) map[string]any {
+		t.Helper()
+		loc, _ := url.Parse(w.Header().Get("Location"))
+		ac, err := h.store.ConsumeCode(t.Context(), h.storeKey(kindCode, loc.Query().Get("code")))
+		if err != nil || ac == nil {
+			t.Fatalf("code from %s: %v, %v", loc, ac, err)
+		}
+		return ac.Claims
+	}
+
+	t.Run("Provision", func(t *testing.T) {
+		ks, _ := GenerateKeySet()
+		reg := NewProviderRegistry()
+		_ = reg.Register(&callbackProvider{name: "mock-idp", issuer: "https://mock-idp", identity: &UpstreamIdentity{Subject: "u1", Username: "alice", Issuer: "https://mock-idp"}})
+		store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+		t.Cleanup(store.stop)
+		provisioned := map[string]any{"device_identity_name": "alice-laptop", "device_external_id": "e1", "sub": "e1"}
+		cfg := Config{ExternalURL: "https://zdas.test", Claims: defaultClaimsConfig(), Token: TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: time.Minute}}
+		h := newTestEndpoints(cfg, ks, reg, store, &immediateProvisioner{claims: provisioned})
+		sessID := seedSession(t, h, &AuthSession{
+			TunnelerRedirectURI: "http://localhost:20314/auth/callback", TunnelerState: "s",
+			TunnelerCodeChallenge: "c", TunnelerCodeChallengeMethod: "S256",
+			DeviceInfo: &DeviceInfo{DeviceName: "laptop"}, UpstreamProviderName: "mock-idp",
+		})
+		w := httptest.NewRecorder()
+		h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=c&state="+sessID, nil))
+		provisioned["device_identity_name"] = "bob-laptop"
+		if got := codeClaims(h, w)["device_identity_name"]; got != "alice-laptop" {
+			t.Errorf("stored name = %v after the provisioner changed its map, want alice-laptop", got)
+		}
+	})
+
+	t.Run("CompleteProvision", func(t *testing.T) {
+		h, _ := setupProvisionComplete(t)
+		pendingID := seedPendingProvision(t, h, &PendingProvision{
+			TunnelerRedirectURI: "http://localhost:20314/auth/callback", TunnelerState: "s",
+			TunnelerCodeChallenge: "c", TunnelerCodeChallengeMethod: "S256",
+		})
+		claims := map[string]any{"device_identity_name": "a", "device_external_id": "e2", "sub": "e2"}
+		w := completeProvision(h, pendingID, claims, nil)
+		claims["device_identity_name"] = "b"
+		if got := codeClaims(h, w)["device_identity_name"]; got != "a" {
+			t.Errorf("stored name = %v after the caller changed its map, want a", got)
+		}
+	})
+}

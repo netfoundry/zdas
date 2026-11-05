@@ -59,7 +59,7 @@ type limitedBody struct {
 // cap. An issuer on a private network needs a client of your own instead.
 func PublicHTTPClient() *http.Client {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second, Control: refuseNonPublic}
-	t := http.DefaultTransport.(*http.Transport).Clone()
+	t := baseTransport()
 	t.Proxy = nil
 	t.DialContext = dialer.DialContext
 	return &http.Client{
@@ -110,12 +110,32 @@ func refuseNonPublic(_, address string, _ syscall.RawConn) error {
 }
 
 // tlsClient returns a client with outboundTimeout whose transport is
-// http.DefaultTransport's, keeping its proxy settings, dial and handshake
-// timeouts and HTTP/2, with tlsCfg in place of its TLS config.
+// baseTransport's, keeping its proxy settings, dial and handshake timeouts
+// and HTTP/2, with tlsCfg in place of its TLS config.
 func tlsClient(tlsCfg *tls.Config) *http.Client {
-	t := http.DefaultTransport.(*http.Transport).Clone()
+	t := baseTransport()
 	t.TLSClientConfig = tlsCfg
 	return &http.Client{Timeout: outboundTimeout, Transport: t}
+}
+
+// baseTransport returns a copy of http.DefaultTransport to configure. An
+// embedder may have replaced that with another RoundTripper, such as one
+// that adds tracing; ZDAS needs an *http.Transport to set its own dialer and
+// TLS config, so it then starts from the settings Go's default transport
+// has, without the replacement.
+func baseTransport() *http.Transport {
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		return t.Clone()
+	}
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
 }
 
 // maxResponseBytes is the cap on outbound response body reads. Prevents a

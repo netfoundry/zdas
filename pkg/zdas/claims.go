@@ -141,15 +141,15 @@ func setClaims(tok jwt.Token, claims map[string]any) error {
 // nonceClaim is the OIDC claim that echoes the nonce sent to /authorize.
 const nonceClaim = "nonce"
 
-// withNonce returns claims with the nonce claim set to nonce, or claims
-// itself when nonce is empty. It copies claims rather than change a map a
-// provisioner returned.
-func withNonce(claims map[string]any, nonce string) map[string]any {
-	if nonce == "" {
-		return claims
-	}
+// ownClaims returns a copy of claims for ZDAS to keep until /token, with
+// the nonce claim set when nonce is not empty. A provisioner may change or
+// reuse the map it returned once it has; the copy is shallow, so it must not
+// change values nested inside it.
+func ownClaims(claims map[string]any, nonce string) map[string]any {
 	claims = maps.Clone(claims)
-	claims[nonceClaim] = nonce
+	if nonce != "" {
+		claims[nonceClaim] = nonce
+	}
 	return claims
 }
 

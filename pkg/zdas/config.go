@@ -384,39 +384,8 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("providers[%d]: duplicate name %q", i, p.Name)
 		}
 		names[p.Name] = struct{}{}
-		switch p.Type {
-		case ProviderTypeGitHub:
-			if p.ClientID == "" || p.ClientSecret == "" {
-				return fmt.Errorf("providers[%d] (%s): client_id and client_secret are required for github", i, p.Name)
-			}
-			if len(p.AllowedEmailDomains) > 0 || len(p.RequiredClaims) > 0 {
-				return fmt.Errorf("providers[%d] (%s): allowed_email_domains and required_claims are for oidc; use allowed_orgs for github", i, p.Name)
-			}
-		case ProviderTypeOIDC:
-			if p.ClientID == "" || p.OIDCIssuerURL == "" {
-				return fmt.Errorf("providers[%d] (%s): client_id and oidc_issuer_url are required for oidc", i, p.Name)
-			}
-			if p.RequireUserInfo && !p.FetchUserInfo {
-				return fmt.Errorf("providers[%d] (%s): require_userinfo needs fetch_userinfo", i, p.Name)
-			}
-			if len(p.AllowedOrgs) > 0 {
-				return fmt.Errorf("providers[%d] (%s): allowed_orgs is for github; use allowed_email_domains or required_claims for oidc", i, p.Name)
-			}
-			for claim, values := range p.RequiredClaims {
-				if len(values) == 0 {
-					return fmt.Errorf("providers[%d] (%s): required_claims.%s lists no values", i, p.Name, claim)
-				}
-			}
-		case "":
-			return fmt.Errorf("providers[%d] (%s): type is required", i, p.Name)
-		default:
-			return fmt.Errorf("providers[%d] (%s): unknown type %q", i, p.Name, p.Type)
-		}
-		switch {
-		case !p.hasPolicy() && !p.AllowAnyUser:
-			return fmt.Errorf("providers[%d] (%s): anyone who can sign in to this provider could enroll; restrict it (allowed_orgs for github, allowed_email_domains or required_claims for oidc) or set allow_any_user: true", i, p.Name)
-		case p.hasPolicy() && p.AllowAnyUser:
-			return fmt.Errorf("providers[%d] (%s): allow_any_user conflicts with the provider's restrictions", i, p.Name)
+		if err := p.check(); err != nil {
+			return fmt.Errorf("providers[%d] (%s): %w", i, p.Name, err)
 		}
 	}
 	if !strings.Contains(c.Claims.NameTemplate, "{username}") || !strings.Contains(c.Claims.NameTemplate, "{device_name}") {
@@ -454,6 +423,49 @@ func (c *Config) Validate() error {
 		}
 	}
 	return c.Claims.checkNames()
+}
+
+// check returns an error for a provider config ZDAS cannot run, or would
+// run more openly than it says: a provider with no policy and no explicit
+// allow_any_user, or with a policy meant for the other type, which that type
+// would ignore. Validate and NewServer both run it, so a Config built in
+// code fails closed too.
+func (p ProviderConfig) check() error {
+	switch p.Type {
+	case ProviderTypeGitHub:
+		if p.ClientID == "" || p.ClientSecret == "" {
+			return errors.New("client_id and client_secret are required for github")
+		}
+		if len(p.AllowedEmailDomains) > 0 || len(p.RequiredClaims) > 0 {
+			return errors.New("allowed_email_domains and required_claims are for oidc; use allowed_orgs for github")
+		}
+	case ProviderTypeOIDC:
+		if p.ClientID == "" || p.OIDCIssuerURL == "" {
+			return errors.New("client_id and oidc_issuer_url are required for oidc")
+		}
+		if p.RequireUserInfo && !p.FetchUserInfo {
+			return errors.New("require_userinfo needs fetch_userinfo")
+		}
+		if len(p.AllowedOrgs) > 0 {
+			return errors.New("allowed_orgs is for github; use allowed_email_domains or required_claims for oidc")
+		}
+		for claim, values := range p.RequiredClaims {
+			if len(values) == 0 {
+				return fmt.Errorf("required_claims.%s lists no values", claim)
+			}
+		}
+	case "":
+		return errors.New("type is required")
+	default:
+		return fmt.Errorf("unknown type %q", p.Type)
+	}
+	switch {
+	case !p.hasPolicy() && !p.AllowAnyUser:
+		return errors.New("anyone who can sign in to this provider could enroll; restrict it (allowed_orgs for github, allowed_email_domains or required_claims for oidc) or set allow_any_user: true")
+	case p.hasPolicy() && p.AllowAnyUser:
+		return errors.New("allow_any_user conflicts with the provider's restrictions")
+	}
+	return nil
 }
 
 // checkRequired returns an error for a setting NewServer cannot work

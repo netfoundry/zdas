@@ -45,7 +45,7 @@ Anyone on the internet can reach `/authorize`, `/callback` and `/token`.
 - Codes are single use, short-lived, and bound to the tunneler's PKCE verifier and redirect URI.
 
 **Who may enroll**
-- A configured provider must have a policy (`allowed_orgs`, `allowed_email_domains`, `required_claims`) or say `allow_any_user: true` explicitly.
+- A configured provider must have a policy (`allowed_orgs`, `allowed_email_domains`, `required_claims`) or say `allow_any_user: true` explicitly, and a policy for the other provider type is refused. This holds for a `Config` built in code as well as one loaded from a file.
 - Only a verified email address counts toward `allowed_email_domains`.
 
 **Resource limits**

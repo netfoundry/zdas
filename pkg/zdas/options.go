@@ -85,8 +85,11 @@ func WithUpstreamHTTPClient(c *http.Client) Option {
 // memory, so that a flow started on one replica can finish on another. See
 // Store for the contract. ZDAS does not stop or close s; its lifetime belongs
 // to the caller. Entries are bound to Config.Token.Issuer, so replicas
-// sharing s must share the issuer, and a Store shared by differently
-// configured instances cannot leak entries between them. Replicas compare
+// sharing s must share the issuer, and instances with different issuers
+// cannot see each other's entries in it. Instances that share s and an
+// issuer but differ otherwise, such as in audience or provisioner, can
+// consume each other's codes and sessions: give each its own issuer or its
+// own Store. Replicas compare
 // entry timestamps written by each other, so their clocks must agree to
 // within a minute.
 //

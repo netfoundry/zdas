@@ -34,8 +34,13 @@ type Server struct {
 
 // NewServer creates a fully-wired Server. Call Start to begin serving. cfg
 // must have its defaults applied, by LoadConfig or Config.ApplyDefaults;
-// NewServer fails if a setting it cannot do without is unset.
+// NewServer fails if a setting it cannot do without is unset, and on a
+// configured provider Validate would also reject, such as one with neither
+// a policy nor AllowAnyUser. A nil logger uses slog.Default().
 func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, retErr error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if err := cfg.checkRequired(); err != nil {
 		return nil, fmt.Errorf("config: %w (was ApplyDefaults called?)", err)
 	}
@@ -84,6 +89,9 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 	// rather than discovered from the controller).
 	configuredNames := make(map[string]struct{}, len(cfg.Providers))
 	for _, pc := range cfg.Providers {
+		if err := pc.check(); err != nil {
+			return nil, fmt.Errorf("provider %q: %w", pc.Name, err)
+		}
 		configuredNames[pc.Name] = struct{}{}
 		switch pc.Type {
 		case ProviderTypeGitHub:
