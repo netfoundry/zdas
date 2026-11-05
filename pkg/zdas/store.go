@@ -22,7 +22,8 @@ import (
 // can only be consumed as the kind and by the ZDAS configuration that
 // created it. An auth session also carries the hash of the nonce in the
 // cookie that ties it to the browser that started it (BindingHash), never
-// the nonce itself.
+// the nonce itself. A session that comes back without its BindingHash is
+// treated as missing, so a Store that drops the field fails every sign-in.
 //
 // Consume methods return the entry for a key and remove it so that it cannot
 // be returned again, atomically: when several callers consume the same key

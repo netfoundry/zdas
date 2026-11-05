@@ -176,10 +176,37 @@ func tokenErrorCode(t *testing.T, w *httptest.ResponseRecorder) string {
 	return body.Error
 }
 
+// waitingSession returns a session waiting for mock-idp's callback, bound
+// to testBindingNonce, so that only its CreatedAt can stop the callback.
+func waitingSession(createdAt time.Time) *AuthSession {
+	return &AuthSession{
+		DeviceInfo:           &DeviceInfo{DeviceName: "laptop"},
+		TunnelerRedirectURI:  "http://localhost:20314/auth/callback",
+		TunnelerState:        "s",
+		UpstreamProviderName: "mock-idp",
+		CallbackURL:          "https://zdas.example.com/callback/mock-idp",
+		BindingHash:          bindingHash(testBindingNonce),
+		CreatedAt:            createdAt,
+	}
+}
+
 // TestStoreStaleEntriesAreMisses verifies that ZDAS enforces TTLs itself, so
 // a store that hands back an expired entry, or one whose CreatedAt was lost
 // or shifted, cannot extend its lifetime.
 func TestStoreStaleEntriesAreMisses(t *testing.T) {
+	// The control: the same session, fresh, finishes the sign-in.
+	store := newJSONStore()
+	h := setupStoreHandlers(t, store, "https://zdas.example.com")
+	sid := mustID(t)
+	if err := store.CreateSession(t.Context(), h.storeKey(kindSession, sid), waitingSession(time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	h.mux().ServeHTTP(w, seededRequest("/callback/mock-idp?code=x&state="+sid, sid))
+	if !redirectsWithCode(t, w) {
+		t.Fatalf("fresh session: status = %d, Location = %q; want a code for the tunneler", w.Code, w.Header().Get("Location"))
+	}
+
 	for name, createdAt := range map[string]time.Time{
 		"expired": time.Now().Add(-time.Hour),
 		"zero":    {},
@@ -201,13 +228,13 @@ func TestStoreStaleEntriesAreMisses(t *testing.T) {
 			}
 
 			sid := mustID(t)
-			if err := store.CreateSession(ctx, h.storeKey(kindSession, sid), &AuthSession{DeviceInfo: &DeviceInfo{}, CreatedAt: createdAt}); err != nil {
+			if err := store.CreateSession(ctx, h.storeKey(kindSession, sid), waitingSession(createdAt)); err != nil {
 				t.Fatal(err)
 			}
 			w = httptest.NewRecorder()
-			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback?code=x&state="+sid, nil))
+			mux.ServeHTTP(w, seededRequest("/callback/mock-idp?code=x&state="+sid, sid))
 			if w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
-				t.Errorf("session: status = %d, body = %s; want 400 not found", w.Code, w.Body.String())
+				t.Errorf("session: status = %d, body = %s; want 400 and the warning", w.Code, w.Body.String())
 			}
 
 			pid := mustID(t)
@@ -240,6 +267,7 @@ func TestStoreFailureIsServerError(t *testing.T) {
 	for _, target := range []string{
 		"/callback?code=x&state=" + id,
 		"/callback?error=access_denied&state=" + id,
+		"/callback/mock-idp/x?code=x&state=" + id,
 	} {
 		w = httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))

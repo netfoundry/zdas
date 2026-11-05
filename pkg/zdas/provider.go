@@ -87,19 +87,20 @@ func (r *ProviderRegistry) Register(p UpstreamProvider) error {
 // Resolve looks up a provider by name, or else by issuer when exactly one
 // provider has that issuer. If hint is empty and exactly one provider is
 // registered, it returns that provider. Otherwise an empty hint with multiple
-// providers returns ErrMultipleProviders.
+// providers returns ErrMultipleProviders. With no providers registered it
+// returns ErrNoProviders, whatever the hint.
 func (r *ProviderRegistry) Resolve(hint string) (UpstreamProvider, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
+	if len(r.providers) == 0 {
+		return nil, ErrNoProviders
+	}
 	if hint == "" {
 		if len(r.providers) == 1 {
 			for _, p := range r.providers {
 				return p, nil
 			}
-		}
-		if len(r.providers) == 0 {
-			return nil, ErrNoProviders
 		}
 		return nil, ErrMultipleProviders
 	}

@@ -9,12 +9,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -396,14 +398,15 @@ func TestClientsWithReplacedDefaultTransport(t *testing.T) {
 }
 
 // TestOIDCProviderBoundsContextClient verifies that a client taken from ctx
-// gets ZDAS's response size cap and, when it has none, ZDAS's timeout,
-// since it now makes the token and userinfo requests too.
+// gets ZDAS's response size cap, for discovery and for the token and
+// userinfo requests it now makes too, and that a typed nil one is ignored.
 func TestOIDCProviderBoundsContextClient(t *testing.T) {
 	var issuer string
+	var padding atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
-			"padding":                strings.Repeat("x", maxResponseBytes),
+			"padding":                strings.Repeat("x", int(padding.Load())),
 			"issuer":                 issuer,
 			"authorization_endpoint": issuer + "/authorize",
 			"token_endpoint":         issuer + "/token",
@@ -412,19 +415,90 @@ func TestOIDCProviderBoundsContextClient(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	issuer = srv.URL
+	padding.Store(maxResponseBytes)
 	ctx := oidc.ClientContext(context.Background(), &http.Client{})
-	if _, err := NewOIDCProvider(ctx, OIDCProviderConfig{Name: "big", Issuer: issuer, ClientID: "c"}); err == nil {
-		t.Error("oversized discovery document accepted through a ctx client")
+	_, err := NewOIDCProvider(ctx, OIDCProviderConfig{Name: "big", Issuer: issuer, ClientID: "c"})
+	if err == nil || !strings.Contains(err.Error(), "oidc discovery") {
+		t.Errorf("oversized discovery document through a ctx client: %v, want a discovery error", err)
 	}
+	// The same document under the cap is accepted, so the cap is what
+	// refused the one above, and the provider keeps the bounded client for
+	// its token and userinfo requests.
+	padding.Store(0)
+	p, err := NewOIDCProvider(ctx, OIDCProviderConfig{Name: "small", Issuer: issuer, ClientID: "c"})
+	if err != nil {
+		t.Fatalf("small discovery document through a ctx client: %v", err)
+	}
+	if _, ok := p.client.Transport.(limitedBodyTransport); !ok {
+		t.Errorf("provider's client transport = %T, want limitedBodyTransport", p.client.Transport)
+	}
+	var typedNil *http.Client
+	if p, err := NewOIDCProvider(oidc.ClientContext(context.Background(), typedNil), OIDCProviderConfig{Name: "nil", Issuer: issuer, ClientID: "c"}); err != nil || p.client != httpClient {
+		t.Errorf("typed nil ctx client: %v, want ZDAS's own client", err)
+	}
+}
 
+// TestBoundedClient verifies that boundedClient adds ZDAS's limits to a
+// copy of the client and keeps everything else the embedder set.
+func TestBoundedClient(t *testing.T) {
 	bc := boundedClient(&http.Client{})
 	if bc.Timeout != outboundTimeout {
 		t.Errorf("timeout = %v, want %v for a client with none", bc.Timeout, outboundTimeout)
 	}
-	if _, ok := bc.Transport.(limitedBodyTransport); !ok {
-		t.Errorf("transport = %T, want limitedBodyTransport", bc.Transport)
-	}
 	if bc := boundedClient(&http.Client{Timeout: time.Second}); bc.Timeout != time.Second {
 		t.Errorf("timeout = %v, want the client's own", bc.Timeout)
 	}
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	redirects := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	own := &roundTripRecorder{}
+	c := &http.Client{Jar: jar, CheckRedirect: redirects, Transport: own}
+	bc = boundedClient(c)
+	if bc == c || c.Transport != own {
+		t.Error("boundedClient changed the client it was given")
+	}
+	if bc.Jar != jar || bc.CheckRedirect == nil {
+		t.Error("boundedClient dropped the cookie jar or redirect policy")
+	}
+	if lt, ok := bc.Transport.(limitedBodyTransport); !ok || lt.base != own {
+		t.Errorf("transport = %#v, want limitedBodyTransport over the client's own", bc.Transport)
+	}
+	if again := boundedClient(bc); again.Transport != bc.Transport {
+		t.Errorf("bounding twice wrapped again: %#v", again.Transport)
+	}
+
+	// A client without a transport uses http.DefaultTransport as it is
+	// when a request is made, as an http.Client does.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(srv.Close)
+	bc = boundedClient(&http.Client{})
+	later := &roundTripRecorder{base: http.DefaultTransport}
+	orig := http.DefaultTransport
+	http.DefaultTransport = later
+	t.Cleanup(func() { http.DefaultTransport = orig })
+	resp, err := bc.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if later.calls != 1 {
+		t.Errorf("DefaultTransport set after boundedClient made %d requests, want 1", later.calls)
+	}
+}
+
+// roundTripRecorder counts requests and passes them to base, if any.
+type roundTripRecorder struct {
+	base  http.RoundTripper
+	calls int
+}
+
+func (r *roundTripRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.calls++
+	if r.base == nil {
+		return nil, errors.New("no transport")
+	}
+	return r.base.RoundTrip(req)
 }

@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/lestrrat-go/jwx/v3/jwt"
 	"gopkg.in/yaml.v3"
@@ -427,14 +429,39 @@ func (c *Config) Validate() error {
 	return c.Claims.checkNames()
 }
 
+// maxProviderNameLength caps a configured provider's name, which goes into
+// its callback path, the consent page and log lines.
+const maxProviderNameLength = 255
+
+// checkProviderName returns an error for a name that can't serve as the
+// last segment of the provider's callback path: "." and "..", which a
+// browser resolves away, invalid UTF-8 and control characters. Other
+// characters, spaces included, are escaped in the path, so a configured
+// provider can still take the name of a controller signer to override it.
+func checkProviderName(name string) error {
+	switch {
+	case name == "":
+		return errors.New("name is required")
+	case name == "." || name == "..":
+		return fmt.Errorf("name %q can't be a callback path segment", name)
+	case len(name) > maxProviderNameLength:
+		return fmt.Errorf("name is longer than %d bytes", maxProviderNameLength)
+	case !utf8.ValidString(name):
+		return errors.New("name is not valid UTF-8")
+	case strings.ContainsFunc(name, unicode.IsControl):
+		return errors.New("name has control characters")
+	}
+	return nil
+}
+
 // check returns an error for a provider config ZDAS cannot run, or would
 // run more openly than it says: a provider with no policy and no explicit
 // allow_any_user, or with a policy meant for the other type, which that type
 // would ignore. Validate and NewServer both run it, so a Config built in
 // code fails closed too.
 func (p ProviderConfig) check() error {
-	if p.Name == "" {
-		return errors.New("name is required")
+	if err := checkProviderName(p.Name); err != nil {
+		return err
 	}
 	switch p.Type {
 	case ProviderTypeGitHub:

@@ -82,13 +82,19 @@ func bindingHandlers(t *testing.T, externalURL string) http.Handler {
 // bindingEndpoints returns the endpoints bindingHandlers serves.
 func bindingEndpoints(t *testing.T, externalURL string) *endpoints {
 	t.Helper()
+	return bindingEndpointsFor(t, externalURL, "mock-idp")
+}
+
+// bindingEndpointsFor is bindingEndpoints with one provider named provider.
+func bindingEndpointsFor(t *testing.T, externalURL, provider string) *endpoints {
+	t.Helper()
 	ks, err := GenerateKeySet()
 	if err != nil {
 		t.Fatalf("GenerateKeySet: %v", err)
 	}
 	reg := NewProviderRegistry()
 	if err := reg.Register(&callbackProvider{
-		name:     "mock-idp",
+		name:     provider,
 		issuer:   "https://mock-idp",
 		identity: &UpstreamIdentity{Subject: "u1", Username: "jsmith", Issuer: "https://mock-idp"},
 	}); err != nil {
@@ -186,7 +192,8 @@ func TestAuthorizeSetsBindingCookie(t *testing.T) {
 
 // TestCallbackRequiresBindingCookie verifies that /callback from a browser
 // without the session's binding cookie is refused and cancels the sign-in,
-// so the browser that started it can't finish it afterwards either.
+// so the browser that started it can't finish it afterwards either. Both
+// get the same warning, so the log and the Store show which branch ran.
 func TestCallbackRequiresBindingCookie(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -207,7 +214,10 @@ func TestCallbackRequiresBindingCookie(t *testing.T) {
 	for _, tc := range cases {
 		for _, query := range []string{"code=c", "error=access_denied"} {
 			t.Run(tc.name+"/"+query, func(t *testing.T) {
-				mux := bindingHandlers(t, "https://zdas.example.com")
+				h := bindingEndpoints(t, "https://zdas.example.com")
+				var logs strings.Builder
+				h.logger = slog.New(slog.NewTextHandler(&logs, nil))
+				mux := h.mux()
 				started, sessID := startAuthorize(t, mux)
 				// An attacker can start their own flow and hold its cookie.
 				attacker, attackerID := startAuthorize(t, mux)
@@ -224,6 +234,12 @@ func TestCallbackRequiresBindingCookie(t *testing.T) {
 				}
 				if loc := w.Header().Get("Location"); loc != "" {
 					t.Errorf("wrong browser: Location = %q, want none", loc)
+				}
+				if n := strings.Count(logs.String(), "did not start the sign-in"); n != 1 {
+					t.Errorf("wrong browser: cancel logged %d times, want once: %s", n, logs.String())
+				}
+				if got, err := h.store.ConsumeSession(t.Context(), h.storeKey(kindSession, sessID)); got != nil || err != nil {
+					t.Fatalf("wrong browser: session still stored: %v, %v", got, err)
 				}
 
 				// The sign-in is gone, for the browser that started it too.
@@ -299,8 +315,11 @@ func TestOldSessionKeysAreNotRead(t *testing.T) {
 	ctx := t.Context()
 	id, nonce := mustID(t), mustID(t)
 	issuer := h.cfg.Token.Issuer
-	for _, key := range []string{hashStoreKey("session", issuer, id), hashStoreKey("session", issuer, id+"."+nonce)} {
-		sess := &AuthSession{DeviceInfo: &DeviceInfo{}, UpstreamProviderName: "x", CreatedAt: time.Now()}
+	// Each old entry is one a read of its key would accept, fresh and
+	// bound to nonce, so only the key keeps it from being consumed.
+	oldKeys := []string{hashStoreKey("session", issuer, id), hashStoreKey("session", issuer, id+"."+nonce)}
+	for _, key := range oldKeys {
+		sess := &AuthSession{DeviceInfo: &DeviceInfo{}, UpstreamProviderName: "x", BindingHash: bindingHash(nonce), CreatedAt: time.Now()}
 		if err := h.store.CreateSession(ctx, key, sess); err != nil {
 			t.Fatal(err)
 		}
@@ -308,6 +327,11 @@ func TestOldSessionKeysAreNotRead(t *testing.T) {
 	for _, n := range []string{"", nonce} {
 		if sess, other, err := h.consumeSession(ctx, id, n); sess != nil || other || err != nil {
 			t.Errorf("nonce %q: %v, %v, %v; want a miss", n, sess, other, err)
+		}
+	}
+	for _, key := range oldKeys {
+		if got, err := h.store.ConsumeSession(ctx, key); got == nil || err != nil {
+			t.Errorf("old entry under %s was touched: %v, %v", key, got, err)
 		}
 	}
 
@@ -349,38 +373,211 @@ func TestSessionWithoutBindingHashIsRefused(t *testing.T) {
 	}
 }
 
-// TestCallbackMissWarns verifies that a /callback with a code or an error
-// that names no session waiting for one warns against sending the address
-// on. That covers a phisher who edits state in the IdP's address before
-// sending it, so that the victim's browser cancels nothing.
+// TestCallbackMissWarns verifies that every /callback that names no
+// session waiting for one warns against sending the address on, whatever
+// the query holds. A phisher can edit the IdP's address so that the code
+// comes back without the session's state: with state changed, in a URL
+// fragment the server never sees (response_mode=fragment), in a JWT
+// (response_mode=jwt), or as a form post (response_mode=form_post).
 func TestCallbackMissWarns(t *testing.T) {
 	mux := bindingHandlers(t, "https://zdas.example.com")
 	attacker, sessID := startAuthorize(t, mux)
-	for _, target := range []string{
-		"/callback/mock-idp?code=c",
-		"/callback/mock-idp?code=c&state=" + mustID(t),
-		"/callback/mock-idp?code=c&state=garbage",
-		"/callback/mock-idp?error=access_denied&state=" + mustID(t),
+	get := func(target string) *http.Request { return httptest.NewRequest(http.MethodGet, target, nil) }
+	post := func(target string) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, target, strings.NewReader("code=c&state=garbage"))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return req
+	}
+	for _, req := range []*http.Request{
+		get("/callback/mock-idp?code=c"),
+		get("/callback/mock-idp?code=c&state=" + mustID(t)),
+		get("/callback/mock-idp?code=c&state=garbage"),
+		get("/callback/mock-idp?error=access_denied&state=" + mustID(t)),
+		get("/callback/mock-idp?state=" + mustID(t)),
+		get("/callback/mock-idp"),
+		get("/callback/mock-idp?response=eyJhbGciOiJub25lIn0.e30."),
+		get("/callback"),
+		get("/callback/"),
+		get("/callback/mock-idp/x?code=c"),
+		get("/callback/unknown?code=c"),
+		post("/callback/mock-idp"),
+		post("/callback"),
+		post("/callback/mock-idp/x"),
+		httptest.NewRequest(http.MethodPut, "/callback/mock-idp?code=c", nil),
 	} {
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
+		mux.ServeHTTP(w, req)
 		if w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
-			t.Errorf("%s: %d %s, want 400 and the warning", target, w.Code, w.Body.String())
+			t.Errorf("%s %s: %d %s, want 400 and the warning", req.Method, req.URL, w.Code, w.Body.String())
 		}
 	}
+	// A known limit, not a property: the binding can't tie the victim's
+	// code to the attacker's session, so callbacks with an edited state
+	// leave it live for the attacker to finish, and the warning is what is
+	// left. docs/security.md describes this.
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/callback/mock-idp?state="+mustID(t), nil))
-	if w.Body.String() != sessionMissing+"\n" {
-		t.Errorf("miss with neither code nor error: %s, want the plain message", w.Body.String())
-	}
-	// The attacker's own session is untouched by the edited addresses: the
-	// binding can't tie the victim's code to it, so the warning is what is
-	// left.
-	w = httptest.NewRecorder()
 	mux.ServeHTTP(w, browserRequest(attacker, "/callback/mock-idp?code=c&state="+sessID))
 	if w.Code != http.StatusFound {
-		t.Errorf("attacker's session after edited callbacks: %d, want it still live", w.Code)
+		t.Errorf("attacker's session after edited callbacks: %d, want it still live (known limit)", w.Code)
 	}
+}
+
+// TestStrayCallbackCancels verifies that a response ZDAS never asked for,
+// at a path below a provider's callback or posted rather than fetched, still
+// consumes the session its state names, logs that, and expires the binding
+// cookie it carries. GitHub accepts any redirect_uri below the registered
+// one, and an IdP can be asked for a form post, so a phisher who edits
+// either into the IdP's address must not get a page that leaves the sign-in
+// live.
+func TestStrayCallbackCancels(t *testing.T) {
+	post := func(target, body string) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, target, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return req
+	}
+	for _, tc := range []struct {
+		name string
+		req  func(state string) *http.Request
+	}{
+		{"sub-path", func(state string) *http.Request {
+			return httptest.NewRequest(http.MethodGet, "/callback/mock-idp/x?code=c&state="+state, nil)
+		}},
+		{"form post", func(state string) *http.Request { return post("/callback/mock-idp", "code=c&state="+state) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := bindingEndpoints(t, "https://zdas.example.com")
+			var logs strings.Builder
+			h.logger = slog.New(slog.NewTextHandler(&logs, nil))
+			mux := h.mux()
+			attacker, sessID := startAuthorize(t, mux)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, tc.req(sessID))
+			if w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
+				t.Fatalf("victim: %d %s, want 400 and the warning", w.Code, w.Body.String())
+			}
+			if got, err := h.store.ConsumeSession(t.Context(), h.storeKey(kindSession, sessID)); got != nil || err != nil {
+				t.Fatalf("session still stored after the stray callback: %v, %v", got, err)
+			}
+			if !strings.Contains(logs.String(), "never asked for; cancelled it") || !strings.Contains(logs.String(), "finished no sign-in") {
+				t.Errorf("stray callback not logged: %s", logs.String())
+			}
+			w = httptest.NewRecorder()
+			mux.ServeHTTP(w, browserRequest(attacker, "/callback/mock-idp?code=c&state="+sessID))
+			if w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
+				t.Errorf("attacker after the stray callback: %d %s, want 400 and the warning", w.Code, w.Body.String())
+			}
+		})
+	}
+
+	t.Run("right browser's cookie expired", func(t *testing.T) {
+		mux := bindingHandlers(t, "https://zdas.example.com")
+		started, sessID := startAuthorize(t, mux)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, browserRequest(started, "/callback/mock-idp/x?code=c&state="+sessID))
+		expired := false
+		for _, c := range w.Result().Cookies() {
+			if c.Name == bindingCookieName(sessID) && c.MaxAge < 0 {
+				expired = true
+			}
+		}
+		if w.Code != http.StatusBadRequest || !expired {
+			t.Errorf("stray callback from the right browser: %d, cookie expired %v; want 400 and the cookie expired", w.Code, expired)
+		}
+	})
+
+	t.Run("oversized body", func(t *testing.T) {
+		h := bindingEndpoints(t, "https://zdas.example.com")
+		mux := h.mux()
+		_, sessID := startAuthorize(t, mux)
+		body := "id_token=" + strings.Repeat("x", maxCallbackFormBytes) + "&state=" + sessID
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, post("/callback/mock-idp", body))
+		if w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
+			t.Errorf("oversized post: %d %s, want 400 and the warning", w.Code, w.Body.String())
+		}
+		if got, err := h.store.ConsumeSession(t.Context(), h.storeKey(kindSession, sessID)); got == nil || err != nil {
+			t.Errorf("a state past the body cap was read: session %v, %v", got, err)
+		}
+	})
+}
+
+// TestProviderNamesInCallbackPath verifies that a provider name with
+// characters the callback path must escape still finishes a sign-in, since
+// the name rule allows them so that a configured provider can take a
+// controller signer's name.
+func TestProviderNamesInCallbackPath(t *testing.T) {
+	for _, name := range []string{"Keycloak Prod", "a/b", "100%", "é", "a?b#c"} {
+		t.Run(name, func(t *testing.T) {
+			mux := bindingEndpointsFor(t, "https://zdas.example.com", name).mux()
+			consented, state := startAuthorize(t, mux)
+			loc, err := url.Parse(consented.Header().Get("Location"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cb, err := url.Parse(loc.Query().Get("redirect_uri"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, browserRequest(consented, cb.EscapedPath()+"?code=c&state="+state))
+			if !redirectsWithCode(t, w) {
+				t.Errorf("callback at %s: %d %s %s, want a code for the tunneler", cb.EscapedPath(), w.Code, w.Header().Get("Location"), w.Body)
+			}
+		})
+	}
+}
+
+// TestSessionWarningText pins what the warning must say, since every other
+// test compares responses with the constant itself.
+func TestSessionWarningText(t *testing.T) {
+	for _, phrase := range []string{"If someone sent you a sign-in link", "send them this page's address, don't", "enroll a device as you", "start again from the app", "you can close this page"} {
+		if !strings.Contains(sessionWarning, phrase) {
+			t.Errorf("warning lacks %q: %s", phrase, sessionWarning)
+		}
+	}
+	if !strings.HasPrefix(sessionWarning, "This sign-in can't be finished here. If someone sent you") {
+		t.Errorf("warning doesn't lead with the phishing advice: %s", sessionWarning)
+	}
+}
+
+// redirectsWithCode reports whether w sends the browser to the tunneler with
+// a code and no error.
+func redirectsWithCode(t *testing.T, w *httptest.ResponseRecorder) bool {
+	t.Helper()
+	loc, err := url.Parse(w.Header().Get("Location"))
+	return w.Code == http.StatusFound && err == nil && loc.Query().Get("code") != "" && loc.Query().Get("error") == ""
+}
+
+// TestCallbackMissesAreLogged verifies that callbacks finishing no sign-in
+// are logged with a count, at most once per callbackMissLogInterval, so an
+// operator sees edited sign-in links without a flood filling the log.
+func TestCallbackMissesAreLogged(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := bindingEndpoints(t, "https://zdas.example.com")
+		var logs strings.Builder
+		h.logger = slog.New(slog.NewTextHandler(&logs, nil))
+		mux := h.mux()
+		miss := func() {
+			mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/callback/mock-idp?code=c", nil))
+		}
+		miss()
+		miss()
+		miss()
+		if n := strings.Count(logs.String(), "finished no sign-in"); n != 1 {
+			t.Fatalf("%d log lines for three misses at once, want 1: %s", n, logs.String())
+		}
+		if !strings.Contains(logs.String(), "count=1 with_code=1") {
+			t.Errorf("first line: %s", logs.String())
+		}
+		time.Sleep(callbackMissLogInterval)
+		miss()
+		if n := strings.Count(logs.String(), "finished no sign-in"); n != 2 {
+			t.Fatalf("%d log lines after the interval, want 2: %s", n, logs.String())
+		}
+		if !strings.Contains(logs.String(), "count=3 with_code=3") {
+			t.Errorf("second line doesn't count the misses since the first: %s", logs.String())
+		}
+	})
 }
 
 func TestBindingCookieScope(t *testing.T) {
@@ -512,8 +709,11 @@ func TestBindingWithBrowserCookies(t *testing.T) {
 		t.Error("the binding cookie is sent over plain http")
 	}
 	w := user.get(base + "/callback/mock-idp?code=c&state=" + state)
-	if w.Code != http.StatusFound || !strings.HasPrefix(w.Header().Get("Location"), "http://localhost:20314/auth/callback?") {
+	if !strings.HasPrefix(w.Header().Get("Location"), "http://localhost:20314/auth/callback?") || !redirectsWithCode(t, w) {
 		t.Fatalf("callback from the user's browser: %d %s", w.Code, w.Header().Get("Location"))
+	}
+	if n := len(user.jar.Cookies(u)); n != 0 {
+		t.Errorf("cookies for /callback after the sign-in = %d, want the binding cookie expired", n)
 	}
 
 	attacker := newJarBrowser(t, mux)
@@ -522,7 +722,7 @@ func TestBindingWithBrowserCookies(t *testing.T) {
 	if w := victim.get(base + "/callback/mock-idp?code=c&state=" + state); w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
 		t.Errorf("callback from another browser: %d %s, want 400 and the warning", w.Code, w.Body)
 	}
-	if w := attacker.get(base + "/callback/mock-idp?code=c&state=" + state); w.Code == http.StatusFound {
-		t.Errorf("the browser that started the sign-in finished it after another browser cancelled it")
+	if w := attacker.get(base + "/callback/mock-idp?code=c&state=" + state); w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
+		t.Errorf("the browser that started the sign-in, after another browser cancelled it: %d %s, want 400 and the warning", w.Code, w.Body)
 	}
 }

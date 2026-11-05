@@ -128,6 +128,10 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 				return nil, fmt.Errorf("register provider %q: %w", pc.Name, err)
 			}
 			logger.Info("registered configured provider", "name", pc.Name, "type", pc.Type)
+		default:
+			// check accepts only the types above; this catches one added
+			// there and not here.
+			return nil, fmt.Errorf("provider %q: unsupported type %q", pc.Name, pc.Type)
 		}
 	}
 

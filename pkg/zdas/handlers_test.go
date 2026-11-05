@@ -1232,7 +1232,15 @@ func TestDisplayText(t *testing.T) {
 		{"日本語のデバイス", 4, "日本語の…"}, // cut on runes, not bytes
 		{"abc", 3, "abc"},
 		{"e\u0301\u0302\u0303\u0304x", 64, "e\u0301\u0302x"}, // at most two marks on a character
-		{"\u0301\u0302\u0303", 64, "\u0301\u0302"},           // and on none
+		{"\u0301\u0302\u0303", 64, ""},                       // and none on nothing
+		{"\ufe0f\u034f", 64, ""},                             // a variation selector and a joiner alone
+		{"\u3164\u0301", 64, ""},                             // a mark on a blank
+		{"a\u0301\u0302b", 1, "a\u0301\u0302…"},              // a cut keeps a character's marks
+		{"a\u0301bc", 2, "a\u0301b…"},                        // which don't count toward the limit
+		{"\u3164\u115f\u1160\uffa0\u2800\u17b4", 64, ""},     // characters that print blank
+		{"   ", 64, ""},                                      // spaces alone
+		{"\u202e  box  ", 64, "box"},                         // leading and trailing spaces
+		{"a b", 64, "a b"},                                   // inner spaces stay
 	}
 	for _, tc := range cases {
 		if got := displayText(tc.in, tc.limit); got != tc.want {
@@ -1272,14 +1280,32 @@ func TestConsentPageShowsDeviceAsLabel(t *testing.T) {
 	}
 }
 
-// TestConsentPageFallsBackToHostname verifies that a device name with
-// nothing printable in it gives way to the hostname, rather than leaving the
-// page with no description.
+// TestInvisibleDeviceNameRefused verifies that a device name with nothing
+// visible in it is refused: the identity is named after it, while the
+// consent page would show the hostname instead.
+func TestInvisibleDeviceNameRefused(t *testing.T) {
+	h, _ := setupHandlers(t)
+	for _, name := range []string{"\u202e\u200b", "\u3164\u2800", "   ", "\ufe0f", "\u0301\u0302"} {
+		w := httptest.NewRecorder()
+		h.mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, authorizeURL(t, url.Values{
+			"device_name": {name}, "hostname": {"build-box"},
+		}), nil))
+		loc, err := url.Parse(w.Header().Get("Location"))
+		if err != nil || loc.Query().Get("error_description") != "device_name must contain visible characters" {
+			t.Errorf("device_name %q: %d %s, want the visible-characters refusal", name, w.Code, w.Header().Get("Location"))
+		}
+	}
+}
+
+// TestConsentPageFallsBackToHostname verifies that a sign-in without a
+// device name, on the fallback path, shows the hostname, rather than
+// leaving the page with no description.
 func TestConsentPageFallsBackToHostname(t *testing.T) {
 	h, _ := setupHandlers(t)
+	h.cfg.Fallback.Enabled = true
 	page := httptest.NewRecorder()
 	h.mux().ServeHTTP(page, httptest.NewRequest(http.MethodGet, authorizeURL(t, url.Values{
-		"device_name": {"\u202e\u200b"}, "hostname": {"build-box"},
+		"device_name": nil, "hostname": {"\u202ebuild-box"},
 	}), nil))
 	if !strings.Contains(page.Body.String(), "<code>build-box</code>") {
 		t.Errorf("page doesn't fall back to the hostname: %s", page.Body)
@@ -1290,17 +1316,32 @@ func TestConsentPageFallsBackToHostname(t *testing.T) {
 }
 
 // TestConsentWithNoProviders verifies that a consent post when no provider
-// is left gets a server error, not an instruction to choose one.
+// is left gets a server error, not an instruction to choose one, both for
+// no choice and for the named one a real consent page posts.
 func TestConsentWithNoProviders(t *testing.T) {
 	h, _ := setupHandlers(t)
+	page := httptest.NewRecorder()
+	h.mux().ServeHTTP(page, httptest.NewRequest(http.MethodGet, authorizeURL(t, nil), nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("authorize: %d", page.Code)
+	}
 	h.registry = NewProviderRegistry()
-	form := url.Values{"consent": {mustID(t)}, "idp": {""}}
-	req := httptest.NewRequest(http.MethodPost, "/authorize", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	w := httptest.NewRecorder()
-	h.mux().ServeHTTP(w, req)
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want 503", w.Code)
+	field := consentFieldRe.FindStringSubmatch(page.Body.String())
+	if field == nil {
+		t.Fatalf("no consent field in page: %s", page.Body)
+	}
+	for _, idp := range []string{"", "test-idp"} {
+		form := url.Values{"consent": {field[1]}, "idp": {idp}}
+		req := httptest.NewRequest(http.MethodPost, "/authorize", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		for _, c := range page.Result().Cookies() {
+			req.AddCookie(c)
+		}
+		w := httptest.NewRecorder()
+		h.mux().ServeHTTP(w, req)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Errorf("idp %q: status = %d, want 503", idp, w.Code)
+		}
 	}
 }
 
