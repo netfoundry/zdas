@@ -188,8 +188,10 @@ type Handler struct {
 	srv *Server
 }
 
-// Stop halts background goroutines started by NewHandler. Call this when the
-// embedding application is shutting down.
+// Stop halts background goroutines started by NewHandler and writes the log
+// summaries still pending. Call this when the embedding application is
+// shutting down, after its http.Server has stopped serving ZDAS; a warning
+// from a request after Stop is still logged, at once.
 func (h *Handler) Stop() {
 	h.srv.cancelRun()
 	h.srv.discovery.stop()
@@ -197,6 +199,7 @@ func (h *Handler) Stop() {
 		h.srv.reconciler.stop()
 	}
 	h.srv.stopStore()
+	h.srv.handlers.stop()
 }
 
 // CompleteProvision finishes an enrollment that the provisioner sent to an
@@ -347,6 +350,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.reconciler.stop()
 	}
 	s.stopStore()
+	s.handlers.stop()
 	return errors.Join(errs...)
 }
 

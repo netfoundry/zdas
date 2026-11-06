@@ -85,7 +85,7 @@ Key settings:
 | `controller.api_url` | OpenZiti controller URL, e.g. `https://ctrl.example.com:1280`. A client or management API URL also works. | (required) |
 | `controller.identity_file` | OpenZiti identity JSON (cert, key, CA) for the management API. It needs only the `identity.read` and `identity.update` permissions (`ziti edge create identity <name> --permissions identity.read,identity.update`); ZDAS warns if it is a full admin. `identity.update` still lets it change any non-admin identity's name, role attributes, external ID and auth policy, so whoever holds the file can take over any non-admin identity. Guard it as you would an identity admin's. | (optional, required for fallback) |
 | `fallback.enabled` | Allow enrollment without device info from unmodified tunnelers | `false` |
-| `rate_limit` | Limits on `/authorize`, per client, and optionally for everyone together. Behind a reverse proxy, also set `rate_limit.trusted_proxies`, or the per-client limit applies to everyone at once. | 2/s (burst 10) per client; no global limit |
+| `rate_limit` | Limits on `/authorize`, per client, and optionally for everyone together. Behind a reverse proxy, also set `rate_limit.trusted_proxies`, or the per-client limit applies to everyone at once, and every client is logged as the proxy. | 2/s (burst 10) per client; no global limit |
 | `claims.name_template` | Template for identity names. Placeholders: `{username}`, `{device_name}`, `{hostname}`, `{os}`, `{arch}` | `{username}-{device_name}` |
 | `token.expiry` | How long enrollment tokens are valid | `5m` |
 | `tls.mode` | `none`, `static`, or `acme` | `none` |

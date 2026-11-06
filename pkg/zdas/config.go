@@ -108,7 +108,8 @@ type Config struct {
 // requests are counted against the address the proxy reports in
 // X-Forwarded-For; otherwise every request counts against the proxy.
 // X-Forwarded-For is ignored from peers that are not listed, since any
-// client can send it.
+// client can send it. TrustedProxies also decides the client that ZDAS's
+// warnings name, with or without rate limits.
 type RateLimitConfig struct {
 	AuthorizePerSecond float64  `yaml:"authorize_per_second"` // sustained rate per client; 0 = disabled
 	AuthorizeBurst     int      `yaml:"authorize_burst"`      // peak burst per client

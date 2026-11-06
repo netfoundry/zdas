@@ -1,11 +1,11 @@
 package zdas
 
 import (
-	"bytes"
 	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -125,51 +125,27 @@ func TestRandomIDUniqueness(t *testing.T) {
 }
 
 // TestMemStoreLogsEviction verifies that a full store warns when it starts
-// evicting sessions, at most once a minute.
+// evicting sessions, at most once a minute, and says how many it dropped
+// since the last warning, including those at the end of a flood.
 func TestMemStoreLogsEviction(t *testing.T) {
-	s := newMemStore(time.Hour, time.Minute, time.Hour)
-	t.Cleanup(s.stop)
-	var buf bytes.Buffer
-	s.logger = slog.New(slog.NewTextHandler(&buf, nil))
-	for i := range maxStoreEntries + 3 {
-		if err := s.CreateSession(t.Context(), fmt.Sprint(i), &AuthSession{CreatedAt: time.Now()}); err != nil {
-			t.Fatal(err)
+	synctest.Test(t, func(t *testing.T) {
+		s := newMemStore(time.Hour, time.Minute, time.Hour)
+		t.Cleanup(s.stop)
+		var buf logBuffer
+		s.logger = slog.New(slog.NewTextHandler(&buf, nil))
+		for i := range maxStoreEntries + 3 {
+			if err := s.CreateSession(t.Context(), fmt.Sprint(i), &AuthSession{CreatedAt: time.Now()}); err != nil {
+				t.Fatal(err)
+			}
 		}
-	}
-	if n := strings.Count(buf.String(), "session store full"); n != 1 {
-		t.Errorf("eviction warnings = %d, want 1: %s", n, buf.String())
-	}
-}
-
-// TestMemStoreEvictionLogCountsDrops verifies that the eviction warning
-// says how many sessions were dropped since the previous one.
-func TestMemStoreEvictionLogCountsDrops(t *testing.T) {
-	s := newMemStore(time.Hour, time.Minute, time.Hour)
-	t.Cleanup(s.stop)
-	var buf bytes.Buffer
-	s.logger = slog.New(slog.NewTextHandler(&buf, nil))
-	s.lastEvicted = time.Now() // as if a warning just went out
-	for i := range maxStoreEntries + 3 {
-		if err := s.CreateSession(t.Context(), fmt.Sprint(i), &AuthSession{CreatedAt: time.Now()}); err != nil {
-			t.Fatal(err)
+		if n := strings.Count(buf.String(), "session store full"); n != 1 || !strings.Contains(buf.String(), "dropped=1") {
+			t.Fatalf("eviction warnings = %d, want 1 with dropped=1: %s", n, buf.String())
 		}
-	}
-	if buf.Len() != 0 {
-		t.Fatalf("warned within the interval: %s", buf.String())
-	}
-	s.lastEvicted = time.Now().Add(-evictionLogInterval)
-	if err := s.CreateSession(t.Context(), "last", &AuthSession{CreatedAt: time.Now()}); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(buf.String(), "dropped=4") {
-		t.Errorf("warning = %s, want dropped=4", buf.String())
-	}
-	buf.Reset()
-	s.lastEvicted = time.Now().Add(-evictionLogInterval)
-	if err := s.CreateSession(t.Context(), "after", &AuthSession{CreatedAt: time.Now()}); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(buf.String(), "dropped=1") {
-		t.Errorf("next warning = %s, want dropped=1, counted from the last one", buf.String())
-	}
+		buf.Reset()
+		time.Sleep(evictionLogInterval)
+		synctest.Wait()
+		if !strings.Contains(buf.String(), "dropped=2") {
+			t.Errorf("warning at the end of the interval = %s, want dropped=2", buf.String())
+		}
+	})
 }

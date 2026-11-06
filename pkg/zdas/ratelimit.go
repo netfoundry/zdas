@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -34,14 +35,8 @@ const (
 type ipRateLimiter struct {
 	rate    rate.Limit
 	burst   int
-	trusted []netip.Prefix // proxies whose X-Forwarded-For entries are believed
+	clients *clientResolver // finds the client a request is counted against
 	now     func() time.Time
-	logger  *slog.Logger
-
-	// untrustedXFF logs, once, X-Forwarded-For from a peer that is not a
-	// trusted proxy: behind an unlisted proxy every client shares one
-	// bucket, which is easy to miss.
-	untrustedXFF sync.Once
 
 	mu      sync.Mutex
 	buckets map[netip.Prefix]*list.Element // of *rateLimitBucket
@@ -67,36 +62,26 @@ const (
 	numRejectReasons
 )
 
-// rejectionLog counts the requests the rate limits refuse and logs how many,
-// at most once per rejectionLogInterval, so that an operator can see users
-// being refused without a flood filling the log.
-type rejectionLog struct {
-	logger *slog.Logger
-	now    func() time.Time
-
-	mu     sync.Mutex
-	counts [numRejectReasons]int // by rejectReason, since the last summary
-	last   time.Time
+// rejectionCounts counts the requests the rate limits refuse, for a line at most
+// once per rejectionLogInterval, so that an operator can see users being
+// refused without a flood filling the log.
+type rejectionCounts struct {
+	counts     [numRejectReasons]int // by rejectReason
+	lastClient string
 }
 
-func newRejectionLog(logger *slog.Logger) *rejectionLog {
-	return &rejectionLog{logger: logger, now: time.Now}
+// addRejection counts one request r that a limit refused for reason.
+func (h *endpoints) addRejection(r *http.Request, reason rejectReason) {
+	client := h.logClient(r)
+	h.rejections.record(func(rej *rejectionCounts) {
+		rej.counts[reason]++
+		rej.lastClient = client
+	})
 }
 
-// add counts one refused request, and logs the counts since the last
-// summary when rejectionLogInterval has passed since it.
-func (l *rejectionLog) add(reason rejectReason) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.counts[reason]++
-	now := l.now()
-	if !l.last.IsZero() && now.Sub(l.last) < rejectionLogInterval {
-		return
-	}
-	l.logger.Warn("rate limits refused /authorize requests",
-		"per_client", l.counts[rejectClient], "global", l.counts[rejectGlobal])
-	l.counts = [numRejectReasons]int{}
-	l.last = now
+func (h *endpoints) logRejections(rej rejectionCounts) {
+	h.logger.Warn("rate limits refused /authorize requests",
+		"per_client", rej.counts[rejectClient], "global", rej.counts[rejectGlobal], "last_client", rej.lastClient)
 }
 
 // tooManyRequests writes the response to a request a rate limit refused.
@@ -114,32 +99,50 @@ func defaultBurst(perSecond float64, burst int) int {
 	return max(int(perSecond)*2, 1)
 }
 
-// newIPRateLimiter returns a limiter for cfg, or nil when rate limiting is
-// disabled. Invalid trusted proxy entries are logged and skipped; Validate
-// rejects them for configs that go through it.
-func newIPRateLimiter(cfg RateLimitConfig, logger *slog.Logger) *ipRateLimiter {
+// newIPRateLimiter returns a limiter for cfg that counts each request
+// against the client the resolver clients finds for it, or nil when rate
+// limiting is disabled.
+func newIPRateLimiter(cfg RateLimitConfig, clients *clientResolver) *ipRateLimiter {
 	if cfg.AuthorizePerSecond <= 0 {
 		return nil
 	}
-	burst := defaultBurst(cfg.AuthorizePerSecond, cfg.AuthorizeBurst)
-	var trusted []netip.Prefix
-	for _, raw := range cfg.TrustedProxies {
+	return &ipRateLimiter{
+		rate:    rate.Limit(cfg.AuthorizePerSecond),
+		burst:   defaultBurst(cfg.AuthorizePerSecond, cfg.AuthorizeBurst),
+		clients: clients,
+		now:     time.Now,
+		buckets: make(map[netip.Prefix]*list.Element),
+		lru:     list.New(),
+	}
+}
+
+// clientResolver finds the client a request comes from, for the rate limits
+// and the warnings that name it.
+type clientResolver struct {
+	trusted []netip.Prefix // proxies whose X-Forwarded-For entries are believed
+	logger  *slog.Logger
+
+	// warnedXFF is set by the first X-Forwarded-For from a peer that is not
+	// a trusted proxy, which is logged: behind an unlisted proxy every
+	// client is logged as the proxy, and with rate limiting on shares one
+	// limit, which is easy to miss. Only that request waits for the log.
+	warnedXFF atomic.Bool
+}
+
+// newClientResolver returns a resolver that believes the X-Forwarded-For
+// entries of trustedProxies. Invalid entries are logged and skipped;
+// Validate rejects them for configs that go through it.
+func newClientResolver(trustedProxies []string, logger *slog.Logger) *clientResolver {
+	c := &clientResolver{logger: logger}
+	for _, raw := range trustedProxies {
 		p, err := parseTrustedProxy(raw)
 		if err != nil {
 			logger.Error("ignoring invalid rate_limit.trusted_proxies entry", "entry", raw, "error", err)
 			continue
 		}
-		trusted = append(trusted, p)
+		c.trusted = append(c.trusted, p)
 	}
-	return &ipRateLimiter{
-		rate:    rate.Limit(cfg.AuthorizePerSecond),
-		burst:   burst,
-		trusted: trusted,
-		now:     time.Now,
-		logger:  logger,
-		buckets: make(map[netip.Prefix]*list.Element),
-		lru:     list.New(),
-	}
+	return c
 }
 
 // parseTrustedProxy parses a trusted proxy entry: an IP address or a CIDR
@@ -166,7 +169,7 @@ func parseTrustedProxy(raw string) (netip.Prefix, error) {
 // allow reports whether the client r comes from is within its rate limit,
 // and for IPv6, whether its /48 is within the site limit.
 func (rl *ipRateLimiter) allow(r *http.Request) bool {
-	addr := rl.clientAddr(r)
+	addr := rl.clients.addr(r)
 	now := rl.now()
 
 	rl.mu.Lock()
@@ -217,24 +220,23 @@ func (rl *ipRateLimiter) removeIdle(now time.Time) {
 	}
 }
 
-// clientAddr returns the address r is counted against: the peer address,
+// addr returns the address r is counted and logged as: the peer address,
 // or, when the peer is a trusted proxy, the rightmost X-Forwarded-For entry
 // that is not one. Entries left of that one were written by the client and
 // are ignored. It returns the zero Addr when RemoteAddr is not an address,
 // so such requests share one bucket.
-func (rl *ipRateLimiter) clientAddr(r *http.Request) netip.Addr {
+func (c *clientResolver) addr(r *http.Request) netip.Addr {
 	addr, ok := parseHostAddr(r.RemoteAddr)
 	if !ok {
 		return netip.Addr{}
 	}
 	xff := r.Header.Values("X-Forwarded-For")
-	if !rl.isTrusted(addr) {
-		if len(xff) > 0 {
-			rl.untrustedXFF.Do(func() {
-				rl.logger.Warn("ignoring X-Forwarded-For from a peer that is not a trusted proxy; "+
-					"if ZDAS is behind a proxy, list it in rate_limit.trusted_proxies, or every client shares its bucket",
-					"peer", addr)
-			})
+	if !c.isTrusted(addr) {
+		if len(xff) > 0 && c.warnedXFF.CompareAndSwap(false, true) {
+			c.logger.Warn("ignoring X-Forwarded-For from a peer that is not a trusted proxy; "+
+				"if ZDAS is behind a proxy, list it in rate_limit.trusted_proxies, or every client is logged as the proxy, "+
+				"and with rate limiting on shares one limit",
+				"peer", addr)
 		}
 		return addr
 	}
@@ -247,15 +249,15 @@ func (rl *ipRateLimiter) clientAddr(r *http.Request) netip.Addr {
 			return addr
 		}
 		addr = hop
-		if !rl.isTrusted(addr) {
+		if !c.isTrusted(addr) {
 			return addr
 		}
 	}
 	return addr
 }
 
-func (rl *ipRateLimiter) isTrusted(a netip.Addr) bool {
-	for _, p := range rl.trusted {
+func (c *clientResolver) isTrusted(a netip.Addr) bool {
+	for _, p := range c.trusted {
 		if p.Contains(a) {
 			return true
 		}

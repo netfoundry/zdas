@@ -13,6 +13,7 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+	"unicode/utf8"
 )
 
 // browserRequest returns a GET for target carrying the cookies prev set, as
@@ -107,7 +108,7 @@ func bindingEndpointsFor(t *testing.T, externalURL, provider string) *endpoints 
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: externalURL, Audience: "ziti-enrolltocert", Expiry: 5 * time.Minute},
 	}
-	return newTestEndpoints(cfg, ks, reg, store, nil)
+	return newTestEndpoints(t, cfg, ks, reg, store, nil)
 }
 
 // startAuthorize runs /authorize and consents, and returns the consent
@@ -203,20 +204,21 @@ func TestAuthorizeSetsBindingCookie(t *testing.T) {
 // get the same warning, so the log and the Store show which branch ran.
 func TestCallbackRequiresBindingCookie(t *testing.T) {
 	cases := []struct {
-		name   string
-		cookie func(name string, other *http.Cookie) *http.Cookie
+		name       string
+		cookie     func(name string, other *http.Cookie) *http.Cookie
+		wantCookie cookieState // what the warning says the browser sent
 	}{
-		{"no cookie", func(string, *http.Cookie) *http.Cookie { return nil }},
+		{"no cookie", func(string, *http.Cookie) *http.Cookie { return nil }, cookieMissing},
 		{"wrong value", func(name string, _ *http.Cookie) *http.Cookie {
 			return &http.Cookie{Name: name, Value: strings.Repeat("0", 32)}
-		}},
+		}, cookieWrong},
 		{"malformed value", func(name string, _ *http.Cookie) *http.Cookie {
 			return &http.Cookie{Name: name, Value: "x"}
-		}},
-		{"another session's cookie", func(_ string, other *http.Cookie) *http.Cookie { return other }},
+		}, cookieWrong},
+		{"another session's cookie", func(_ string, other *http.Cookie) *http.Cookie { return other }, cookieMissing},
 		{"another session's nonce under this name", func(name string, other *http.Cookie) *http.Cookie {
 			return &http.Cookie{Name: name, Value: other.Value}
-		}},
+		}, cookieWrong},
 	}
 	for _, tc := range cases {
 		for _, query := range []string{"code=c", "error=access_denied"} {
@@ -245,6 +247,12 @@ func TestCallbackRequiresBindingCookie(t *testing.T) {
 				if n := strings.Count(logs.String(), "did not start the sign-in"); n != 1 {
 					t.Errorf("wrong browser: cancel logged %d times, want once: %s", n, logs.String())
 				}
+				line := logLine(logs.String(), "did not start the sign-in")
+				for _, field := range []string{" client=192.0.2.1 ", " provider=mock-idp ", " cookie=" + string(tc.wantCookie) + " "} {
+					if !strings.Contains(line, field) {
+						t.Errorf("wrong browser: cancel logged without %q: %s", field, line)
+					}
+				}
 				if got, err := h.store.ConsumeSession(t.Context(), h.storeKey(kindSession, sessID)); got != nil || err != nil {
 					t.Fatalf("wrong browser: session still stored: %v, %v", got, err)
 				}
@@ -259,6 +267,152 @@ func TestCallbackRequiresBindingCookie(t *testing.T) {
 					t.Errorf("right browser afterwards: Location = %q, want none", loc)
 				}
 			})
+		}
+	}
+}
+
+// TestConsumeSessionFromOtherBrowser verifies that a session consumed for a
+// browser without its nonce comes back only as other, so no caller can
+// finish the sign-in with it.
+func TestConsumeSessionFromOtherBrowser(t *testing.T) {
+	h := bindingEndpoints(t, "https://zdas.example.com")
+	id := seedSession(t, h, &AuthSession{UpstreamProviderName: "mock-idp"})
+	sess, other, err := h.consumeSession(t.Context(), id, strings.Repeat("0", 32))
+	if sess != nil || err != nil || other == nil || other.provider != "mock-idp" {
+		t.Fatalf("consumeSession = %v, %+v, %v; want nil, the session as other, nil", sess, other, err)
+	}
+	if got, other, err := h.consumeSession(t.Context(), id, testBindingNonce); got != nil || other != nil || err != nil {
+		t.Errorf("session still there for the right nonce: %v, %v, %v", got, other, err)
+	}
+}
+
+// TestCancelWarningNamesForwardedClient verifies that the warning for a
+// cancelled sign-in names the client behind a trusted proxy, with rate
+// limiting off, as it is for embedders by default.
+func TestCancelWarningNamesForwardedClient(t *testing.T) {
+	h := bindingEndpoints(t, "https://zdas.example.com")
+	h.clients = newClientResolver([]string{"192.0.2.0/24"}, h.logger)
+	var logs strings.Builder
+	h.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	mux := h.mux()
+	_, sessID := startAuthorize(t, mux)
+	req := httptest.NewRequest(http.MethodGet, "/callback/mock-idp?code=c&state="+sessID, nil)
+	req.Header.Set("X-Forwarded-For", "198.51.100.7")
+	mux.ServeHTTP(httptest.NewRecorder(), req)
+	if !strings.Contains(logLine(logs.String(), "did not start the sign-in"), " client=198.51.100.7 ") {
+		t.Errorf("warning doesn't name the forwarded client: %s", logs.String())
+	}
+}
+
+// TestCancelWarningAge verifies that the warning gives the sign-in's age
+// from /authorize, not from consent, and the browser's User-Agent.
+func TestCancelWarningAge(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := bindingEndpoints(t, "https://zdas.example.com")
+		var logs logBuffer
+		h.logger = slog.New(slog.NewTextHandler(&logs, nil))
+		mux := h.mux()
+		page := httptest.NewRecorder()
+		mux.ServeHTTP(page, httptest.NewRequest(http.MethodGet, authorizeURL(t, nil), nil))
+		time.Sleep(30 * time.Second)
+		consented := consent(t, mux, page, "")
+		loc, err := url.Parse(consented.Header().Get("Location"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Minute)
+		req := httptest.NewRequest(http.MethodGet, "/callback/mock-idp?code=c&state="+loc.Query().Get("state"), nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0")
+		mux.ServeHTTP(httptest.NewRecorder(), req)
+		line := logLine(logs.String(), "did not start the sign-in")
+		if !strings.Contains(line, " age=1m30s ") || !strings.Contains(line, " user_agent=Mozilla/5.0") {
+			t.Errorf("warning = %s, want age=1m30s and the User-Agent", line)
+		}
+	})
+}
+
+// TestCancelWarningBounds verifies that the warning cuts a long User-Agent,
+// gives a sign-in created a little in the future (a Store shared across
+// clocks) an age of 0, and names a client whose RemoteAddr isn't an address.
+func TestCancelWarningBounds(t *testing.T) {
+	h := bindingEndpoints(t, "https://zdas.example.com")
+	var logs strings.Builder
+	h.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	req := httptest.NewRequest(http.MethodGet, "/callback/mock-idp", nil)
+	req.Header.Set("User-Agent", strings.Repeat("a", 1<<20))
+	req.RemoteAddr = "@"
+	h.warnCancelled(req, "cancelled", "mock-idp", time.Now().Add(2*time.Second), cookieMissing)
+	line := logs.String()
+	if len(line) > 1024 || !strings.Contains(line, "...") {
+		t.Errorf("warning with a 1 MiB User-Agent is %d bytes, want it cut: %.300s", len(line), line)
+	}
+	if !strings.Contains(line, " age=0s ") || !strings.Contains(line, " client=@ ") {
+		t.Errorf("warning = %.300s, want age=0s and client=@", line)
+	}
+}
+
+// TestCancelWarningIgnoresUntrustedXFF verifies that, with rate limiting
+// off, the warning names the peer rather than an X-Forwarded-For it sent,
+// and that the resolver says so once.
+func TestCancelWarningIgnoresUntrustedXFF(t *testing.T) {
+	h := bindingEndpoints(t, "https://zdas.example.com")
+	var logs strings.Builder
+	h.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	h.clients = newClientResolver(nil, h.logger)
+	mux := h.mux()
+	for range 2 {
+		_, sessID := startAuthorize(t, mux)
+		req := httptest.NewRequest(http.MethodGet, "/callback/mock-idp?code=c&state="+sessID, nil)
+		req.Header.Set("X-Forwarded-For", "198.51.100.7")
+		mux.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	if n := strings.Count(logs.String(), "ignoring X-Forwarded-For"); n != 1 {
+		t.Errorf("untrusted X-Forwarded-For reported %d times, want once: %s", n, logs.String())
+	}
+	if n := strings.Count(logs.String(), " client=192.0.2.1 "); n != 2 {
+		t.Errorf("%d warnings name the peer, want 2: %s", n, logs.String())
+	}
+}
+
+// TestLongClientValuesAreCut verifies that a method, or an IdP error and its
+// description, as long as the header limit allows, is cut in the log.
+func TestLongClientValuesAreCut(t *testing.T) {
+	h := bindingEndpoints(t, "https://zdas.example.com")
+	var logs strings.Builder
+	h.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	mux := h.mux()
+	long := strings.Repeat("X", 64<<10)
+
+	_, sessID := startAuthorize(t, mux)
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(long, "/callback/mock-idp?state="+sessID, nil))
+	started, sessID := startAuthorize(t, mux)
+	mux.ServeHTTP(httptest.NewRecorder(), browserRequest(started, "/callback/mock-idp?error="+long+"&error_description="+long+"&state="+sessID))
+	for _, msg := range []string{"never asked for", "upstream returned error"} {
+		if line := logLine(logs.String(), msg); line == "" || len(line) > 2048 {
+			t.Errorf("%q line is %d bytes, want it logged and cut: %.200s", msg, len(line), line)
+		}
+	}
+	h.stop() // writes the miss summary
+	if line := logLine(logs.String(), "finished no sign-in"); line == "" || len(line) > 2048 {
+		t.Errorf("miss summary is %d bytes, want it logged and cut: %.200s", len(line), line)
+	}
+}
+
+func TestTruncForLog(t *testing.T) {
+	long := strings.Repeat("a", maxLoggedLen)
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"/callback/github", "/callback/github"},
+		{long, long},
+		{long + "b", long + "..."},
+		// A rune that would straddle the cut is left out whole.
+		{long[:maxLoggedLen-1] + "é", long[:maxLoggedLen-1] + "..."},
+		// Bytes that aren't UTF-8 are cut near the limit, not backed over.
+		{strings.Repeat("\x80", 300), strings.Repeat("\x80", maxLoggedLen-utf8.UTFMax+1) + "..."},
+	}
+	for _, tc := range cases {
+		if got := truncForLog(tc.in); got != tc.want {
+			t.Errorf("truncForLog(%d bytes) = %d bytes %q, want %d bytes", len(tc.in), len(got), got[max(0, len(got)-8):], len(tc.want))
 		}
 	}
 }
@@ -339,7 +493,7 @@ func TestOldSessionKeysAreNotRead(t *testing.T) {
 		}
 	}
 	for _, n := range []string{"", nonce} {
-		if sess, other, err := h.consumeSession(ctx, id, n); sess != nil || other || err != nil {
+		if sess, other, err := h.consumeSession(ctx, id, n); sess != nil || other != nil || err != nil {
 			t.Errorf("nonce %q: %v, %v, %v; want a miss", n, sess, other, err)
 		}
 	}
@@ -375,7 +529,7 @@ func TestSessionWithoutBindingHashIsRefused(t *testing.T) {
 		if err := h.store.CreateSession(t.Context(), h.storeKey(kindSession, id), sess); err != nil {
 			t.Fatal(err)
 		}
-		if got, other, err := h.consumeSession(t.Context(), id, nonce); got != nil || other || err != nil {
+		if got, other, err := h.consumeSession(t.Context(), id, nonce); got != nil || other != nil || err != nil {
 			t.Errorf("nonce %q: %v, %v, %v; want a miss", nonce, got, other, err)
 		}
 	}
@@ -450,13 +604,20 @@ func TestStrayCallbackCancels(t *testing.T) {
 		return req
 	}
 	for _, tc := range []struct {
-		name string
-		req  func(state string) *http.Request
+		name   string
+		req    func(state string) *http.Request
+		fields []string // in the warning
 	}{
 		{"sub-path", func(state string) *http.Request {
 			return httptest.NewRequest(http.MethodGet, "/callback/mock-idp/x?code=c&state="+state, nil)
-		}},
-		{"form post", func(state string) *http.Request { return post("/callback/mock-idp", "code=c&state="+state) }},
+		}, []string{" cookie=missing ", " method=GET ", " path=/callback/mock-idp/x"}},
+		{"form post", func(state string) *http.Request { return post("/callback/mock-idp", "code=c&state="+state) },
+			[]string{" cookie=missing ", " method=POST ", " path=/callback/mock-idp"}},
+		{"form post with another nonce", func(state string) *http.Request {
+			req := post("/callback/mock-idp", "code=c&state="+state)
+			req.AddCookie(&http.Cookie{Name: bindingCookieScope("https://zdas.example.com").name(state), Value: strings.Repeat("0", 32)})
+			return req
+		}, []string{" cookie=wrong ", " method=POST "}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := bindingEndpoints(t, "https://zdas.example.com")
@@ -475,6 +636,12 @@ func TestStrayCallbackCancels(t *testing.T) {
 			if !strings.Contains(logs.String(), "never asked for; cancelled it") || !strings.Contains(logs.String(), "finished no sign-in") {
 				t.Errorf("stray callback not logged: %s", logs.String())
 			}
+			line := logLine(logs.String(), "never asked for")
+			for _, field := range append(tc.fields, " client=192.0.2.1 ", " provider=mock-idp ") {
+				if !strings.Contains(line, field) {
+					t.Errorf("stray callback logged without %q: %s", field, line)
+				}
+			}
 			w = httptest.NewRecorder()
 			mux.ServeHTTP(w, browserRequest(attacker, "/callback/mock-idp?code=c&state="+sessID))
 			if w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
@@ -485,6 +652,8 @@ func TestStrayCallbackCancels(t *testing.T) {
 
 	t.Run("right browser's cookie expired", func(t *testing.T) {
 		h := bindingEndpoints(t, "https://zdas.example.com")
+		var logs strings.Builder
+		h.logger = slog.New(slog.NewTextHandler(&logs, nil))
 		mux := h.mux()
 		started, sessID := startAuthorize(t, mux)
 		w := httptest.NewRecorder()
@@ -497,6 +666,12 @@ func TestStrayCallbackCancels(t *testing.T) {
 		}
 		if w.Code != http.StatusBadRequest || !expired {
 			t.Errorf("stray callback from the right browser: %d, cookie expired %v; want 400 and the cookie expired", w.Code, expired)
+		}
+		line := logLine(logs.String(), "never asked for")
+		for _, field := range []string{" provider=mock-idp ", " cookie=right ", " method=GET ", " path=/callback/mock-idp/x"} {
+			if !strings.Contains(line, field) {
+				t.Errorf("stray callback from the right browser logged without %q: %s", field, line)
+			}
 		}
 	})
 
@@ -662,7 +837,7 @@ func TestRoutesToCallback(t *testing.T) {
 func TestCallbackNotRateLimited(t *testing.T) {
 	h := bindingEndpoints(t, "https://zdas.example.com")
 	// GET and POST /authorize spend the burst, as a real sign-in does.
-	h.rateLimiter = newIPRateLimiter(RateLimitConfig{AuthorizePerSecond: 0.001, AuthorizeBurst: 2}, h.logger)
+	h.rateLimiter = newIPRateLimiter(RateLimitConfig{AuthorizePerSecond: 0.001, AuthorizeBurst: 2}, h.clients)
 	mux := h.mux()
 	started, sessID := startAuthorize(t, mux)
 	w := httptest.NewRecorder()
@@ -794,6 +969,16 @@ func TestSessionWarningText(t *testing.T) {
 	}
 }
 
+// logLine returns the first line of logs that contains msg, or "".
+func logLine(logs, msg string) string {
+	for line := range strings.Lines(logs) {
+		if strings.Contains(line, msg) {
+			return line
+		}
+	}
+	return ""
+}
+
 // redirectsWithCode reports whether w sends the browser to the tunneler with
 // a code and no error.
 func redirectsWithCode(t *testing.T, w *httptest.ResponseRecorder) bool {
@@ -808,27 +993,31 @@ func redirectsWithCode(t *testing.T, w *httptest.ResponseRecorder) bool {
 func TestCallbackMissesAreLogged(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := bindingEndpoints(t, "https://zdas.example.com")
-		var logs strings.Builder
+		var logs logBuffer
 		h.logger = slog.New(slog.NewTextHandler(&logs, nil))
 		mux := h.mux()
-		miss := func() {
-			mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/callback/mock-idp?code=c", nil))
+		miss := func(query string) {
+			mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/callback/mock-idp?"+query, nil))
 		}
-		miss()
-		miss()
-		miss()
+		miss("code=c")
+		miss("code=c")
+		post := httptest.NewRequest(http.MethodPost, "/callback/mock-idp/x", strings.NewReader("error=access_denied"))
+		post.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		mux.ServeHTTP(httptest.NewRecorder(), post)
 		if n := strings.Count(logs.String(), "finished no sign-in"); n != 1 {
 			t.Fatalf("%d log lines for three misses at once, want 1: %s", n, logs.String())
 		}
 		if !strings.Contains(logs.String(), "count=1 with_code=1") {
 			t.Errorf("first line: %s", logs.String())
 		}
+		// The misses after the first line are written when the interval
+		// ends, with no further miss to trigger it.
 		time.Sleep(callbackMissLogInterval)
-		miss()
+		synctest.Wait()
 		if n := strings.Count(logs.String(), "finished no sign-in"); n != 2 {
 			t.Fatalf("%d log lines after the interval, want 2: %s", n, logs.String())
 		}
-		if !strings.Contains(logs.String(), "count=3 with_code=3") {
+		if !strings.Contains(logs.String(), "count=2 with_code=1 last_client=192.0.2.1 last_method=POST last_path=/callback/mock-idp/x") {
 			t.Errorf("second line doesn't count the misses since the first: %s", logs.String())
 		}
 	})

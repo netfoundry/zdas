@@ -17,7 +17,7 @@ import (
 // testLimiter returns a limiter for cfg with a clock the test controls.
 func testLimiter(t *testing.T, cfg RateLimitConfig) (*ipRateLimiter, *time.Time) {
 	t.Helper()
-	rl := newIPRateLimiter(cfg, slog.Default())
+	rl := newIPRateLimiter(cfg, newClientResolver(cfg.TrustedProxies, slog.Default()))
 	if rl == nil {
 		t.Fatal("limiter disabled")
 	}
@@ -99,11 +99,8 @@ func TestRateLimiterIgnoresUntrustedXFF(t *testing.T) {
 	}
 }
 
-func TestRateLimiterClientAddr(t *testing.T) {
-	rl, _ := testLimiter(t, RateLimitConfig{
-		AuthorizePerSecond: 1,
-		TrustedProxies:     []string{"10.0.0.0/8", "2001:db8::1"},
-	})
+func TestClientResolverAddr(t *testing.T) {
+	c := newClientResolver([]string{"10.0.0.0/8", "2001:db8::1"}, slog.Default())
 	cases := []struct {
 		name   string
 		remote string
@@ -129,8 +126,8 @@ func TestRateLimiterClientAddr(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := rl.clientAddr(fromAddr(tc.remote, tc.xff...)).String(); got != tc.want {
-				t.Errorf("clientAddr = %s, want %s", got, tc.want)
+			if got := c.addr(fromAddr(tc.remote, tc.xff...)).String(); got != tc.want {
+				t.Errorf("addr = %s, want %s", got, tc.want)
 			}
 		})
 	}
@@ -202,7 +199,7 @@ func TestRateLimiterSiteLimit(t *testing.T) {
 // client shares one bucket.
 func TestRateLimiterLogsUntrustedXFFOnce(t *testing.T) {
 	var buf bytes.Buffer
-	rl := newIPRateLimiter(RateLimitConfig{AuthorizePerSecond: 1}, slog.New(slog.NewTextHandler(&buf, nil)))
+	rl := newIPRateLimiter(RateLimitConfig{AuthorizePerSecond: 1}, newClientResolver(nil, slog.New(slog.NewTextHandler(&buf, nil))))
 	rl.allow(fromAddr("192.0.2.1:1"))
 	if buf.Len() != 0 {
 		t.Fatalf("logged without X-Forwarded-For: %s", buf.String())
@@ -273,7 +270,7 @@ func TestRateLimiterEnabled(t *testing.T) {
 		Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 		RateLimit:   RateLimitConfig{AuthorizePerSecond: 1, AuthorizeBurst: 2},
 	}
-	h := newTestEndpoints(cfg, ks, reg, store, nil)
+	h := newTestEndpoints(t, cfg, ks, reg, store, nil)
 	mux := h.mux()
 
 	_, challenge := generateTestPKCE(t)
@@ -334,11 +331,11 @@ func TestTrustedProxiesValidation(t *testing.T) {
 		t.Errorf("Validate = %v, want an error for trusted_proxies[1]", err)
 	}
 
-	// A config that skipped Validate still gets a limiter, trusting only the
-	// valid entries.
-	rl := newIPRateLimiter(cfg.RateLimit, slog.Default())
-	if len(rl.trusted) != 1 || rl.trusted[0].String() != "10.0.0.0/8" {
-		t.Errorf("trusted = %v, want [10.0.0.0/8]", rl.trusted)
+	// A config that skipped Validate still gets a resolver, trusting only
+	// the valid entries.
+	c := newClientResolver(cfg.RateLimit.TrustedProxies, slog.Default())
+	if len(c.trusted) != 1 || c.trusted[0].String() != "10.0.0.0/8" {
+		t.Errorf("trusted = %v, want [10.0.0.0/8]", c.trusted)
 	}
 }
 
@@ -357,7 +354,7 @@ func TestGlobalRateLimit(t *testing.T) {
 		Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 		RateLimit:   RateLimitConfig{GlobalPerSecond: 0.001, GlobalBurst: 2},
 	}
-	mux := newTestEndpoints(cfg, ks, reg, store, nil).mux()
+	mux := newTestEndpoints(t, cfg, ks, reg, store, nil).mux()
 
 	get := func(addr string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, authorizeURL(t, nil), nil)
@@ -420,7 +417,7 @@ func TestGlobalLimitSpentOnlyByValidRequests(t *testing.T) {
 		Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 		RateLimit:   RateLimitConfig{GlobalPerSecond: 0.001, GlobalBurst: 1},
 	}
-	mux := newTestEndpoints(cfg, ks, reg, store, nil).mux()
+	mux := newTestEndpoints(t, cfg, ks, reg, store, nil).mux()
 	get := func(addr, target string) int {
 		req := httptest.NewRequest(http.MethodGet, target, nil)
 		req.RemoteAddr = addr
@@ -490,7 +487,7 @@ func TestDefaultRateLimitSurvivesFlood(t *testing.T) {
 					Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 					RateLimit:   tc.limits,
 				}
-				mux := newTestEndpoints(cfg, ks, reg, store, nil).mux()
+				mux := newTestEndpoints(t, cfg, ks, reg, store, nil).mux()
 				validURL := authorizeURL(t, nil)
 				send := func(addr, target string) int {
 					req := httptest.NewRequest(http.MethodGet, target, nil)
@@ -582,7 +579,7 @@ func TestEvictionThreshold(t *testing.T) {
 				Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 				RateLimit:   defaultRateLimit,
 			}
-			mux := newTestEndpoints(cfg, ks, reg, store, nil).mux()
+			mux := newTestEndpoints(t, cfg, ks, reg, store, nil).mux()
 			validURL := authorizeURL(t, nil)
 			page := httptest.NewRecorder()
 			mux.ServeHTTP(page, httptest.NewRequest(http.MethodGet, validURL, nil))
@@ -635,28 +632,35 @@ func TestEvictionThreshold(t *testing.T) {
 }
 
 // TestRejectionLog verifies that refused requests are logged with counts,
-// at most once per rejectionLogInterval.
+// at most once per rejectionLogInterval, including those at the end of a
+// flood.
 func TestRejectionLog(t *testing.T) {
-	var buf bytes.Buffer
-	l := newRejectionLog(slog.New(slog.NewTextHandler(&buf, nil)))
-	now := time.Now()
-	l.now = func() time.Time { return now }
+	synctest.Test(t, func(t *testing.T) {
+		h := bindingEndpoints(t, "https://zdas.example.com")
+		var buf logBuffer
+		h.logger = slog.New(slog.NewTextHandler(&buf, nil))
+		from := func(addr string) *http.Request {
+			req := httptest.NewRequest(http.MethodGet, "/authorize", nil)
+			req.RemoteAddr = addr
+			return req
+		}
 
-	l.add(rejectClient)
-	if !strings.Contains(buf.String(), "per_client=1 global=0") {
-		t.Fatalf("first refusal not logged with its count: %s", buf.String())
-	}
-	buf.Reset()
-	l.add(rejectGlobal)
-	l.add(rejectClient)
-	if buf.Len() != 0 {
-		t.Errorf("logged again within the interval: %s", buf.String())
-	}
-	now = now.Add(rejectionLogInterval)
-	l.add(rejectGlobal)
-	if !strings.Contains(buf.String(), "per_client=1 global=2") {
-		t.Errorf("summary after the interval = %s, want per_client=1 global=2", buf.String())
-	}
+		h.addRejection(from("192.0.2.1:1"), rejectClient)
+		if !strings.Contains(buf.String(), "per_client=1 global=0 last_client=192.0.2.1") {
+			t.Fatalf("first refusal not logged with its count and client: %s", buf.String())
+		}
+		buf.Reset()
+		h.addRejection(from("192.0.2.2:1"), rejectGlobal)
+		h.addRejection(from("192.0.2.3:1"), rejectClient)
+		if buf.String() != "" {
+			t.Errorf("logged again within the interval: %s", buf.String())
+		}
+		time.Sleep(rejectionLogInterval)
+		synctest.Wait()
+		if !strings.Contains(buf.String(), "per_client=1 global=1 last_client=192.0.2.3") {
+			t.Errorf("summary at the end of the interval = %s, want per_client=1 global=1 last_client=192.0.2.3", buf.String())
+		}
+	})
 }
 
 // TestAuthorizeRefusalsAreLogged verifies that the handlers count what the
@@ -692,7 +696,9 @@ func TestAuthorizeRefusalsAreLogged(t *testing.T) {
 	if !strings.Contains(buf.String(), "per_client=1 global=0") {
 		t.Errorf("per-client refusal not logged: %s", buf.String())
 	}
-	if got := h.rejections.counts; got != [numRejectReasons]int{rejectClient: 1, rejectGlobal: 1} {
-		t.Errorf("refusals counted since the summary = %v, want 1 per-client and 1 global", got)
+	buf.Reset()
+	h.stop() // writes the pending summary
+	if !strings.Contains(buf.String(), "per_client=1 global=1 last_client=1.1.1.1") {
+		t.Errorf("refusals since the first summary = %s, want 1 per-client and 1 global, the last from 1.1.1.1", buf.String())
 	}
 }

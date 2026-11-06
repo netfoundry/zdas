@@ -79,21 +79,29 @@ func (h *endpoints) startSession(w http.ResponseWriter, r *http.Request, sess *A
 }
 
 // consumeBoundSession consumes the session named by state, checked against
-// the binding cookie r carries, and expires that cookie. otherBrowser
-// reports a session consumed for a browser without the right cookie; see
+// the binding cookie r carries, and expires that cookie. other reports a
+// session consumed for a browser without the right cookie; see
 // consumeSession.
-func (h *endpoints) consumeBoundSession(w http.ResponseWriter, r *http.Request, state string) (sess *AuthSession, otherBrowser bool, err error) {
+func (h *endpoints) consumeBoundSession(w http.ResponseWriter, r *http.Request, state string) (sess *AuthSession, other *otherBrowser, err error) {
 	if !validID(state) {
-		return nil, false, nil
+		return nil, nil, nil
 	}
 	var nonce string
-	if c, err := r.Cookie(h.cookie.name(state)); err == nil {
+	c, cookieErr := r.Cookie(h.cookie.name(state))
+	if cookieErr == nil {
 		h.setBindingCookie(w, state, "", -1)
 		if validID(c.Value) {
 			nonce = c.Value
 		}
 	}
-	return h.consumeSession(r.Context(), state, nonce)
+	sess, other, err = h.consumeSession(r.Context(), state, nonce)
+	if other != nil {
+		other.cookie = cookieMissing
+		if cookieErr == nil {
+			other.cookie = cookieWrong
+		}
+	}
+	return sess, other, err
 }
 
 func (h *endpoints) setBindingCookie(w http.ResponseWriter, id, nonce string, maxAge int) {
