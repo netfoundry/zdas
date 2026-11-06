@@ -37,9 +37,8 @@ type memStore struct {
 	done     chan struct{}
 	stopOnce sync.Once
 
-	logger      *slog.Logger // warns of evictions; nil logs nothing
-	lastEvicted time.Time    // when an eviction was last logged; guarded by mu
-	evicted     int          // sessions evicted since then; guarded by mu
+	logger    *slog.Logger    // warns of evictions; nil logs nothing
+	evictions summaryLog[int] // counts evicted sessions for the warning
 }
 
 // newMemStore returns a memStore that sweeps out sessions and pending
@@ -54,13 +53,22 @@ func newMemStore(sessionTTL, codeTTL, sweepEvery time.Duration) *memStore {
 		provisions: newEntryList[*PendingProvision](),
 		done:       make(chan struct{}),
 	}
+	s.evictions.interval = evictionLogInterval
+	s.evictions.write = func(dropped int) {
+		if s.logger != nil {
+			s.logger.Warn("session store full, dropping the oldest sign-ins; something is creating sessions faster than users finish them",
+				"max_sessions", maxStoreEntries, "dropped", dropped)
+		}
+	}
 	go s.sweepLoop(sweepEvery)
 	return s
 }
 
-// stop ends the sweep goroutine. It may be called more than once.
+// stop ends the sweep goroutine and writes any pending eviction warning. It
+// may be called more than once.
 func (s *memStore) stop() {
 	s.stopOnce.Do(func() { close(s.done) })
+	s.evictions.stop()
 }
 
 // CreateSession stores sess. When the store is full it evicts the oldest
@@ -68,19 +76,19 @@ func (s *memStore) stop() {
 // anyone authenticates, so refusing them would let anonymous /authorize
 // requests lock every user out.
 func (s *memStore) CreateSession(_ context.Context, key string, sess *AuthSession) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.sessions.len() >= maxStoreEntries {
-		s.sessions.removeOldest()
-		s.evicted++
-		if now := time.Now(); s.logger != nil && now.Sub(s.lastEvicted) >= evictionLogInterval {
-			s.logger.Warn("session store full, dropping the oldest sign-ins; something is creating sessions faster than users finish them",
-				"max_sessions", maxStoreEntries, "dropped", s.evicted)
-			s.lastEvicted = now
-			s.evicted = 0
+	evicted := func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		full := s.sessions.len() >= maxStoreEntries
+		if full {
+			s.sessions.removeOldest()
 		}
+		s.sessions.add(key, sess, sess.CreatedAt)
+		return full
+	}()
+	if evicted {
+		s.evictions.record(func(dropped *int) { *dropped++ })
 	}
-	s.sessions.add(key, sess, sess.CreatedAt)
 	return nil
 }
 

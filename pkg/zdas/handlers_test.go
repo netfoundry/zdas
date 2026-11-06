@@ -18,9 +18,12 @@ import (
 
 // newTestEndpoints returns endpoints over store, keyed as NewServer keys
 // them, with entries expiring by the store's TTLs.
-func newTestEndpoints(cfg Config, keys *KeySet, reg *ProviderRegistry, store *memStore, p EnrollmentProvisioner) *endpoints {
+func newTestEndpoints(t *testing.T, cfg Config, keys *KeySet, reg *ProviderRegistry, store *memStore, p EnrollmentProvisioner) *endpoints {
+	t.Helper()
 	cfg.Session.Timeout, cfg.Session.CodeExpiry = store.sessionTTL, store.codeTTL
-	return newEndpoints(cfg, keys, nil, reg, store, nil, nil, p, slog.Default())
+	h := newEndpoints(cfg, keys, nil, reg, store, nil, nil, p, slog.Default())
+	t.Cleanup(h.stop)
+	return h
 }
 
 // testBindingNonce is the binding nonce seedSession binds sessions to.
@@ -80,7 +83,7 @@ func setupHandlers(t *testing.T) (*endpoints, *stubProvider) {
 			Expiry:   5 * time.Minute,
 		},
 	}
-	h := newTestEndpoints(cfg, ks, reg, store, nil)
+	h := newTestEndpoints(t, cfg, ks, reg, store, nil)
 	return h, sp
 }
 
@@ -218,7 +221,7 @@ func TestHandleAuthorizeFallbackEnabled(t *testing.T) {
 			Expiry:   5 * time.Minute,
 		},
 	}
-	h := newTestEndpoints(cfg, ks, reg, store, nil)
+	h := newTestEndpoints(t, cfg, ks, reg, store, nil)
 	mux := h.mux()
 
 	// Should redirect to upstream (not error), even without device_name,
@@ -256,7 +259,7 @@ func TestHandleAuthorizeFallbackRefusedForTokenEnrollment(t *testing.T) {
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := newTestEndpoints(cfg, ks, reg, store, nil)
+	h := newTestEndpoints(t, cfg, ks, reg, store, nil)
 	h.discovery = &signerDiscovery{}
 	mux := h.mux()
 	noDevice := authorizeURL(t, url.Values{"device_name": nil})
@@ -298,7 +301,7 @@ func TestHandleAuthorizeIDPSelector(t *testing.T) {
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enrolltocert", Expiry: 5 * time.Minute},
 	}
-	h := newTestEndpoints(cfg, ks, reg, store, nil)
+	h := newTestEndpoints(t, cfg, ks, reg, store, nil)
 	mux := h.mux()
 
 	page := httptest.NewRecorder()
@@ -391,17 +394,45 @@ func TestConsentRequiresBindingCookie(t *testing.T) {
 	if w := post(form); w.Code != http.StatusBadRequest || w.Header().Get("Location") != "" || w.Body.String() != sessionWarning+"\n" {
 		t.Errorf("without cookie: %d %q %s, want 400 and the warning", w.Code, w.Header().Get("Location"), w.Body.String())
 	}
-	if !strings.Contains(logs.String(), "consent posted from a browser that did not start the sign-in") {
-		t.Errorf("cancelled consent not logged: %s", logs.String())
+	line := logLine(logs.String(), "consent posted from a browser that did not start the sign-in")
+	for _, field := range []string{" client=192.0.2.1 ", " provider=mock-idp ", " cookie=missing "} {
+		if !strings.Contains(line, field) {
+			t.Errorf("cancelled consent logged without %q: %s", field, logs.String())
+		}
 	}
 	if w := post(form, cookie); w.Code != http.StatusBadRequest {
 		t.Errorf("with cookie after a post without it: %d, want 400", w.Code)
+	}
+
+	// A post with a cookie under the sign-in's name but another nonce is
+	// logged as the wrong cookie.
+	logs.Reset()
+	form, _ = newPage()
+	if w := post(form, &http.Cookie{Name: h.cookie.name(form.Get("consent")), Value: strings.Repeat("0", 32)}); w.Code != http.StatusBadRequest {
+		t.Errorf("with another browser's nonce: %d, want 400", w.Code)
+	}
+	if line := logLine(logs.String(), "consent posted from"); !strings.Contains(line, " cookie=wrong ") {
+		t.Errorf("consent with another nonce logged without cookie=wrong: %s", logs.String())
 	}
 
 	// A session waiting for /callback can't be consented to again.
 	started, upstream := startAuthorize(t, mux)
 	if w := post(url.Values{"consent": {upstream}, "idp": {"mock-idp"}}, liveCookie(t, started, upstream)); w.Code != http.StatusBadRequest {
 		t.Errorf("consent to an upstream session: %d, want 400", w.Code)
+	}
+
+	// One posted from another browser naming another provider is logged with
+	// the provider the sign-in went to.
+	_, upstream = startAuthorize(t, mux)
+	if err := h.registry.Register(&callbackProvider{name: "other-idp", issuer: "https://other-idp"}); err != nil {
+		t.Fatal(err)
+	}
+	logs.Reset()
+	if w := post(url.Values{"consent": {upstream}, "idp": {"other-idp"}}); w.Code != http.StatusBadRequest {
+		t.Errorf("another browser's consent to an upstream session: %d, want 400", w.Code)
+	}
+	if line := logLine(logs.String(), "consent posted from"); !strings.Contains(line, " provider=mock-idp ") {
+		t.Errorf("consent to an upstream session logged without its own provider: %s", logs.String())
 	}
 }
 
@@ -466,7 +497,7 @@ func idpSelectorHandlers(t *testing.T, selectorURL string) http.Handler {
 		Claims:         defaultClaimsConfig(),
 		Token:          TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := newTestEndpoints(cfg, ks, reg, store, nil)
+	h := newTestEndpoints(t, cfg, ks, reg, store, nil)
 	return h.mux()
 }
 
@@ -547,7 +578,7 @@ func TestIDPSelectorURLSingleProviderSkipsPicker(t *testing.T) {
 		Claims:         defaultClaimsConfig(),
 		Token:          TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := newTestEndpoints(cfg, ks, reg, store, nil)
+	h := newTestEndpoints(t, cfg, ks, reg, store, nil)
 	w := authorizeAndConsent(t, h.mux(), authorizeURL(t, nil), "")
 	if loc := w.Header().Get("Location"); w.Code != http.StatusSeeOther || !strings.HasPrefix(loc, "https://stub/only-one") {
 		t.Errorf("consent: %d %s, want 303 to the upstream", w.Code, loc)
@@ -820,7 +851,7 @@ func TestCallbackToTokenFullFlow(t *testing.T) {
 			Expiry:   5 * time.Minute,
 		},
 	}
-	h := newTestEndpoints(cfg, ks, reg, store, nil)
+	h := newTestEndpoints(t, cfg, ks, reg, store, nil)
 	mux := h.mux()
 
 	// Pre-create a session as if /authorize had run.
@@ -923,7 +954,7 @@ func TestCallbackErrorMapping(t *testing.T) {
 				Claims:      defaultClaimsConfig(),
 				Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 			}
-			h := newTestEndpoints(cfg, ks, reg, store, tc.provisioner)
+			h := newTestEndpoints(t, cfg, ks, reg, store, tc.provisioner)
 			sessID := seedSession(t, h, &AuthSession{
 				TunnelerRedirectURI:  "http://localhost:20314/auth/callback",
 				TunnelerState:        "tstate",
@@ -1126,7 +1157,7 @@ func TestCallbackMustMatchProvider(t *testing.T) {
 				Claims:         defaultClaimsConfig(),
 				Token:          TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 			}
-			mux := newTestEndpoints(cfg, ks, reg, store, nil).mux()
+			mux := newTestEndpoints(t, cfg, ks, reg, store, nil).mux()
 
 			own, other := "https://zdas.example.com/callback/evil", "https://zdas.example.com/callback"
 			if legacy {
@@ -1174,7 +1205,7 @@ func TestCallbackChecksResponseIssuer(t *testing.T) {
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	mux := newTestEndpoints(cfg, ks, reg, store, nil).mux()
+	mux := newTestEndpoints(t, cfg, ks, reg, store, nil).mux()
 
 	for _, tc := range []struct {
 		iss string

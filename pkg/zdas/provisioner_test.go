@@ -73,7 +73,7 @@ func TestProvisionerImmediateClaims(t *testing.T) {
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := newTestEndpoints(cfg, ks, reg, store, provisioner)
+	h := newTestEndpoints(t, cfg, ks, reg, store, provisioner)
 	mux := h.mux()
 
 	// Create a session as if /authorize ran.
@@ -149,7 +149,7 @@ func TestProvisionerInteractiveRedirect(t *testing.T) {
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := newTestEndpoints(cfg, ks, reg, store, provisioner)
+	h := newTestEndpoints(t, cfg, ks, reg, store, provisioner)
 	mux := h.mux()
 
 	verifier, challenge := generateTestPKCE(t)
@@ -239,7 +239,7 @@ func runProvisionerCallback(t *testing.T, p EnrollmentProvisioner) *httptest.Res
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := newTestEndpoints(cfg, ks, reg, store, p)
+	h := newTestEndpoints(t, cfg, ks, reg, store, p)
 	mux := h.mux()
 
 	_, challenge := generateTestPKCE(t)
@@ -391,7 +391,7 @@ func setupProvisionComplete(t *testing.T) (h *endpoints, pendingID string) {
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h = newTestEndpoints(cfg, ks, reg, store, nil)
+	h = newTestEndpoints(t, cfg, ks, reg, store, nil)
 
 	pendingID = seedPendingProvision(t, h, &PendingProvision{
 		TunnelerRedirectURI:         "http://localhost:20314/auth/callback",
@@ -595,7 +595,7 @@ func TestProvisionerReceivesEnrollmentMethod(t *testing.T) {
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := newTestEndpoints(cfg, ks, reg, store, provisioner)
+	h := newTestEndpoints(t, cfg, ks, reg, store, provisioner)
 	mux := h.mux()
 
 	_, challenge := generateTestPKCE(t)
@@ -669,7 +669,7 @@ func TestProvisionerReceivesClientType(t *testing.T) {
 				Claims:      defaultClaimsConfig(),
 				Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 			}
-			mux := newTestEndpoints(cfg, ks, reg, store, provisioner).mux()
+			mux := newTestEndpoints(t, cfg, ks, reg, store, provisioner).mux()
 
 			_, challenge := generateTestPKCE(t)
 			w := authorizeAndConsent(t, mux,
@@ -713,7 +713,7 @@ func TestProvisionCompleteTracksFallback(t *testing.T) {
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := newTestEndpoints(cfg, ks, reg, store, &interactiveProvisioner{redirectURL: "https://embedder.example.com/pick"})
+	h := newTestEndpoints(t, cfg, ks, reg, store, &interactiveProvisioner{redirectURL: "https://embedder.example.com/pick"})
 	h.reconciler = testReconciler("https://ctrl", time.Hour)
 	sessID := seedSession(t, h, &AuthSession{
 		TunnelerRedirectURI:  "http://localhost:20314/auth/callback",
@@ -858,7 +858,7 @@ func TestProvisionerReceivesPendingID(t *testing.T) {
 		Claims:      defaultClaimsConfig(),
 		Token:       TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
 	}
-	h := newTestEndpoints(cfg, ks, reg, store, p)
+	h := newTestEndpoints(t, cfg, ks, reg, store, p)
 	callback := func() *httptest.ResponseRecorder {
 		sessID := seedSession(t, h, &AuthSession{
 			TunnelerRedirectURI:  "http://localhost:20314/auth/callback",
@@ -929,7 +929,7 @@ func TestProvisionerAudienceCheckedAtCallback(t *testing.T) {
 		aud string
 		ok  bool
 	}{{"net-a", true}, {"net-c", false}} {
-		h := newTestEndpoints(cfg, ks, reg, store, &immediateProvisioner{claims: map[string]any{
+		h := newTestEndpoints(t, cfg, ks, reg, store, &immediateProvisioner{claims: map[string]any{
 			"device_identity_name": "alice-laptop", "device_external_id": "e1", "sub": "e1", "aud": tc.aud,
 		}})
 		sessID := seedSession(t, h, &AuthSession{
@@ -968,7 +968,7 @@ func TestNonceReachesToken(t *testing.T) {
 		t.Cleanup(store.stop)
 		provisioned := map[string]any{"device_identity_name": "alice-laptop", "device_external_id": "e1", "sub": "e1"}
 		cfg := Config{ExternalURL: "https://zdas.test", Claims: defaultClaimsConfig(), Token: TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: time.Minute}}
-		h := newTestEndpoints(cfg, ks, reg, store, &immediateProvisioner{claims: provisioned})
+		h := newTestEndpoints(t, cfg, ks, reg, store, &immediateProvisioner{claims: provisioned})
 		sessID := seedSession(t, h, &AuthSession{
 			TunnelerRedirectURI: "http://localhost:20314/auth/callback", TunnelerState: "s", TunnelerNonce: "n-1",
 			TunnelerCodeChallenge: "c", TunnelerCodeChallengeMethod: "S256",
@@ -1007,7 +1007,7 @@ func TestNonceKeptForInteractiveProvision(t *testing.T) {
 	store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
 	t.Cleanup(store.stop)
 	cfg := Config{ExternalURL: "https://zdas.test", Claims: defaultClaimsConfig(), Token: TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: time.Minute}}
-	h := newTestEndpoints(cfg, ks, reg, store, &interactiveProvisioner{redirectURL: "https://embedder.example.com/pick"})
+	h := newTestEndpoints(t, cfg, ks, reg, store, &interactiveProvisioner{redirectURL: "https://embedder.example.com/pick"})
 	sessID := seedSession(t, h, &AuthSession{
 		TunnelerRedirectURI: "http://localhost:20314/auth/callback", TunnelerState: "s", TunnelerNonce: "n-3",
 		TunnelerCodeChallenge: "c", TunnelerCodeChallengeMethod: "S256",
@@ -1045,7 +1045,7 @@ func TestStoredClaimsAreCopies(t *testing.T) {
 			t.Cleanup(store.stop)
 			provisioned := map[string]any{"device_identity_name": "alice-laptop", "device_external_id": "e1", "sub": "e1"}
 			cfg := Config{ExternalURL: "https://zdas.test", Claims: defaultClaimsConfig(), Token: TokenConfig{Issuer: "https://zdas.test", Audience: "ziti-enroll", Expiry: time.Minute}}
-			h := newTestEndpoints(cfg, ks, reg, store, &immediateProvisioner{claims: provisioned})
+			h := newTestEndpoints(t, cfg, ks, reg, store, &immediateProvisioner{claims: provisioned})
 			sessID := seedSession(t, h, &AuthSession{
 				TunnelerRedirectURI: "http://localhost:20314/auth/callback", TunnelerState: "s", TunnelerNonce: nonce,
 				TunnelerCodeChallenge: "c", TunnelerCodeChallengeMethod: "S256",

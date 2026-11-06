@@ -16,7 +16,6 @@ import (
 	"path"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -34,13 +33,17 @@ type endpoints struct {
 	discovery   *signerDiscovery      // for cached network JWTs; may be nil in tests
 	reconciler  *fallbackReconciler   // nil when fallback is disabled
 	provisioner EnrollmentProvisioner // nil uses built-in ComposeClaims
+	clients     *clientResolver       // the client a request comes from
 	rateLimiter *ipRateLimiter        // nil when rate limiting is disabled
 	globalLimit *rate.Limiter         // GET /authorize for all clients; nil when disabled
-	rejections  *rejectionLog         // counts and logs what the limits refuse
-	misses      callbackMissLog       // counts and logs callbacks that finish no sign-in
 	redirects   []*url.URL            // parsed cfg.AllowedRedirectURIs; nil keeps the loopback default
 	cookie      cookieScope           // of the browser binding cookie, from cfg.ExternalURL
 	logger      *slog.Logger
+
+	// Summaries for the log: what the rate limits refuse, and callbacks that
+	// finish no sign-in.
+	rejections summaryLog[rejectionCounts]
+	misses     summaryLog[callbackMisses]
 }
 
 // newEndpoints returns endpoints that sign with keys, publish keys plus
@@ -62,9 +65,10 @@ func newEndpoints(cfg Config, keys *KeySet, verifyKeys []*KeySet, registry *Prov
 		logger:      logger,
 	}
 	h.cookie = bindingCookieScope(cfg.ExternalURL)
-	h.rateLimiter = newIPRateLimiter(cfg.RateLimit, logger)
-	h.rejections = newRejectionLog(logger)
-	h.misses.log.Interval = callbackMissLogInterval
+	h.clients = newClientResolver(cfg.RateLimit.TrustedProxies, logger)
+	h.rateLimiter = newIPRateLimiter(cfg.RateLimit, h.clients)
+	h.rejections.interval, h.rejections.write = rejectionLogInterval, h.logRejections
+	h.misses.interval, h.misses.write = callbackMissLogInterval, h.logMisses
 	if rl := cfg.RateLimit; rl.GlobalPerSecond > 0 {
 		h.globalLimit = rate.NewLimiter(rate.Limit(rl.GlobalPerSecond), defaultBurst(rl.GlobalPerSecond, rl.GlobalBurst))
 	}
@@ -239,7 +243,7 @@ const (
 
 func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	if h.rateLimiter != nil && !h.rateLimiter.allow(r) {
-		h.rejections.add(rejectClient)
+		h.addRejection(r, rejectClient)
 		tooManyRequests(w)
 		return
 	}
@@ -393,7 +397,7 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	// The global limit is spent only here, by a request that stores a
 	// session, so that invalid requests cannot use it up.
 	if h.globalLimit != nil && !h.globalLimit.Allow() {
-		h.rejections.add(rejectGlobal)
+		h.addRejection(r, rejectGlobal)
 		tooManyRequests(w)
 		return
 	}
@@ -433,7 +437,7 @@ const consentMissing = "sign-in request not found or expired; start again from t
 // form post does not carry, so the post must come from that browser.
 func (h *endpoints) handleConsent(w http.ResponseWriter, r *http.Request) {
 	if h.rateLimiter != nil && !h.rateLimiter.allow(r) {
-		h.rejections.add(rejectClient)
+		h.addRejection(r, rejectClient)
 		tooManyRequests(w)
 		return
 	}
@@ -454,14 +458,20 @@ func (h *endpoints) handleConsent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown or missing sign-in provider; go back and choose one", http.StatusBadRequest)
 		return
 	}
-	sess, otherBrowser, err := h.consumeBoundSession(w, r, r.PostFormValue("consent"))
+	sess, other, err := h.consumeBoundSession(w, r, r.PostFormValue("consent"))
 	if err != nil {
 		h.logger.Error("consume session", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if otherBrowser {
-		h.logger.Warn("consent posted from a browser that did not start the sign-in; cancelled it")
+	if other != nil {
+		// A session waiting for consent has no provider yet; name the one the
+		// post chose.
+		p := other.provider
+		if p == "" {
+			p = provider.Name()
+		}
+		h.warnCancelled(r, "consent posted from a browser that did not start the sign-in; cancelled it", p, other.created, other.cookie)
 		http.Error(w, sessionWarning, http.StatusBadRequest)
 		return
 	}
@@ -528,14 +538,14 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request, pathP
 
 	// The session holds the tunneler's redirect_uri, which every outcome
 	// below needs, including an upstream error.
-	sess, otherBrowser, err := h.consumeBoundSession(w, r, sessionState)
+	sess, other, err := h.consumeBoundSession(w, r, sessionState)
 	if err != nil {
 		h.logger.Error("consume session", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if otherBrowser {
-		h.logger.Warn("callback from a browser that did not start the sign-in; cancelled it")
+	if other != nil {
+		h.warnCancelled(r, "callback from a browser that did not start the sign-in; cancelled it", other.provider, other.created, other.cookie)
 		http.Error(w, sessionWarning, http.StatusBadRequest)
 		return
 	}
@@ -547,14 +557,14 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request, pathP
 		// The edit can also move the code out of the query (into a
 		// fragment, a JWT or a form post), so every miss warns, whatever the
 		// query holds.
-		h.misses.add(h.logger, r, code != "")
+		h.addMiss(r, code != "")
 		http.Error(w, sessionWarning, http.StatusBadRequest)
 		return
 	}
 
 	if errParam := q.Get("error"); errParam != "" {
 		desc := q.Get("error_description")
-		h.logger.Warn("upstream returned error", "error", errParam, "description", desc)
+		h.logger.Warn("upstream returned error", "error", truncForLog(errParam), "description", truncForLog(desc))
 		oidcErrorRedirect(w, r, sess.TunnelerRedirectURI, sess.TunnelerState, upstreamErrorCode(errParam), sanitizeErrorDescription(desc))
 		return
 	}
@@ -721,16 +731,20 @@ const maxCallbackFormBytes = 64 << 10
 // as handleCallback does for another browser, and the browser is warned.
 func (h *endpoints) handleStrayCallback(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxCallbackFormBytes)
-	sess, otherBrowser, err := h.consumeBoundSession(w, r, r.FormValue("state"))
+	sess, other, err := h.consumeBoundSession(w, r, r.FormValue("state"))
 	if err != nil {
 		h.logger.Error("consume session", "error", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	if sess != nil || otherBrowser {
-		h.logger.Warn("sign-in response at a callback ZDAS never asked for; cancelled it", "method", r.Method, "path", r.URL.Path)
+	const stray = "sign-in response at a callback ZDAS never asked for; cancelled it"
+	switch {
+	case sess != nil:
+		h.warnCancelled(r, stray, sess.UpstreamProviderName, sess.CreatedAt, cookieRight, "method", truncForLog(r.Method), "path", truncForLog(r.URL.Path))
+	case other != nil:
+		h.warnCancelled(r, stray, other.provider, other.created, other.cookie, "method", truncForLog(r.Method), "path", truncForLog(r.URL.Path))
 	}
-	h.misses.add(h.logger, r, r.FormValue("code") != "")
+	h.addMiss(r, r.FormValue("code") != "")
 	http.Error(w, sessionWarning, http.StatusBadRequest)
 }
 
@@ -738,28 +752,66 @@ func (h *endpoints) handleStrayCallback(w http.ResponseWriter, r *http.Request) 
 // callbacks that finish no sign-in.
 const callbackMissLogInterval = time.Minute
 
-// callbackMissLog counts the /callback requests that finish no sign-in, and
-// logs how many at most once per callbackMissLogInterval. One that carries a
-// code can be a phisher's edited IdP address, so operators can see them
-// without a flood filling the log.
-type callbackMissLog struct {
-	count    atomic.Int64
-	withCode atomic.Int64
-	log      rate.Sometimes
+// callbackMisses counts the /callback requests that finish no sign-in, for
+// a line at most once per callbackMissLogInterval. One that carries a code
+// can be a phisher's edited IdP address, so operators can see them without a
+// flood filling the log.
+type callbackMisses struct {
+	count, withCode                  int
+	lastClient, lastMethod, lastPath string // of the last miss
 }
 
-// add counts one miss, whether it carried a code, and logs the counts since
-// the last line when callbackMissLogInterval has passed. It reads nothing
-// from r but its method and path, so the log never reads a request body.
-func (l *callbackMissLog) add(logger *slog.Logger, r *http.Request, hadCode bool) {
-	l.count.Add(1)
-	if hadCode {
-		l.withCode.Add(1)
-	}
-	l.log.Do(func() {
-		logger.Warn("callbacks finished no sign-in; one with a code may be from an edited sign-in link",
-			"count", l.count.Swap(0), "with_code", l.withCode.Swap(0), "last_method", r.Method, "last_path", r.URL.Path)
+// addMiss counts one callback that finished no sign-in, and whether it
+// carried a code. It reads nothing from r but its client, method and path,
+// so the log never reads a request body.
+func (h *endpoints) addMiss(r *http.Request, hadCode bool) {
+	client, method, path := h.logClient(r), truncForLog(r.Method), truncForLog(r.URL.Path)
+	h.misses.record(func(m *callbackMisses) {
+		m.count++
+		if hadCode {
+			m.withCode++
+		}
+		m.lastClient, m.lastMethod, m.lastPath = client, method, path
 	})
+}
+
+func (h *endpoints) logMisses(m callbackMisses) {
+	h.logger.Warn("callbacks finished no sign-in; one with a code may be from an edited sign-in link",
+		"count", m.count, "with_code", m.withCode, "last_client", m.lastClient, "last_method", m.lastMethod, "last_path", m.lastPath)
+}
+
+// stop writes the summaries still pending and cancels their timers.
+func (h *endpoints) stop() {
+	h.rejections.stop()
+	h.misses.stop()
+}
+
+// maxLoggedLen caps the strings a client chooses, such as a method, a path
+// or a User-Agent, in a log line.
+const maxLoggedLen = 256
+
+// truncForLog cuts s to maxLoggedLen bytes, on a rune boundary, marking the
+// cut.
+func truncForLog(s string) string {
+	if len(s) <= maxLoggedLen {
+		return s
+	}
+	// Back up over at most one rune's continuation bytes; s need not be
+	// valid UTF-8.
+	cut := maxLoggedLen
+	for i := 0; i < utf8.UTFMax-1 && !utf8.RuneStart(s[cut]); i++ {
+		cut--
+	}
+	return s[:cut] + "..."
+}
+
+// logClient returns the client a log line names for r: its address, or, when
+// RemoteAddr is not an address, RemoteAddr itself.
+func (h *endpoints) logClient(r *http.Request) string {
+	if a := h.clients.addr(r); a.IsValid() {
+		return a.String()
+	}
+	return truncForLog(r.RemoteAddr)
 }
 
 // maxTokenRequestBytes caps a /token request body. A real one is a few
@@ -1041,33 +1093,66 @@ func (h *endpoints) createPendingProvision(ctx context.Context, id string, pp *P
 	return h.store.CreatePendingProvision(ctx, h.storeKey(kindProvision, id), pp)
 }
 
+// cookieState is the binding cookie a request carried for a sign-in, as the
+// warning that cancels it reports it.
+type cookieState string
+
+const (
+	cookieRight   cookieState = "right"   // the one the sign-in was bound to
+	cookieWrong   cookieState = "wrong"   // one under the sign-in's name, with another nonce
+	cookieMissing cookieState = "missing" // none under the sign-in's name that parsed
+)
+
+// otherBrowser describes a session consumed for a browser without its
+// binding cookie, for the warning that names it. It holds nothing that could
+// finish the sign-in.
+type otherBrowser struct {
+	provider string    // the session's provider; "" before consent
+	created  time.Time // the session's CreatedAt
+	cookie   cookieState
+}
+
+// warnCancelled logs msg for a sign-in with provider (omitted when "") and
+// created time, cancelled at r, with what tells a phish from a blocked
+// cookie or a link scanner: the client, the provider, the sign-in's age, the
+// binding cookie r carried for it, and r's User-Agent.
+func (h *endpoints) warnCancelled(r *http.Request, msg, provider string, created time.Time, cookie cookieState, args ...any) {
+	fields := []any{"client", h.logClient(r)}
+	if provider != "" {
+		fields = append(fields, "provider", provider)
+	}
+	// A Store shared across clocks can hold a CreatedAt slightly ahead.
+	age := max(time.Since(created), 0).Round(time.Second)
+	fields = append(fields, "age", age, "cookie", cookie, "user_agent", truncForLog(r.UserAgent()))
+	h.logger.Warn(msg, append(fields, args...)...)
+}
+
 // consumeSession consumes an auth session and treats one that is no longer
 // fresh as a miss, so a Store without expiry logic of its own never hands
 // back an expired session. A malformed ID is a miss without a store lookup.
-// It returns (nil, false, nil) on a miss. nonce is the one in the browser's
+// It returns (nil, nil, nil) on a miss. nonce is the one in the browser's
 // binding cookie, or "" for none. When it is not the session's, the session
-// is consumed all the same and consumeSession returns (nil, true, nil), so a
-// sign-in whose session ID reaches another browser cannot be finished
-// anywhere.
-func (h *endpoints) consumeSession(ctx context.Context, id, nonce string) (sess *AuthSession, otherBrowser bool, err error) {
+// is consumed all the same and only described in other, so a sign-in whose
+// session ID reaches another browser cannot be finished anywhere.
+func (h *endpoints) consumeSession(ctx context.Context, id, nonce string) (sess *AuthSession, other *otherBrowser, err error) {
 	if !validID(id) {
-		return nil, false, nil
+		return nil, nil, nil
 	}
 	sess, err = h.store.ConsumeSession(ctx, h.storeKey(kindSession, id))
 	if err != nil || sess == nil || !h.fresh(kindSession, sess.CreatedAt, h.cfg.Session.Timeout) {
-		return nil, false, err
+		return nil, nil, err
 	}
 	if sess.BindingHash == "" {
 		// createSession binds every session, so the Store lost the hash,
 		// as one that predates the field would. Without it no browser can
 		// be told apart, so the session is treated as missing.
 		h.logger.Warn("store returned session without BindingHash, treating as expired")
-		return nil, false, nil
+		return nil, nil, nil
 	}
 	if subtle.ConstantTimeCompare([]byte(sess.BindingHash), []byte(bindingHash(nonce))) != 1 {
-		return nil, true, nil
+		return nil, &otherBrowser{provider: sess.UpstreamProviderName, created: sess.CreatedAt}, nil
 	}
-	return sess, false, nil
+	return sess, nil, nil
 }
 
 // consumeCode is consumeSession for authorization codes, checked against the

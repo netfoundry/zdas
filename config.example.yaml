@@ -143,7 +143,8 @@ session:
 # Behind a reverse proxy, list it in trusted_proxies (IP addresses or CIDR
 # prefixes) so requests count against the client address it reports in
 # X-Forwarded-For. Without that, every request counts against the proxy, and
-# the per-client limit becomes a limit for everyone.
+# the per-client limit becomes a limit for everyone. The same list decides
+# the client ZDAS's warnings name, even with the limits off.
 # X-Forwarded-For from any other peer is ignored, since clients can set it.
 rate_limit:
   authorize_per_second: 2
