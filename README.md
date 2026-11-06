@@ -101,7 +101,7 @@ Updated tunnelers send device info as query parameters on the authorize URL:
 - `hostname`, `os`, `arch`, `os_release`, `os_version` - optional, for richer identity names
 - `client_type` - optional free-form hint (`tunneler`, `host`, `service`) passed through to an embedding application's provisioner
 
-Each IdP sends the browser back to ZDAS at `<external_url>/callback/<provider name>`, so register that URL as a redirect URI with each IdP's client. For a discovered signer, that's the signer's client, and the provider name is the signer's name. A response that arrives at another provider's callback is refused. That stops an IdP mix-up, where one IdP gets a code meant for another (RFC 9700 section 4.4). ZDAS also checks the response's `iss` (RFC 9207) when the IdP sends one. Until every registration has been updated, `legacy_callback: true` keeps sending the old shared `<external_url>/callback`. That setting is deprecated and will be removed.
+Each IdP sends the browser back to ZDAS at `<external_url>/callback/<provider name>`, so register that URL as a redirect URI with each IdP's client. For a discovered signer, that's the signer's client, and the provider name is the signer's name. On a GitHub OAuth app, turn off wildcard matching for the callback URL. With it on, GitHub sends a code to any subdomain or sub-path of the URL, and it is on for apps that had a single callback URL before August 3, 2026. A response that arrives at another provider's callback is refused. That stops an IdP mix-up, where one IdP gets a code meant for another (RFC 9700 section 4.4). ZDAS also checks the response's `iss` (RFC 9207) when the IdP sends one. Until every registration has been updated, `legacy_callback: true` keeps sending the old shared `<external_url>/callback`. That setting is deprecated and will be removed.
 
 The IdP sign-in must finish in the browser the tunneler opened. ZDAS ties each enrollment to that browser with a cookie. A sign-in completed anywhere else, such as another browser or a phone following an emailed magic link, is refused at `/callback` and cancelled, so the user has to start again from the tunneler and finish in the browser it opens. The page the other browser shows warns against sending its address to anyone. See `docs/security.md` for what the binding does and doesn't stop.
 
@@ -122,7 +122,9 @@ mux.Handle("/device-auth/", http.StripPrefix("/device-auth", handler))
 handler.Stop()
 ```
 
-Set `external_url` to the public URL including the mount prefix (`https://example.com/device-auth` above). ZDAS scopes the cookie that binds an enrollment to the browser that started it to that path.
+Set `external_url` to the public URL including the mount prefix (`https://example.com/device-auth` above). ZDAS scopes the cookie that binds an enrollment to the browser that started it to that path. Under a mount prefix, that cookie's name can't start with `__Host-`, which keeps a sibling subdomain from setting it; see `docs/security.md`.
+
+Route `/callback` and everything below it, for every method, to the handler, as the mount above does. ZDAS warns the user, and cancels the sign-in, at any response under `/callback` it never asked for. A narrower route, such as only `GET /callback/{provider}`, leaves those to your own mux.
 
 To run several replicas behind a load balancer, give every replica the same signing key and a shared store for in-flight enrollments:
 

@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -38,11 +39,8 @@ type endpoints struct {
 	rejections  *rejectionLog         // counts and logs what the limits refuse
 	misses      callbackMissLog       // counts and logs callbacks that finish no sign-in
 	redirects   []*url.URL            // parsed cfg.AllowedRedirectURIs; nil keeps the loopback default
+	cookie      cookieScope           // of the browser binding cookie, from cfg.ExternalURL
 	logger      *slog.Logger
-
-	// Scope of the browser binding cookie, from cfg.ExternalURL.
-	cookiePath   string
-	cookieSecure bool
 }
 
 // newEndpoints returns endpoints that sign with keys, publish keys plus
@@ -63,7 +61,7 @@ func newEndpoints(cfg Config, keys *KeySet, verifyKeys []*KeySet, registry *Prov
 		provisioner: provisioner,
 		logger:      logger,
 	}
-	h.cookiePath, h.cookieSecure = bindingCookieScope(cfg.ExternalURL)
+	h.cookie = bindingCookieScope(cfg.ExternalURL)
 	h.rateLimiter = newIPRateLimiter(cfg.RateLimit, logger)
 	h.rejections = newRejectionLog(logger)
 	h.misses.log.Interval = callbackMissLogInterval
@@ -74,8 +72,9 @@ func newEndpoints(cfg Config, keys *KeySet, verifyKeys []*KeySet, registry *Prov
 	return h
 }
 
-// mux returns an http.ServeMux wired to all ZDAS endpoints.
-func (h *endpoints) mux() *http.ServeMux {
+// mux returns a handler wired to all ZDAS endpoints. Requests under
+// /callback skip the ServeMux, so they have no r.Pattern; see serveCallback.
+func (h *endpoints) mux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /.well-known/openid-configuration", h.handleDiscovery)
 	mux.HandleFunc("GET /.well-known/jwks.json", h.handleJWKS)
@@ -84,12 +83,91 @@ func (h *endpoints) mux() *http.ServeMux {
 	mux.HandleFunc("GET /external-jwt-signers", h.handleExtJWTSigners)
 	mux.HandleFunc("GET /authorize", h.handleAuthorize)
 	mux.HandleFunc("POST /authorize", h.handleConsent)
-	mux.HandleFunc("GET /callback", h.handleCallback)
-	mux.HandleFunc("GET /callback/{provider}", h.handleCallback)
-	mux.HandleFunc("/callback", h.handleStrayCallback)
-	mux.HandleFunc("/callback/", h.handleStrayCallback)
 	mux.HandleFunc("POST /token", h.handleToken)
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if routesToCallback(r.URL) {
+			h.serveCallback(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// routesToCallback reports whether serveCallback handles a request for u:
+// its path is /callback or below it, decoded or as a ServeMux would clean it.
+// The ServeMux cleans the escaped path, so that is cleaned and then decoded
+// too. Every spelling of a callback, such as /%63allback/github or
+// //callback/github, then gets the warning rather than a ServeMux 404 or
+// redirect.
+func routesToCallback(u *url.URL) bool {
+	for _, p := range []string{u.Path, u.EscapedPath()} {
+		if !strings.HasPrefix(p, "/") {
+			p = "/" + p
+		}
+		cleaned := path.Clean(p)
+		if unescaped, err := url.PathUnescape(cleaned); err == nil {
+			cleaned = unescaped
+		}
+		if isCallbackPath(p) || isCallbackPath(cleaned) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCallbackPath(p string) bool {
+	return p == "/callback" || strings.HasPrefix(p, "/callback/")
+}
+
+// serveCallback handles every request routesToCallback picks, ahead of the
+// ServeMux. When nothing in front of ZDAS has cleaned the path, as with
+// http.StripPrefix as the server's handler, the ServeMux would answer a path
+// it cleans, such as /callback/github//x, with a redirect to the cleaned
+// path, and that redirect leaves out the stripped prefix: the browser would
+// land outside ZDAS, without the warning, and the sign-in would stay live. A
+// GET or HEAD of a callback ZDAS gives IdPs goes to handleCallback, and
+// anything else to handleStrayCallback.
+//
+// An external_url that ends in "/" gives IdPs callbacks that start with
+// //callback, which v0.16.0 reached through the ServeMux's redirect; they
+// are taken as they come. With any other external_url, a path starting with
+// // is stray.
+//
+// /callback isn't rate limited: a refused callback could neither warn nor
+// cancel the sign-in.
+func (h *endpoints) serveCallback(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		escaped := r.URL.EscapedPath()
+		if strings.HasSuffix(h.cfg.ExternalURL, "/") && strings.HasPrefix(escaped, "//") {
+			escaped = escaped[1:]
+		}
+		if provider, ok := parseCallbackPath(escaped); ok {
+			h.handleCallback(w, r, provider)
+			return
+		}
+	}
+	h.handleStrayCallback(w, r)
+}
+
+// parseCallbackPath parses the escaped path of a callback ZDAS gives IdPs:
+// /callback, for which it returns "", or /callback/ followed by one segment,
+// which it returns unescaped. ok is false for any other path, including a
+// segment that is empty, "." or "..", none of which a provider can be named.
+// It splits on the escaped path as the ServeMux does, so an escaped slash
+// stays in the provider's name.
+func parseCallbackPath(escapedPath string) (provider string, ok bool) {
+	if escapedPath == "/callback" {
+		return "", true
+	}
+	seg, found := strings.CutPrefix(escapedPath, "/callback/")
+	if !found || seg == "" || strings.Contains(seg, "/") {
+		return "", false
+	}
+	provider, err := url.PathUnescape(seg)
+	if err != nil || provider == "." || provider == ".." {
+		return "", false
+	}
+	return provider, true
 }
 
 func (h *endpoints) handleDiscovery(w http.ResponseWriter, r *http.Request) {
@@ -441,7 +519,9 @@ const sessionWarning = "This sign-in can't be finished here. " +
 	"If you were signing in yourself, it has expired, was cancelled, or was started in a different browser: start again from the app and finish in the browser it opens. " +
 	"If you had already finished, you can close this page."
 
-func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
+// handleCallback finishes a sign-in at the callback for the provider named
+// pathProvider, or at the shared /callback when pathProvider is "".
+func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request, pathProvider string) {
 	q := r.URL.Query()
 	code := q.Get("code")
 	sessionState := q.Get("state")
@@ -500,8 +580,8 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 		callbackURL = h.cfg.ExternalURL + "/callback"
 	}
 	reached := h.cfg.ExternalURL + "/callback"
-	if p := r.PathValue("provider"); p != "" {
-		reached += "/" + url.PathEscape(p)
+	if pathProvider != "" {
+		reached += "/" + url.PathEscape(pathProvider)
 	}
 	if reached != callbackURL {
 		h.logger.Warn("upstream response at another provider's callback", "provider", provider.Name(), "callback", reached)
@@ -631,10 +711,12 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request) {
 // its state. A form_post response can carry an ID token next to it.
 const maxCallbackFormBytes = 64 << 10
 
-// handleStrayCallback answers what reaches /callback other than a GET of a
-// provider's callback: another method, such as an IdP's form_post response,
-// or a path below a callback, which GitHub accepts as a redirect_uri. ZDAS
-// never asks for either, so it comes from an IdP address someone edited.
+// handleStrayCallback answers what reaches /callback other than a GET or
+// HEAD of a callback ZDAS gives IdPs: another method, such as an IdP's
+// form_post response, a path below a callback, which GitHub accepts as a
+// redirect_uri, or another spelling of one, such as //callback/github. ZDAS
+// never asks for any of these, so they come from an IdP address someone
+// edited.
 // The session its state names is consumed, cancelling a phisher's sign-in
 // as handleCallback does for another browser, and the browser is warned.
 func (h *endpoints) handleStrayCallback(w http.ResponseWriter, r *http.Request) {
