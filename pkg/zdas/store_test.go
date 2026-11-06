@@ -202,7 +202,7 @@ func TestStoreStaleEntriesAreMisses(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := httptest.NewRecorder()
-	h.mux().ServeHTTP(w, seededRequest("/callback/mock-idp?code=x&state="+sid, sid))
+	h.mux().ServeHTTP(w, seededRequest(h, "/callback/mock-idp?code=x&state="+sid, sid))
 	if !redirectsWithCode(t, w) {
 		t.Fatalf("fresh session: status = %d, Location = %q; want a code for the tunneler", w.Code, w.Header().Get("Location"))
 	}
@@ -232,7 +232,7 @@ func TestStoreStaleEntriesAreMisses(t *testing.T) {
 				t.Fatal(err)
 			}
 			w = httptest.NewRecorder()
-			mux.ServeHTTP(w, seededRequest("/callback/mock-idp?code=x&state="+sid, sid))
+			mux.ServeHTTP(w, seededRequest(h, "/callback/mock-idp?code=x&state="+sid, sid))
 			if w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
 				t.Errorf("session: status = %d, body = %s; want 400 and the warning", w.Code, w.Body.String())
 			}

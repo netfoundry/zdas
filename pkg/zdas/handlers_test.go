@@ -39,10 +39,10 @@ func seedSession(t *testing.T, h *endpoints, sess *AuthSession) string {
 }
 
 // seededRequest returns a GET for target from the browser that holds the
-// binding cookie for the session seedSession returned as sessID.
-func seededRequest(target, sessID string) *http.Request {
+// binding cookie for the session seedSession stored in h as sessID.
+func seededRequest(h *endpoints, target, sessID string) *http.Request {
 	req := httptest.NewRequest(http.MethodGet, target, nil)
-	req.AddCookie(&http.Cookie{Name: bindingCookieName(sessID), Value: testBindingNonce})
+	req.AddCookie(&http.Cookie{Name: h.cookie.name(sessID), Value: testBindingNonce})
 	return req
 }
 
@@ -451,7 +451,7 @@ func TestConsentUnknownProvider(t *testing.T) {
 
 // idpSelectorHandlers sets up endpoints with multiple providers and an
 // optional IDPSelectorURL. Returns the mux for sending requests.
-func idpSelectorHandlers(t *testing.T, selectorURL string) *http.ServeMux {
+func idpSelectorHandlers(t *testing.T, selectorURL string) http.Handler {
 	t.Helper()
 	ks, _ := GenerateKeySet()
 	reg := NewProviderRegistry()
@@ -836,7 +836,7 @@ func TestCallbackToTokenFullFlow(t *testing.T) {
 
 	// Simulate /callback from upstream.
 	callbackURL := "/callback?code=upstream-code&state=" + sessID
-	req := seededRequest(callbackURL, sessID)
+	req := seededRequest(h, callbackURL, sessID)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 
@@ -936,7 +936,7 @@ func TestCallbackErrorMapping(t *testing.T) {
 				target += "&" + tc.query
 			}
 			w := httptest.NewRecorder()
-			h.mux().ServeHTTP(w, seededRequest(target, sessID))
+			h.mux().ServeHTTP(w, seededRequest(h, target, sessID))
 			loc, err := url.Parse(w.Header().Get("Location"))
 			if err != nil || w.Code != http.StatusFound {
 				t.Fatalf("status = %d, Location = %q", w.Code, w.Header().Get("Location"))

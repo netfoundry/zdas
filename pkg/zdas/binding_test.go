@@ -134,11 +134,13 @@ func startAuthorize(t *testing.T, mux http.Handler) (*httptest.ResponseRecorder,
 	return w, loc.Query().Get("state")
 }
 
-// liveCookie returns the cookie w sets for session ID sessID.
+// liveCookie returns the binding cookie w sets for session ID sessID, with
+// or without the __Host- prefix, so that TestAuthorizeSetsBindingCookie can
+// check which.
 func liveCookie(t *testing.T, w *httptest.ResponseRecorder, sessID string) *http.Cookie {
 	t.Helper()
 	for _, c := range w.Result().Cookies() {
-		if c.Name == bindingCookieName(sessID) && c.MaxAge > 0 {
+		if strings.HasSuffix(c.Name, bindingCookiePrefix+sessID[:8]) && c.MaxAge > 0 {
 			return c
 		}
 	}
@@ -149,12 +151,14 @@ func liveCookie(t *testing.T, w *httptest.ResponseRecorder, sessID string) *http
 func TestAuthorizeSetsBindingCookie(t *testing.T) {
 	cases := []struct {
 		externalURL string
+		wantPrefix  string
 		wantPath    string
 		wantSecure  bool
 	}{
-		{"https://zdas.example.com", "/", true},
-		{"https://app.example.com/enroll", "/enroll", true},
-		{"http://localhost:8080", "/", false},
+		{"https://zdas.example.com", "__Host-zdas_bind_", "/", true},
+		{"https://zdas.example.com/", "__Host-zdas_bind_", "/", true},
+		{"https://app.example.com/enroll", "zdas_bind_", "/enroll", true},
+		{"http://localhost:8080", "zdas_bind_", "/", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.externalURL, func(t *testing.T) {
@@ -165,7 +169,7 @@ func TestAuthorizeSetsBindingCookie(t *testing.T) {
 					t.Errorf("cookie %s set as well as the session's", other.Name)
 				}
 			}
-			if want := "zdas_bind_" + sessID[:8]; c.Name != want {
+			if want := tc.wantPrefix + sessID[:8]; c.Name != want {
 				t.Errorf("Name = %q, want %q", c.Name, want)
 			}
 			if !validID(c.Value) || c.Value == sessID {
@@ -173,6 +177,9 @@ func TestAuthorizeSetsBindingCookie(t *testing.T) {
 			}
 			if c.Path != tc.wantPath {
 				t.Errorf("Path = %q, want %q", c.Path, tc.wantPath)
+			}
+			if c.Domain != "" {
+				t.Errorf("Domain = %q, want none, so only ZDAS's host gets it", c.Domain)
 			}
 			if c.Secure != tc.wantSecure {
 				t.Errorf("Secure = %v, want %v", c.Secure, tc.wantSecure)
@@ -197,18 +204,18 @@ func TestAuthorizeSetsBindingCookie(t *testing.T) {
 func TestCallbackRequiresBindingCookie(t *testing.T) {
 	cases := []struct {
 		name   string
-		cookie func(sessID string, other *http.Cookie) *http.Cookie
+		cookie func(name string, other *http.Cookie) *http.Cookie
 	}{
 		{"no cookie", func(string, *http.Cookie) *http.Cookie { return nil }},
-		{"wrong value", func(sessID string, _ *http.Cookie) *http.Cookie {
-			return &http.Cookie{Name: bindingCookieName(sessID), Value: strings.Repeat("0", 32)}
+		{"wrong value", func(name string, _ *http.Cookie) *http.Cookie {
+			return &http.Cookie{Name: name, Value: strings.Repeat("0", 32)}
 		}},
-		{"malformed value", func(sessID string, _ *http.Cookie) *http.Cookie {
-			return &http.Cookie{Name: bindingCookieName(sessID), Value: "x"}
+		{"malformed value", func(name string, _ *http.Cookie) *http.Cookie {
+			return &http.Cookie{Name: name, Value: "x"}
 		}},
 		{"another session's cookie", func(_ string, other *http.Cookie) *http.Cookie { return other }},
-		{"another session's nonce under this name", func(sessID string, other *http.Cookie) *http.Cookie {
-			return &http.Cookie{Name: bindingCookieName(sessID), Value: other.Value}
+		{"another session's nonce under this name", func(name string, other *http.Cookie) *http.Cookie {
+			return &http.Cookie{Name: name, Value: other.Value}
 		}},
 	}
 	for _, tc := range cases {
@@ -224,7 +231,7 @@ func TestCallbackRequiresBindingCookie(t *testing.T) {
 
 				target := "/callback/mock-idp?" + query + "&state=" + sessID
 				req := httptest.NewRequest(http.MethodGet, target, nil)
-				if c := tc.cookie(sessID, liveCookie(t, attacker, attackerID)); c != nil {
+				if c := tc.cookie(h.cookie.name(sessID), liveCookie(t, attacker, attackerID)); c != nil {
 					req.AddCookie(c)
 				}
 				w := httptest.NewRecorder()
@@ -288,21 +295,28 @@ func TestCallbackSkippingConsentIsCancelled(t *testing.T) {
 // TestCallbackFromRightBrowser verifies that the browser with the binding
 // cookie completes the sign-in and has the cookie expired.
 func TestCallbackFromRightBrowser(t *testing.T) {
-	mux := bindingHandlers(t, "https://zdas.example.com")
-	started, sessID := startAuthorize(t, mux)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, browserRequest(started, "/callback/mock-idp?code=c&state="+sessID))
-	if w.Code != http.StatusFound || !strings.HasPrefix(w.Header().Get("Location"), "http://localhost:20314/auth/callback?") {
-		t.Fatalf("status = %d, Location = %q; want 302 to the tunneler callback", w.Code, w.Header().Get("Location"))
-	}
-	cleared := false
-	for _, c := range w.Result().Cookies() {
-		if c.Name == bindingCookieName(sessID) && c.MaxAge < 0 {
-			cleared = true
-		}
-	}
-	if !cleared {
-		t.Error("binding cookie not expired after the session was consumed")
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			h := bindingEndpoints(t, "https://zdas.example.com")
+			mux := h.mux()
+			started, sessID := startAuthorize(t, mux)
+			req := browserRequest(started, "/callback/mock-idp?code=c&state="+sessID)
+			req.Method = method
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+			if w.Code != http.StatusFound || !strings.HasPrefix(w.Header().Get("Location"), "http://localhost:20314/auth/callback?") {
+				t.Fatalf("status = %d, Location = %q; want 302 to the tunneler callback", w.Code, w.Header().Get("Location"))
+			}
+			cleared := false
+			for _, c := range w.Result().Cookies() {
+				if c.Name == h.cookie.name(sessID) && c.MaxAge < 0 {
+					cleared = true
+				}
+			}
+			if !cleared {
+				t.Error("binding cookie not expired after the session was consumed")
+			}
+		})
 	}
 }
 
@@ -470,13 +484,14 @@ func TestStrayCallbackCancels(t *testing.T) {
 	}
 
 	t.Run("right browser's cookie expired", func(t *testing.T) {
-		mux := bindingHandlers(t, "https://zdas.example.com")
+		h := bindingEndpoints(t, "https://zdas.example.com")
+		mux := h.mux()
 		started, sessID := startAuthorize(t, mux)
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, browserRequest(started, "/callback/mock-idp/x?code=c&state="+sessID))
 		expired := false
 		for _, c := range w.Result().Cookies() {
-			if c.Name == bindingCookieName(sessID) && c.MaxAge < 0 {
+			if c.Name == h.cookie.name(sessID) && c.MaxAge < 0 {
 				expired = true
 			}
 		}
@@ -499,6 +514,219 @@ func TestStrayCallbackCancels(t *testing.T) {
 			t.Errorf("a state past the body cap was read: session %v, %v", got, err)
 		}
 	})
+}
+
+// TestCallbackPathsUnderStripPrefix verifies that a path a ServeMux would
+// clean to one under /callback gets the warning and cancels the sign-in it
+// names, under a mount prefix too, even from the browser that started it. A
+// ServeMux answers such a path with a redirect to the cleaned one, which
+// under http.StripPrefix leaves out the prefix and sends the browser out of
+// ZDAS with the sign-in still live.
+func TestCallbackPathsUnderStripPrefix(t *testing.T) {
+	const base = "https://zdas.example.com/enroll"
+	for _, path := range []string{
+		"/callback/mock-idp//x",
+		"/callback//mock-idp",
+		"/callback/mock-idp/",
+		"/callback/mock-idp/./x",
+		"/callback/mock-idp/../mock-idp",
+		"/callback/../authorize",
+		"/callback/.",
+		"/callback/%2e%2e",
+		"/callback%2Fmock-idp",
+		"/%63allback/mock-idp",
+		"//callback/mock-idp",
+		"/./callback/mock-idp",
+		"/x/../callback/mock-idp",
+		"/p%2Fq/../callback/mock-idp",
+		"/p%2Fq/../%63allback/mock-idp",
+	} {
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost} {
+			t.Run(method+path, func(t *testing.T) {
+				h := bindingEndpoints(t, base)
+				started, sessID := startAuthorize(t, h.mux())
+				req := browserRequest(started, "/enroll"+path+"?code=c&state="+sessID)
+				req.Method = method
+				w := httptest.NewRecorder()
+				http.StripPrefix("/enroll", h.mux()).ServeHTTP(w, req)
+				if w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" || w.Header().Get("Location") != "" {
+					t.Errorf("%d %s, Location %q; want 400 and the warning, no redirect", w.Code, w.Body, w.Header().Get("Location"))
+				}
+				if got, err := h.store.ConsumeSession(t.Context(), h.storeKey(kindSession, sessID)); got != nil || err != nil {
+					t.Errorf("session still stored: %v, %v", got, err)
+				}
+				expired := false
+				for _, c := range w.Result().Cookies() {
+					if c.Name == h.cookie.name(sessID) && c.MaxAge < 0 {
+						expired = true
+					}
+				}
+				if !expired {
+					t.Error("binding cookie not expired")
+				}
+			})
+		}
+	}
+
+	// The rest of ZDAS is still the ServeMux's.
+	mux := http.StripPrefix("/enroll", bindingHandlers(t, base))
+	for _, tc := range []struct {
+		method, path string
+		want         int
+	}{
+		{http.MethodGet, "/enroll/callbacks", http.StatusNotFound},
+		{http.MethodGet, "/enroll/x/callback", http.StatusNotFound},
+		{http.MethodGet, "/enroll/token", http.StatusMethodNotAllowed},
+		{http.MethodGet, "/enroll/.well-known/jwks.json", http.StatusOK},
+	} {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(tc.method, tc.path, nil))
+		if w.Code != tc.want {
+			t.Errorf("%s %s: %d, want %d", tc.method, tc.path, w.Code, tc.want)
+		}
+	}
+}
+
+func TestParseCallbackPath(t *testing.T) {
+	cases := []struct {
+		path, provider string
+		ok             bool
+	}{
+		{"/callback", "", true},
+		{"/callback/github", "github", true},
+		{"/callback/Keycloak%20Prod", "Keycloak Prod", true},
+		{"/callback/a%2Fb", "a/b", true},
+		{"/callback/", "", false},
+		{"/callback//github", "", false},
+		{"/callback/github/", "", false},
+		{"/callback/github/x", "", false},
+		{"/callback/.", "", false},
+		{"/callback/..", "", false},
+		{"/callback/%2e", "", false},
+		{"/callback/%2E%2E", "", false},
+		{"/callback/%2e%2e", "", false},
+		{"/callback/%zz", "", false},
+		{"/callbacks", "", false},
+		{"/authorize", "", false},
+	}
+	for _, tc := range cases {
+		if provider, ok := parseCallbackPath(tc.path); provider != tc.provider || ok != tc.ok {
+			t.Errorf("parseCallbackPath(%q) = %q, %v; want %q, %v", tc.path, provider, ok, tc.provider, tc.ok)
+		}
+	}
+}
+
+func TestRoutesToCallback(t *testing.T) {
+	cases := []struct {
+		target string
+		want   bool
+	}{
+		{"/callback", true},
+		{"/callback/", true},
+		{"/callback/github", true},
+		{"/callback/github/x", true},
+		{"/callback/../authorize", true},
+		{"//callback/github", true},
+		{"/./callback", true},
+		{"/x/../callback/github", true},
+		{"/%63allback/github", true},
+		{"/callback%2Fgithub", true},
+		{"/p%2Fq/../callback/github", true},
+		{"/p%2Fq/../%63allback/github", true},
+		{"/x/%2e%2e/callback/github", true},
+		{"/callbacks", false},
+		{"/callbacks/github", false},
+		{"/x/callback", false},
+		{"/authorize", false},
+		{"/", false},
+	}
+	for _, tc := range cases {
+		// As a server parses a request target, so // starts a path.
+		u, err := url.ParseRequestURI(tc.target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := routesToCallback(u); got != tc.want {
+			t.Errorf("routesToCallback(%q) = %v, want %v", tc.target, got, tc.want)
+		}
+	}
+	// What http.StripPrefix leaves of /enrollcallback/github.
+	if !routesToCallback(&url.URL{Path: "callback/github"}) {
+		t.Error("routesToCallback(callback/github) = false, want true")
+	}
+}
+
+// TestCallbackNotRateLimited verifies that the per-client limit leaves
+// /callback alone. A refused callback would neither warn nor cancel, so a
+// page that spent the victim's limit would keep a phished sign-in live.
+func TestCallbackNotRateLimited(t *testing.T) {
+	h := bindingEndpoints(t, "https://zdas.example.com")
+	// GET and POST /authorize spend the burst, as a real sign-in does.
+	h.rateLimiter = newIPRateLimiter(RateLimitConfig{AuthorizePerSecond: 0.001, AuthorizeBurst: 2}, h.logger)
+	mux := h.mux()
+	started, sessID := startAuthorize(t, mux)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, authorizeURL(t, nil), nil))
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("authorize over the limit: %d, want 429", w.Code)
+	}
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, browserRequest(started, "/callback/mock-idp?code=c&state="+sessID))
+	if !redirectsWithCode(t, w) {
+		t.Errorf("callback over the limit: %d %s, want a code for the tunneler", w.Code, w.Header().Get("Location"))
+	}
+}
+
+// TestTrailingSlashExternalURL verifies that a sign-in finishes when
+// external_url ends in "/", following the callback ZDAS gave the IdP, which
+// then has //callback in its path. A ServeMux used to redirect that to
+// /callback; the warning must not take its place.
+func TestTrailingSlashExternalURL(t *testing.T) {
+	for _, tc := range []struct{ externalURL, mount string }{
+		{"https://zdas.example.com/", ""},
+		{"https://zdas.example.com/enroll/", "/enroll"},
+	} {
+		t.Run(tc.externalURL, func(t *testing.T) {
+			h := bindingEndpoints(t, tc.externalURL)
+			var mux http.Handler = h.mux()
+			if tc.mount != "" {
+				mux = http.StripPrefix(tc.mount, mux)
+			}
+			consented, state := startAuthorize(t, h.mux())
+			loc, err := url.Parse(consented.Header().Get("Location"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cb, err := url.Parse(loc.Query().Get("redirect_uri"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, browserRequest(consented, cb.EscapedPath()+"?code=c&state="+state))
+			if !redirectsWithCode(t, w) {
+				t.Errorf("callback at %s: %d %s %s, want a code for the tunneler", cb.EscapedPath(), w.Code, w.Header().Get("Location"), w.Body)
+			}
+		})
+	}
+}
+
+// TestUnprefixedCookieIsRefused verifies that a deployment whose binding
+// cookie has the __Host- prefix doesn't read the same nonce under the plain
+// name, which a sibling host could set.
+func TestUnprefixedCookieIsRefused(t *testing.T) {
+	h := bindingEndpoints(t, "https://zdas.example.com")
+	mux := h.mux()
+	started, sessID := startAuthorize(t, mux)
+	req := httptest.NewRequest(http.MethodGet, "/callback/mock-idp?code=c&state="+sessID, nil)
+	req.AddCookie(&http.Cookie{Name: bindingCookiePrefix + sessID[:8], Value: liveCookie(t, started, sessID).Value})
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || w.Body.String() != sessionWarning+"\n" {
+		t.Errorf("%d %s, want 400 and the warning", w.Code, w.Body)
+	}
+	if got, err := h.store.ConsumeSession(t.Context(), h.storeKey(kindSession, sessID)); got != nil || err != nil {
+		t.Errorf("session still stored: %v, %v", got, err)
+	}
 }
 
 // TestProviderNamesInCallbackPath verifies that a provider name with
@@ -524,6 +752,32 @@ func TestProviderNamesInCallbackPath(t *testing.T) {
 				t.Errorf("callback at %s: %d %s %s, want a code for the tunneler", cb.EscapedPath(), w.Code, w.Header().Get("Location"), w.Body)
 			}
 		})
+	}
+}
+
+// TestBareCallbackIgnoresEmbedderPathValue verifies that a sign-in
+// finishing at the shared /callback neither reads nor writes the request's
+// path values. An embedder's own route can set one, as a wildcard named
+// provider in the path it mounts ZDAS under would, which the mix-up check
+// would read as another provider's callback, and which the embedder may read
+// after ZDAS returns.
+func TestBareCallbackIgnoresEmbedderPathValue(t *testing.T) {
+	h := bindingEndpoints(t, "https://zdas.example.com")
+	sessID := seedSession(t, h, &AuthSession{
+		TunnelerRedirectURI:  "http://localhost:20314/auth/callback",
+		TunnelerState:        "tstate",
+		DeviceInfo:           &DeviceInfo{DeviceName: "laptop"},
+		UpstreamProviderName: "mock-idp",
+	})
+	req := seededRequest(h, "/callback?code=c&state="+sessID, sessID)
+	req.SetPathValue("provider", "tenant-a")
+	w := httptest.NewRecorder()
+	h.mux().ServeHTTP(w, req)
+	if !redirectsWithCode(t, w) {
+		t.Errorf("%d %s, want a code for the tunneler", w.Code, w.Header().Get("Location"))
+	}
+	if got := req.PathValue("provider"); got != "tenant-a" {
+		t.Errorf("embedder's path value = %q after the callback, want it unchanged", got)
 	}
 }
 
@@ -581,22 +835,25 @@ func TestCallbackMissesAreLogged(t *testing.T) {
 }
 
 func TestBindingCookieScope(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef"
 	cases := []struct {
 		externalURL string
-		wantPath    string
-		wantSecure  bool
+		want        cookieScope
+		wantName    string
 	}{
-		{"https://zdas.example.com", "/", true},
-		{"https://zdas.example.com/", "/", true},
-		{"https://app.example.com/enroll", "/enroll", true},
-		{"http://localhost:8080/a/b", "/a/b", false},
-		{"", "/", false},
-		{"://bad", "/", false},
+		{"https://zdas.example.com", cookieScope{"/", true}, "__Host-zdas_bind_01234567"},
+		{"https://zdas.example.com/", cookieScope{"/", true}, "__Host-zdas_bind_01234567"},
+		{"https://app.example.com/enroll", cookieScope{"/enroll", true}, "zdas_bind_01234567"},
+		{"https://app.example.com/enroll/", cookieScope{"/enroll/", true}, "zdas_bind_01234567"},
+		{"http://localhost:8080", cookieScope{"/", false}, "zdas_bind_01234567"},
+		{"http://localhost:8080/a/b", cookieScope{"/a/b", false}, "zdas_bind_01234567"},
+		{"", cookieScope{"/", false}, "zdas_bind_01234567"},
+		{"://bad", cookieScope{"/", false}, "zdas_bind_01234567"},
 	}
 	for _, tc := range cases {
-		path, secure := bindingCookieScope(tc.externalURL)
-		if path != tc.wantPath || secure != tc.wantSecure {
-			t.Errorf("bindingCookieScope(%q) = %q, %v; want %q, %v", tc.externalURL, path, secure, tc.wantPath, tc.wantSecure)
+		got := bindingCookieScope(tc.externalURL)
+		if got != tc.want || got.name(id) != tc.wantName {
+			t.Errorf("bindingCookieScope(%q) = %+v named %q; want %+v named %q", tc.externalURL, got, got.name(id), tc.want, tc.wantName)
 		}
 	}
 }

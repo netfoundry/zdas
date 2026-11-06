@@ -12,19 +12,38 @@ import (
 // the session ID so concurrent enrollments in one browser don't collide.
 const bindingCookiePrefix = "zdas_bind_"
 
-func bindingCookieName(sessionID string) string {
-	return bindingCookiePrefix + sessionID[:8]
+// hostCookiePrefix is the name prefix browsers accept only on a cookie that
+// is Secure, has Path=/ and names no Domain. A cookie set by a sibling host,
+// which could otherwise stand in for the binding cookie, can't carry it.
+const hostCookiePrefix = "__Host-"
+
+// cookieScope is where the binding cookie is sent: the path and the Secure
+// flag it is set with.
+type cookieScope struct {
+	path   string
+	secure bool
 }
 
-// bindingCookieScope returns the cookie path and Secure flag for the
-// deployment at externalURL. The path is the URL's path, so the cookie
-// reaches /authorize and /callback under whatever prefix zdas is mounted at.
-func bindingCookieScope(externalURL string) (path string, secure bool) {
+// bindingCookieScope returns the cookie scope for the deployment at
+// externalURL. The path is the URL's path, so the cookie reaches /authorize
+// and /callback under whatever prefix zdas is mounted at.
+func bindingCookieScope(externalURL string) cookieScope {
 	u, err := url.Parse(externalURL)
 	if err != nil || u.Path == "" {
-		return "/", err == nil && u.Scheme == "https"
+		return cookieScope{path: "/", secure: err == nil && u.Scheme == "https"}
 	}
-	return u.Path, u.Scheme == "https"
+	return cookieScope{path: u.Path, secure: u.Scheme == "https"}
+}
+
+// name returns the binding cookie's name for sessionID. It has the
+// __Host- prefix wherever a browser allows it, which is a Secure cookie for
+// the whole host. Under a mount prefix it can't have it, and the cookie is
+// as safe as the host's siblings are trusted.
+func (s cookieScope) name(sessionID string) string {
+	if s.secure && s.path == "/" {
+		return hostCookiePrefix + bindingCookiePrefix + sessionID[:8]
+	}
+	return bindingCookiePrefix + sessionID[:8]
 }
 
 // bindingHash returns what a session keeps of the nonce in its browser's
@@ -68,7 +87,7 @@ func (h *endpoints) consumeBoundSession(w http.ResponseWriter, r *http.Request, 
 		return nil, false, nil
 	}
 	var nonce string
-	if c, err := r.Cookie(bindingCookieName(state)); err == nil {
+	if c, err := r.Cookie(h.cookie.name(state)); err == nil {
 		h.setBindingCookie(w, state, "", -1)
 		if validID(c.Value) {
 			nonce = c.Value
@@ -79,11 +98,11 @@ func (h *endpoints) consumeBoundSession(w http.ResponseWriter, r *http.Request, 
 
 func (h *endpoints) setBindingCookie(w http.ResponseWriter, id, nonce string, maxAge int) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     bindingCookieName(id),
+		Name:     h.cookie.name(id),
 		Value:    nonce,
-		Path:     h.cookiePath,
+		Path:     h.cookie.path,
 		MaxAge:   maxAge,
-		Secure:   h.cookieSecure,
+		Secure:   h.cookie.secure,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
