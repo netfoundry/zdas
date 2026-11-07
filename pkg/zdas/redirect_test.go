@@ -1,10 +1,12 @@
 package zdas
 
 import (
+	"bytes"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -108,6 +110,31 @@ func TestRedirectAllowedLegacyPrefixEntry(t *testing.T) {
 	}
 }
 
+func TestParseRedirectURI(t *testing.T) {
+	cases := []struct {
+		raw     string
+		wantErr string // "" when raw is accepted
+	}{
+		{"https://app.example.com/cb", ""},
+		{"HTTPS://app.example.com/cb", ""},
+		{"https://user@app.example.com/cb", "userinfo is not allowed"},
+		{"https://user@/cb", "host is required"},
+		{"app.example.com/cb", "missing http:// or https://"},
+		{"ftp://app.example.com/cb", `scheme must be http or https, not "ftp"`},
+	}
+	for _, tc := range cases {
+		u, err := parseRedirectURI(tc.raw)
+		switch {
+		case tc.wantErr == "" && err != nil:
+			t.Errorf("parseRedirectURI(%q) = %v, want nil", tc.raw, err)
+		case tc.wantErr == "" && u.Scheme != "https":
+			t.Errorf("parseRedirectURI(%q).Scheme = %q, want https", tc.raw, u.Scheme)
+		case tc.wantErr != "" && (err == nil || err.Error() != tc.wantErr):
+			t.Errorf("parseRedirectURI(%q) = %v, want %q", tc.raw, err, tc.wantErr)
+		}
+	}
+}
+
 func TestValidateAllowedRedirectURIs(t *testing.T) {
 	cases := []struct {
 		entry   string
@@ -122,6 +149,8 @@ func TestValidateAllowedRedirectURIs(t *testing.T) {
 		{"app.example.com", true},
 		{"ftp://app.example.com", true},
 		{"https://user@app.example.com", true},
+		{"https://user@app.example.com/cb", true},
+		{"http://user@localhost", true},
 		{"https://", true},
 		{"", true},
 	}
@@ -178,6 +207,17 @@ func TestAuthorizeRejectsRemoteRedirect(t *testing.T) {
 func TestRedirectAllowListAllInvalid(t *testing.T) {
 	if allowed("http://localhost:20314/auth/callback", []string{"not a url", "ftp://x"}) {
 		t.Error("loopback callback accepted under an allow list with no valid entries")
+	}
+}
+
+func TestParseAllowListLogHidesPassword(t *testing.T) {
+	var logs bytes.Buffer
+	parseAllowList([]string{"https://app.example.com/cb", "https://user:s3cret@app.example.com/cb"}, slog.New(slog.NewTextHandler(&logs, nil)))
+	if !strings.Contains(logs.String(), "index=1") {
+		t.Errorf("log doesn't name the entry by index: %s", logs.String())
+	}
+	if strings.Contains(logs.String(), "s3cret") {
+		t.Errorf("log quotes the password: %s", logs.String())
 	}
 }
 

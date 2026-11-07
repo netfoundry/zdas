@@ -63,9 +63,9 @@ type Config struct {
 	// still works, but the user then confirms again on ZDAS's own page.
 	//
 	// The redirect target must be on a host the embedding application
-	// controls; ZDAS does not validate or sanitize the URL beyond requiring
-	// it to be set at startup. Operators must not allow user input to
-	// influence this field.
+	// controls; Validate checks only that it is an absolute path or an
+	// http(s) URL with a host, and doesn't sanitize it. Operators must not
+	// allow user input to influence this field.
 	IDPSelectorURL string `yaml:"idp_selector_url"`
 
 	// LegacyCallback sends every IdP ZDAS's old shared callback,
@@ -358,8 +358,13 @@ func (c *Config) Validate() error {
 	if err := c.checkRequired(); err != nil {
 		return err
 	}
+	// Lower-case only: external_url is the issuer of ZDAS's own tokens, which
+	// is compared byte for byte, and is pasted into callback URLs.
 	if !strings.HasPrefix(c.ExternalURL, "http://") && !strings.HasPrefix(c.ExternalURL, "https://") {
 		return errors.New("external_url must be an http(s) URL")
+	}
+	if _, err := parseHTTPURL(c.ExternalURL); err != nil {
+		return fmt.Errorf("external_url: %w", err)
 	}
 	switch c.TLS.Mode {
 	case TLSModeNone:
@@ -379,6 +384,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Controller.APIURL == "" {
 		return errors.New("controller.api_url is required")
+	}
+	if _, err := parseHTTPURL(c.Controller.APIURL); err != nil {
+		return fmt.Errorf("controller.api_url: %w", err)
 	}
 	names := make(map[string]struct{}, len(c.Providers))
 	for i, p := range c.Providers {
@@ -401,11 +409,12 @@ func (c *Config) Validate() error {
 			return errors.New("fallback.temp_name_template must contain {username}")
 		}
 	}
-	if c.IDPSelectorURL != "" {
-		if !strings.HasPrefix(c.IDPSelectorURL, "http://") &&
-			!strings.HasPrefix(c.IDPSelectorURL, "https://") &&
-			!strings.HasPrefix(c.IDPSelectorURL, "/") {
+	if c.IDPSelectorURL != "" && !strings.HasPrefix(c.IDPSelectorURL, "/") {
+		if !strings.HasPrefix(c.IDPSelectorURL, "http://") && !strings.HasPrefix(c.IDPSelectorURL, "https://") {
 			return errors.New("idp_selector_url must be an http(s) URL or an absolute path")
+		}
+		if _, err := parseHTTPURL(c.IDPSelectorURL); err != nil {
+			return fmt.Errorf("idp_selector_url: %w", err)
 		}
 	}
 	for i, raw := range c.AllowedRedirectURIs {
@@ -414,7 +423,7 @@ func (c *Config) Validate() error {
 			err = errors.New("an entry for a host other than loopback needs the callback's full path, which it must match exactly")
 		}
 		if err != nil {
-			return fmt.Errorf("allowed_redirect_uris[%d] %q: %w", i, raw, err)
+			return fmt.Errorf("allowed_redirect_uris[%d]: %w", i, err)
 		}
 	}
 	for i, aud := range c.Token.ProvisionerAudiences {
@@ -475,6 +484,9 @@ func (p ProviderConfig) check() error {
 	case ProviderTypeOIDC:
 		if p.ClientID == "" || p.OIDCIssuerURL == "" {
 			return errors.New("client_id and oidc_issuer_url are required for oidc")
+		}
+		if _, err := parseHTTPURL(p.OIDCIssuerURL); err != nil {
+			return fmt.Errorf("oidc_issuer_url: %w", err)
 		}
 		if p.RequireUserInfo && !p.FetchUserInfo {
 			return errors.New("require_userinfo needs fetch_userinfo")
