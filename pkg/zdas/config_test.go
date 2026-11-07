@@ -329,6 +329,9 @@ func TestValidateIDPSelectorURL(t *testing.T) {
 		{"bare word rejected", "not-a-url", true},
 		{"ftp rejected", "ftp://nope", true},
 		{"relative path rejected", "enroll/pick", true},
+		{"no host rejected", "https:///pick-idp", true},
+		{"malformed rejected", "https://app.example.com/%zz", true},
+		{"upper-case scheme rejected", "HTTPS://app.example.com/pick-idp", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -346,6 +349,134 @@ func TestValidateIDPSelectorURL(t *testing.T) {
 				t.Errorf("unexpected error for %q: %v", tc.url, err)
 			}
 		})
+	}
+}
+
+// TestValidateURLs checks that Validate refuses only a URL no request can
+// use, and leaves the URLs it accepts as they are, trailing slashes
+// included. An upper-case scheme is refused in external_url, which must
+// match byte for byte, and passes in the others.
+func TestValidateURLs(t *testing.T) {
+	cases := []struct {
+		name    string
+		field   func(*Config) *string
+		url     string
+		wantErr string // "" when the URL is accepted
+	}{
+		{"external_url with trailing slash", externalURLField, "https://das.example.com/", ""},
+		{"external_url under a prefix", externalURLField, "https://example.com/zdas", ""},
+		{"external_url with a port", externalURLField, "http://127.0.0.1:18443", ""},
+		{"external_url with no host", externalURLField, "https:///zdas", "external_url: host is required"},
+		{"external_url with only a port", externalURLField, "https://:18443", "external_url: host is required"},
+		{"external_url that doesn't parse", externalURLField, "https://das example.com", "external_url: invalid character"},
+		{"external_url with a bad escape", externalURLField, "https://das.example.com/100%/zdas", "external_url: invalid URL escape"},
+		{"external_url with an upper-case scheme", externalURLField, "HTTPS://das.example.com", "external_url must be an http(s) URL"},
+
+		{"api_url root", apiURLField, "https://controller.example.com:1280", ""},
+		{"api_url with trailing slash", apiURLField, "https://controller.example.com:1280/", ""},
+		{"api_url as an Edge API URL", apiURLField, "https://controller.example.com:1280/edge/client/v1", ""},
+		{"api_url with an IPv6 host", apiURLField, "https://[::1]:1280", ""},
+		{"api_url with an upper-case scheme", apiURLField, "HTTPS://controller.example.com", ""},
+		{"api_url with userinfo", apiURLField, "https://user:pw@controller.example.com", ""},
+		{"api_url with no scheme", apiURLField, "controller.example.com:1280", "controller.api_url: missing http:// or https://"},
+		{"api_url host:port only", apiURLField, "localhost:1280", "controller.api_url: missing http:// or https://"},
+		{"api_url IP:port only", apiURLField, "10.0.0.1:1280", "controller.api_url: missing http:// or https://"},
+		{"api_url with no host", apiURLField, "https://", "controller.api_url: host is required"},
+		{"api_url with only a port", apiURLField, "http://:1280", "controller.api_url: host is required"},
+		{"api_url with a bad port", apiURLField, "http://a:b:c", "controller.api_url: invalid port"},
+		{"api_url not http", apiURLField, "tls://controller.example.com:1280", `controller.api_url: scheme must be http or https, not "tls"`},
+
+		{"issuer with trailing slash", issuerURLField, "https://tenant.auth0.com/", ""},
+		{"issuer without trailing slash", issuerURLField, "https://example.okta.com", ""},
+		{"issuer with a path", issuerURLField, "https://kc.example.com/realms/zdas", ""},
+		// Discovery then fails, since the IdP's issuer doesn't match it.
+		{"issuer with an upper-case scheme", issuerURLField, "HTTPS://kc.example.com", ""},
+		{"issuer with no scheme", issuerURLField, "kc.example.com", "providers[0] (kc): oidc_issuer_url: missing http:// or https://"},
+		{"issuer with no host", issuerURLField, "https:///realms/zdas", "providers[0] (kc): oidc_issuer_url: host is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{
+				ExternalURL: "https://das.example.com",
+				Controller:  ControllerConfig{APIURL: "https://c"},
+				Providers: []ProviderConfig{
+					{Type: "oidc", Name: "kc", ClientID: "c", OIDCIssuerURL: "https://kc.example.com", AllowAnyUser: true},
+				},
+			}
+			*tc.field(cfg) = tc.url
+			cfg.ApplyDefaults()
+			err := cfg.Validate()
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("Validate(%q) = %v, want nil", tc.url, err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("Validate(%q) = %v, want an error containing %q", tc.url, err, tc.wantErr)
+			}
+			if got := *tc.field(cfg); got != tc.url {
+				t.Errorf("the configured URL %q was changed to %q", tc.url, got)
+			}
+		})
+	}
+}
+
+func externalURLField(c *Config) *string { return &c.ExternalURL }
+func apiURLField(c *Config) *string      { return &c.Controller.APIURL }
+func issuerURLField(c *Config) *string   { return &c.Providers[0].OIDCIssuerURL }
+
+func TestValidateIssuerURLByProvider(t *testing.T) {
+	cfg := &Config{
+		ExternalURL: "https://das.example.com",
+		Controller:  ControllerConfig{APIURL: "https://c"},
+		Providers: []ProviderConfig{
+			// A github provider has no issuer, so a stray one is ignored.
+			{Type: "github", Name: "gh", ClientID: "c", ClientSecret: "s", OIDCIssuerURL: "junk", AllowAnyUser: true},
+			{Type: "oidc", Name: "kc", ClientID: "c", OIDCIssuerURL: "kc.example.com", AllowAnyUser: true},
+		},
+	}
+	cfg.ApplyDefaults()
+	want := "providers[1] (kc): oidc_issuer_url: missing http:// or https://"
+	if err := cfg.Validate(); err == nil || err.Error() != want {
+		t.Errorf("Validate = %v, want %q", err, want)
+	}
+}
+
+// TestValidateURLErrorHidesPassword checks that a URL Validate refuses
+// isn't quoted in the error, since it may hold a password.
+func TestValidateURLErrorHidesPassword(t *testing.T) {
+	cases := map[string]func(*Config){
+		"api_url that doesn't parse": func(c *Config) {
+			c.Controller.APIURL = "https://user:s3cret@controller.example.com:bad"
+		},
+		"allowed_redirect_uris entry with userinfo": func(c *Config) {
+			c.AllowedRedirectURIs = []string{"https://user:s3cret@app.example.com/cb"}
+		},
+	}
+	for name, set := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg := &Config{
+				ExternalURL: "https://das.example.com",
+				Controller:  ControllerConfig{APIURL: "https://c"},
+			}
+			set(cfg)
+			cfg.ApplyDefaults()
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate = nil, want an error")
+			}
+			if strings.Contains(err.Error(), "s3cret") {
+				t.Errorf("Validate = %v, which quotes the password", err)
+			}
+		})
+	}
+}
+
+func TestLoadConfigAPIURLEnvValidated(t *testing.T) {
+	path := writeTempConfig(t, minimalYAML)
+	t.Setenv("ZDAS_CONTROLLER_API_URL", "localhost:1280")
+
+	_, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "controller.api_url: missing http:// or https://") {
+		t.Errorf("LoadConfig = %v, want the api_url error", err)
 	}
 }
 

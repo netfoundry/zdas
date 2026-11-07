@@ -2,28 +2,52 @@ package zdas
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/url"
 	"strings"
 )
 
+// parseHTTPURL parses raw as an absolute http(s) URL with a host. It
+// doesn't ask for a canonical form: IdPs differ on whether an issuer ends in
+// a slash, and an issuer must match byte for byte, so Validate checks
+// configured URLs with it and leaves them as they are. parseRedirectURI
+// builds on it.
+//
+// Its errors don't quote raw, which may hold a password; the caller names
+// the setting.
+func parseHTTPURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	switch {
+	case !strings.Contains(raw, "://"):
+		// Without it, "host:1280" parses with "host" as the scheme, and
+		// "10.0.0.1:1280" doesn't parse.
+		return nil, errors.New("missing http:// or https://")
+	case err != nil:
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err // *url.Error quotes raw
+		}
+		return nil, err
+	case u.Scheme != "http" && u.Scheme != "https":
+		return nil, fmt.Errorf("scheme must be http or https, not %q", u.Scheme)
+	case u.Hostname() == "":
+		return nil, errors.New("host is required")
+	}
+	return u, nil
+}
+
 // parseRedirectURI parses raw as an absolute http(s) URL with a host and no
 // userinfo. It applies to request redirect_uri values and to
 // AllowedRedirectURIs entries alike.
 func parseRedirectURI(raw string) (*url.URL, error) {
-	u, err := url.Parse(raw)
+	u, err := parseHTTPURL(raw)
 	if err != nil {
 		return nil, err
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, errors.New("scheme must be http or https")
-	}
 	if u.User != nil {
 		return nil, errors.New("userinfo is not allowed")
-	}
-	if u.Hostname() == "" {
-		return nil, errors.New("host is required")
 	}
 	return u, nil
 }
@@ -38,10 +62,11 @@ func parseAllowList(raw []string, logger *slog.Logger) []*url.URL {
 		return nil
 	}
 	entries := make([]*url.URL, 0, len(raw))
-	for _, r := range raw {
+	for i, r := range raw {
 		u, err := parseRedirectURI(r)
 		if err != nil {
-			logger.Error("ignoring invalid allowed_redirect_uris entry", "entry", r, "error", err)
+			// By index, since the entry may hold a password.
+			logger.Error("ignoring invalid allowed_redirect_uris entry", "index", i, "error", err)
 			continue
 		}
 		entries = append(entries, u)
