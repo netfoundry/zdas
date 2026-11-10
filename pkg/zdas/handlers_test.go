@@ -324,7 +324,7 @@ func TestHandleAuthorizeIDPSelector(t *testing.T) {
 		t.Error("device name not escaped")
 	}
 	for k, want := range map[string]string{
-		"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+		"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'",
 		"X-Frame-Options":         "DENY",
 		"Cache-Control":           "no-store",
 		"X-Content-Type-Options":  "nosniff",
@@ -582,6 +582,88 @@ func TestIDPSelectorURLSingleProviderSkipsPicker(t *testing.T) {
 	w := authorizeAndConsent(t, h.mux(), authorizeURL(t, nil), "")
 	if loc := w.Header().Get("Location"); w.Code != http.StatusSeeOther || !strings.HasPrefix(loc, "https://stub/only-one") {
 		t.Errorf("consent: %d %s, want 303 to the upstream", w.Code, loc)
+	}
+}
+
+// TestIDPSelectorAlways verifies that IDPSelectorAlways sends every
+// sign-in that names no provider to the embedder's picker, which posts
+// consent back as with several, and that one naming a provider, from a
+// picker that links back, gets ZDAS's own page.
+func TestIDPSelectorAlways(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		providers     []string
+		idp           string
+		wantProviders string // "" for ZDAS's own page
+	}{
+		{"one provider", []string{"only-one"}, "", "only-one"},
+		{"several providers", []string{"github", "keycloak"}, "", "github,keycloak"},
+		{"one provider named", []string{"only-one"}, "only-one", ""},
+		{"one of several named", []string{"github", "keycloak"}, "keycloak", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ks, _ := GenerateKeySet()
+			reg := NewProviderRegistry()
+			for _, name := range tc.providers {
+				_ = reg.Register(&stubProvider{name: name, issuer: "https://" + name})
+			}
+			store := newMemStore(10*time.Minute, 60*time.Second, storeSweepInterval)
+			t.Cleanup(store.stop)
+			cfg := Config{
+				ExternalURL:       "https://zdas.example.com",
+				IDPSelectorURL:    "https://app.example.com/pick-idp",
+				IDPSelectorAlways: true,
+				Claims:            defaultClaimsConfig(),
+				Token:             TokenConfig{Issuer: "https://zdas.example.com", Audience: "ziti-enroll", Expiry: 5 * time.Minute},
+			}
+			mux := newTestEndpoints(t, cfg, ks, reg, store, nil).mux()
+			var over url.Values
+			if tc.idp != "" {
+				over = url.Values{"idp": {tc.idp}}
+			}
+			target := authorizeURL(t, over)
+
+			if tc.wantProviders == "" {
+				w := authorizeAndConsent(t, mux, target, "")
+				if loc := w.Header().Get("Location"); w.Code != http.StatusSeeOther || !strings.HasPrefix(loc, "https://stub/"+tc.idp) {
+					t.Errorf("consent: %d %s, want 303 to %s", w.Code, loc, tc.idp)
+				}
+				return
+			}
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
+			if w.Code != http.StatusFound {
+				t.Fatalf("status = %d, want 302 to the picker", w.Code)
+			}
+			loc, err := url.Parse(w.Header().Get("Location"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if loc.Host != "app.example.com" || loc.Query().Get("providers") != tc.wantProviders || loc.Query().Get("consent") == "" {
+				t.Fatalf("redirect = %s, want the picker with providers=%s and consent", loc, tc.wantProviders)
+			}
+			chosen := tc.providers[0]
+			form := url.Values{"consent": {loc.Query().Get("consent")}, "idp": {chosen}}
+			post := httptest.NewRequest(http.MethodPost, "/authorize", strings.NewReader(form.Encode()))
+			post.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			for _, c := range w.Result().Cookies() {
+				post.AddCookie(c)
+			}
+			w = httptest.NewRecorder()
+			mux.ServeHTTP(w, post)
+			if got := w.Header().Get("Location"); w.Code != http.StatusSeeOther || !strings.HasPrefix(got, "https://stub/"+chosen) {
+				t.Errorf("picker consent: %d %s, want 303 to %s", w.Code, got, chosen)
+			}
+		})
+	}
+
+	// A Config built in code may set it without IDPSelectorURL, skipping
+	// Validate; ZDAS then shows its own page.
+	var logs logBuffer
+	h := brandedEndpoints(t, nil, &logs, "only-one")
+	h.cfg.IDPSelectorAlways = true
+	if body := consentPage(t, h); !strings.Contains(body, consentWarning) {
+		t.Errorf("without IDPSelectorURL: %s, want ZDAS's consent page", body)
 	}
 }
 

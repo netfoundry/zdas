@@ -48,10 +48,11 @@ type Config struct {
 
 	// IDPSelectorURL, when set, replaces ZDAS's built-in IdP picker. When
 	// ZDAS would otherwise show its own picker (multiple providers
-	// registered, no idp query param on /authorize), it 302-redirects to
-	// this URL with the original /authorize query string plus two
-	// parameters: `providers`, a comma-separated list of IdP names, and
-	// `consent`, an opaque value.
+	// registered, no idp query param on /authorize), or with
+	// IDPSelectorAlways whenever there is no idp, it 302-redirects to this
+	// URL with the original /authorize query string plus two parameters:
+	// `providers`, a comma-separated list of IdP names, and `consent`, an
+	// opaque value.
 	//
 	// The picker is where the user consents to the sign-in, so it must
 	// show what is being signed in to, must not be frameable, and must
@@ -67,6 +68,15 @@ type Config struct {
 	// http(s) URL with a host, and doesn't sanitize it. Operators must not
 	// allow user input to influence this field.
 	IDPSelectorURL string `yaml:"idp_selector_url"`
+
+	// IDPSelectorAlways sends every sign-in that names no provider (no idp
+	// query param on /authorize) to IDPSelectorURL, also when only one
+	// provider is offered, so the embedding application shows every page
+	// before the IdP. It needs IDPSelectorURL. The picker must still post
+	// consent only on the user's click, also for one provider: that click
+	// is what stops a link alone from signing someone in. A picker that
+	// links back with idp still gets ZDAS's own page.
+	IDPSelectorAlways bool `yaml:"idp_selector_always"`
 
 	// LegacyCallback sends every IdP ZDAS's old shared callback,
 	// <ExternalURL>/callback, instead of one per provider,
@@ -412,6 +422,9 @@ func (c *Config) Validate() error {
 			return errors.New("fallback.temp_name_template must contain {username}")
 		}
 	}
+	if c.IDPSelectorAlways && c.IDPSelectorURL == "" {
+		return errors.New("idp_selector_always requires idp_selector_url")
+	}
 	if c.IDPSelectorURL != "" && !strings.HasPrefix(c.IDPSelectorURL, "/") {
 		if !strings.HasPrefix(c.IDPSelectorURL, "http://") && !strings.HasPrefix(c.IDPSelectorURL, "https://") {
 			return errors.New("idp_selector_url must be an http(s) URL or an absolute path")
@@ -547,6 +560,9 @@ func (c *Config) applyEnv() error {
 	setString(&c.Listen, "ZDAS_LISTEN")
 	setString(&c.ExternalURL, "ZDAS_EXTERNAL_URL")
 	setString(&c.IDPSelectorURL, "ZDAS_IDP_SELECTOR_URL")
+	if err := setBool(&c.IDPSelectorAlways, "ZDAS_IDP_SELECTOR_ALWAYS"); err != nil {
+		return err
+	}
 
 	setString(&c.TLS.Mode, "ZDAS_TLS_MODE")
 	setString(&c.TLS.CertFile, "ZDAS_TLS_CERT_FILE")

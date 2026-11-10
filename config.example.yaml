@@ -11,6 +11,10 @@ external_url: "https://das.example.com"   # how tunnelers and the controller rea
 # user clicks. See Config.IDPSelectorURL for the requirements.
 # When unset, ZDAS renders a built-in picker.
 # idp_selector_url: "https://app.example.com/enroll/pick-idp"
+# Send every sign-in without an idp to idp_selector_url, also with one
+# provider, so the host app shows every page before the IdP. Requires
+# idp_selector_url.
+# idp_selector_always: true
 
 # Each IdP sends the browser back to <external_url>/callback/<provider name>;
 # register that redirect URI with each IdP's client. Deprecated: set this to

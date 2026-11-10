@@ -165,6 +165,7 @@ func TestNewServerRejectsNilOptions(t *testing.T) {
 		"nil store":       WithStore(nil),
 		"nil client":      WithUpstreamHTTPClient(nil),
 		"nil provisioner": WithProvisioner(nil),
+		"nil branding":    WithPageBranding(nil),
 	} {
 		if srv, err := NewServer(cfg, slog.Default(), opt); err == nil {
 			srv.Shutdown(context.Background())

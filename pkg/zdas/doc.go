@@ -21,6 +21,8 @@
 // ZDAS's own endpoint. [WithUpstreamHTTPClient] sends every request to
 // upstream identity providers through the embedder's client, for an
 // embedder whose issuers are chosen by someone it does not fully trust.
+// [WithPageBranding] gives ZDAS's consent and error pages the embedder's
+// name, logo and colors.
 //
 // The provider layer alone: [NewOIDCProvider], [NewGitHubProvider],
 // [UpstreamProvider], [UpstreamIdentity], and [ProviderRegistry] can be
