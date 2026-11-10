@@ -21,6 +21,8 @@ type Server struct {
 	handlers   *endpoints
 	logger     *slog.Logger
 
+	challengeAddr string // where the ACME challenge listener binds; :443 outside tests
+
 	// runCtx scopes background work (discovery and reconciler polling) and
 	// the initial discovery poll; Shutdown cancels it.
 	runCtx    context.Context
@@ -178,6 +180,8 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 		logger:     logger,
 		runCtx:     runCtx,
 		cancelRun:  cancelRun,
+
+		challengeAddr: ":443",
 	}, nil
 }
 

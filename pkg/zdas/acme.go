@@ -9,8 +9,8 @@ import (
 )
 
 // listenACME serves srv over HTTPS with automatic Let's Encrypt certificates.
-// If the main listen address is not on port 443, it starts a secondary
-// listener on :443 for the TLS-ALPN-01 challenge.
+// If the main listen address is not on port 443, it also serves a listener
+// on :443 for the TLS-ALPN-01 challenge.
 func (s *Server) listenACME(srv *http.Server) error {
 	m := &autocert.Manager{
 		Cache:      autocert.DirCache(s.cfg.TLS.ACME.CacheDir),
@@ -20,34 +20,55 @@ func (s *Server) listenACME(srv *http.Server) error {
 
 	srv.TLSConfig = m.TLSConfig()
 
-	if chalSrv := challengeServer(s.cfg.Listen, m); chalSrv != nil {
-		s.mu.Lock()
-		if s.stopping {
-			s.mu.Unlock()
-			return http.ErrServerClosed
+	if chalSrv := challengeServer(s.cfg.Listen, s.challengeAddr, m); chalSrv != nil {
+		if err := s.serveChallenge(chalSrv); err != nil {
+			return err
 		}
-		s.chalSrv = chalSrv
-		s.mu.Unlock()
-		go func() {
-			if err := chalSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				s.logger.Error("acme challenge listener failed", "error", err)
-			}
-		}()
 	}
 
 	return srv.ListenAndServeTLS("", "")
 }
 
-// challengeServer returns a server for :443 that answers m's TLS-ALPN-01
-// challenge, or nil when listen is on port 443 and the main listener
-// answers it itself.
-func challengeServer(listen string, m *autocert.Manager) *http.Server {
+// serveChallenge binds chalSrv's address and serves it in the background.
+// If the address can't be bound, as when ZDAS lacks permission for :443 or
+// another process holds it, it logs a warning and carries on: the main
+// listener answers the challenge too, so certificates are still issued when
+// port 443 is forwarded to the listen address. It returns
+// http.ErrServerClosed if Shutdown has been called.
+func (s *Server) serveChallenge(chalSrv *http.Server) error {
+	ln, err := net.Listen("tcp", chalSrv.Addr)
+	if err != nil {
+		s.logger.Warn("acme challenge listener not started; certificates can be issued only if port 443 is forwarded to the listen address",
+			"addr", chalSrv.Addr, "listen", s.cfg.Listen, "error", err)
+		return nil
+	}
+	s.mu.Lock()
+	if s.stopping {
+		s.mu.Unlock()
+		ln.Close()
+		return http.ErrServerClosed
+	}
+	s.chalSrv = chalSrv
+	s.mu.Unlock()
+	go func() {
+		defer ln.Close() // ServeTLS doesn't close it if it fails before serving
+		if err := chalSrv.ServeTLS(ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.logger.Error("acme challenge listener failed", "error", err)
+		}
+	}()
+	return nil
+}
+
+// challengeServer returns a server for addr, which is :443 outside tests,
+// that answers m's TLS-ALPN-01 challenge, or nil when listen is on port 443
+// and the main listener answers it itself.
+func challengeServer(listen, addr string, m *autocert.Manager) *http.Server {
 	if onHTTPSPort(listen) {
 		return nil
 	}
 	// The challenge is answered in the TLS handshake, so ordinary requests
 	// to this listener have nothing to reach.
-	srv := newHTTPServer(":443", http.NotFoundHandler())
+	srv := newHTTPServer(addr, http.NotFoundHandler())
 	srv.TLSConfig = m.TLSConfig()
 	return srv
 }
