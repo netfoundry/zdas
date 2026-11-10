@@ -480,9 +480,58 @@ func TestLoadConfigAPIURLEnvValidated(t *testing.T) {
 	}
 }
 
+func TestValidateIDPSelectorAlways(t *testing.T) {
+	for _, tc := range []struct {
+		url     string
+		wantErr bool
+	}{
+		{"", true},
+		{"/enroll/pick-idp", false},
+	} {
+		cfg := &Config{
+			ExternalURL:       "https://das.example.com",
+			Controller:        ControllerConfig{APIURL: "https://c"},
+			IDPSelectorURL:    tc.url,
+			IDPSelectorAlways: true,
+		}
+		cfg.ApplyDefaults()
+		err := cfg.Validate()
+		if (err != nil) != tc.wantErr || (err != nil && !strings.Contains(err.Error(), "idp_selector_always")) {
+			t.Errorf("idp_selector_always with idp_selector_url %q: Validate = %v, want an idp_selector_always error %v", tc.url, err, tc.wantErr)
+		}
+	}
+}
+
+// TestIDPSelectorAlwaysLoad verifies idp_selector_always from YAML and from
+// the environment, through LoadConfig.
+func TestIDPSelectorAlwaysLoad(t *testing.T) {
+	if _, err := LoadConfig(writeTempConfig(t, minimalYAML+"idp_selector_always: true\n")); err == nil || !strings.Contains(err.Error(), "idp_selector_always") {
+		t.Errorf("idp_selector_always without idp_selector_url: LoadConfig = %v, want an error", err)
+	}
+
+	path := writeTempConfig(t, minimalYAML+"idp_selector_url: /pick\nidp_selector_always: true\n")
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.IDPSelectorAlways {
+		t.Error("idp_selector_always: true not loaded")
+	}
+
+	t.Setenv("ZDAS_IDP_SELECTOR_ALWAYS", "false")
+	if cfg, err = LoadConfig(path); err != nil || cfg.IDPSelectorAlways {
+		t.Errorf("env false over YAML true: %v, %v; want false", cfg.IDPSelectorAlways, err)
+	}
+	t.Setenv("ZDAS_IDP_SELECTOR_ALWAYS", "maybe")
+	if _, err := LoadConfig(path); err == nil {
+		t.Error("ZDAS_IDP_SELECTOR_ALWAYS=maybe accepted")
+	}
+}
+
 func TestIDPSelectorURLEnvOverride(t *testing.T) {
 	path := writeTempConfig(t, minimalYAML)
 	t.Setenv("ZDAS_IDP_SELECTOR_URL", "https://app.example.com/pick-idp")
+	t.Setenv("ZDAS_IDP_SELECTOR_ALWAYS", "true")
 
 	cfg, err := LoadConfig(path)
 	if err != nil {
@@ -490,6 +539,9 @@ func TestIDPSelectorURLEnvOverride(t *testing.T) {
 	}
 	if cfg.IDPSelectorURL != "https://app.example.com/pick-idp" {
 		t.Errorf("IDPSelectorURL env override = %q", cfg.IDPSelectorURL)
+	}
+	if !cfg.IDPSelectorAlways {
+		t.Error("IDPSelectorAlways env override not applied")
 	}
 }
 

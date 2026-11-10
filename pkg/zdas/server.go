@@ -168,6 +168,7 @@ func NewServer(cfg Config, logger *slog.Logger, opts ...Option) (srv *Server, re
 	}
 
 	handlers := newEndpoints(cfg, keys, sopts.verifyKeys, registry, store, disc, reconciler, sopts.provisioner, logger)
+	handlers.branding = sopts.branding
 
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	return &Server{

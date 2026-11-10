@@ -1,7 +1,6 @@
 package zdas
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -9,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -39,6 +37,9 @@ type endpoints struct {
 	redirects   []*url.URL            // parsed cfg.AllowedRedirectURIs; nil keeps the loopback default
 	cookie      cookieScope           // of the browser binding cookie, from cfg.ExternalURL
 	logger      *slog.Logger
+
+	branding       func(*http.Request) PageBranding // nil keeps ZDAS's own look
+	brandingWarned onceSet                          // invalid branding already logged
 
 	// Summaries for the log: what the rate limits refuse, and callbacks that
 	// finish no sign-in.
@@ -267,28 +268,28 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	// Validate redirect_uri early - before we trust it for error redirects.
 	// state is echoed in those redirects, so it is checked here too.
 	if redirectURI == "" {
-		http.Error(w, "redirect_uri is required", http.StatusBadRequest)
+		h.pageError(w, r, "redirect_uri is required", http.StatusBadRequest)
 		return
 	}
 	if len(redirectURI) > maxRedirectURILength {
-		http.Error(w, "redirect_uri is too long", http.StatusBadRequest)
+		h.pageError(w, r, "redirect_uri is too long", http.StatusBadRequest)
 		return
 	}
 	if len(state) > maxStateLength {
-		http.Error(w, "state is too long", http.StatusBadRequest)
+		h.pageError(w, r, "state is too long", http.StatusBadRequest)
 		return
 	}
 	if len(nonce) > maxNonceLength {
-		http.Error(w, "nonce is too long", http.StatusBadRequest)
+		h.pageError(w, r, "nonce is too long", http.StatusBadRequest)
 		return
 	}
 	parsedRedirect, err := parseRedirectURI(redirectURI)
 	if err != nil {
-		http.Error(w, "redirect_uri must be a valid http(s) URL", http.StatusBadRequest)
+		h.pageError(w, r, "redirect_uri must be a valid http(s) URL", http.StatusBadRequest)
 		return
 	}
 	if !redirectAllowed(parsedRedirect, h.redirects) {
-		http.Error(w, "redirect_uri is not allowed", http.StatusBadRequest)
+		h.pageError(w, r, "redirect_uri is not allowed", http.StatusBadRequest)
 		return
 	}
 
@@ -407,11 +408,13 @@ func (h *endpoints) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		oidcErrorRedirect(w, r, redirectURI, state, "server_error", "internal error")
 		return
 	}
-	if len(choices) > 1 && h.cfg.IDPSelectorURL != "" {
+	// A request that names a provider comes from a picker that links back,
+	// so it gets ZDAS's own page rather than the picker again.
+	if h.cfg.IDPSelectorURL != "" && idpHint == "" && (len(choices) > 1 || h.cfg.IDPSelectorAlways) {
 		h.redirectToIDPSelector(w, r, choices, consentID)
 		return
 	}
-	h.renderConsent(w, deviceInfo, parsedRedirect, choices, consentID)
+	h.renderConsent(w, r, deviceInfo, parsedRedirect, choices, consentID)
 }
 
 // callbackURL returns the redirect_uri ZDAS sends provider: its own
@@ -443,7 +446,7 @@ func (h *endpoints) handleConsent(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxConsentRequestBytes)
 	if err := r.ParseForm(); err != nil {
-		http.Error(w, "malformed form body", http.StatusBadRequest)
+		h.pageError(w, r, "malformed form body", http.StatusBadRequest)
 		return
 	}
 	// Resolve the provider before consuming the session, so that a post
@@ -452,16 +455,16 @@ func (h *endpoints) handleConsent(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case errors.Is(err, ErrNoProviders):
 		h.logger.Error("no upstream providers configured")
-		http.Error(w, "no sign-in providers are available; try again later", http.StatusServiceUnavailable)
+		h.pageError(w, r, "no sign-in providers are available; try again later", http.StatusServiceUnavailable)
 		return
 	case err != nil:
-		http.Error(w, "unknown or missing sign-in provider; go back and choose one", http.StatusBadRequest)
+		h.pageError(w, r, "unknown or missing sign-in provider; go back and choose one", http.StatusBadRequest)
 		return
 	}
 	sess, other, err := h.consumeBoundSession(w, r, r.PostFormValue("consent"))
 	if err != nil {
 		h.logger.Error("consume session", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.pageError(w, r, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if other != nil {
@@ -472,13 +475,13 @@ func (h *endpoints) handleConsent(w http.ResponseWriter, r *http.Request) {
 			p = provider.Name()
 		}
 		h.warnCancelled(r, "consent posted from a browser that did not start the sign-in; cancelled it", p, other.created, other.cookie)
-		http.Error(w, sessionWarning, http.StatusBadRequest)
+		h.pageError(w, r, sessionWarning, http.StatusBadRequest)
 		return
 	}
 	// A session that already has a provider is waiting for /callback, not
 	// for consent.
 	if sess == nil || sess.UpstreamProviderName != "" {
-		http.Error(w, consentMissing, http.StatusBadRequest)
+		h.pageError(w, r, consentMissing, http.StatusBadRequest)
 		return
 	}
 	sess.UpstreamProviderName = provider.Name()
@@ -541,12 +544,12 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request, pathP
 	sess, other, err := h.consumeBoundSession(w, r, sessionState)
 	if err != nil {
 		h.logger.Error("consume session", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.pageError(w, r, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if other != nil {
 		h.warnCancelled(r, "callback from a browser that did not start the sign-in; cancelled it", other.provider, other.created, other.cookie)
-		http.Error(w, sessionWarning, http.StatusBadRequest)
+		h.pageError(w, r, sessionWarning, http.StatusBadRequest)
 		return
 	}
 	// A session without a provider is still waiting for consent.
@@ -558,7 +561,7 @@ func (h *endpoints) handleCallback(w http.ResponseWriter, r *http.Request, pathP
 		// fragment, a JWT or a form post), so every miss warns, whatever the
 		// query holds.
 		h.addMiss(r, code != "")
-		http.Error(w, sessionWarning, http.StatusBadRequest)
+		h.pageError(w, r, sessionWarning, http.StatusBadRequest)
 		return
 	}
 
@@ -734,7 +737,7 @@ func (h *endpoints) handleStrayCallback(w http.ResponseWriter, r *http.Request) 
 	sess, other, err := h.consumeBoundSession(w, r, r.FormValue("state"))
 	if err != nil {
 		h.logger.Error("consume session", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.pageError(w, r, "internal error", http.StatusInternalServerError)
 		return
 	}
 	const stray = "sign-in response at a callback ZDAS never asked for; cancelled it"
@@ -745,7 +748,7 @@ func (h *endpoints) handleStrayCallback(w http.ResponseWriter, r *http.Request) 
 		h.warnCancelled(r, stray, other.provider, other.created, other.cookie, "method", truncForLog(r.Method), "path", truncForLog(r.URL.Path))
 	}
 	h.addMiss(r, r.FormValue("code") != "")
-	http.Error(w, sessionWarning, http.StatusBadRequest)
+	h.pageError(w, r, sessionWarning, http.StatusBadRequest)
 }
 
 // callbackMissLogInterval is the least time between log lines about
@@ -967,11 +970,11 @@ func (h *endpoints) completeProvision(w http.ResponseWriter, r *http.Request, pe
 	pp, cerr := h.consumePendingProvision(r.Context(), pendingID)
 	if cerr != nil {
 		h.logger.Error("consume pending provision", "error", cerr)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.pageError(w, r, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if pp == nil {
-		http.Error(w, "pending provision not found or expired", http.StatusBadRequest)
+		h.pageError(w, r, "pending provision not found or expired", http.StatusBadRequest)
 		return
 	}
 	if err == nil && len(claims) == 0 {
@@ -1232,48 +1235,6 @@ func (h *endpoints) redirectToIDPSelector(w http.ResponseWriter, r *http.Request
 	http.Redirect(w, r, withQuery(h.cfg.IDPSelectorURL, q), http.StatusFound)
 }
 
-// consentPageData is what the consent page shows. Everything about the
-// device comes from the request, so the page presents it as the device's
-// own description, not as something ZDAS vouches for.
-type consentPageData struct {
-	Device    string   // the device's name, or its hostname on the fallback path
-	Details   string   // OS and architecture, as reported
-	ReturnTo  string   // the host and port the browser returns to
-	Providers []string // one button each
-	Consent   string   // the session ID the form posts back
-}
-
-// renderConsent shows the page the user continues from: one button per
-// provider in providers, posting back to /authorize. The page cannot be
-// framed, so another site cannot trick the user into clicking it.
-func (h *endpoints) renderConsent(w http.ResponseWriter, info *DeviceInfo, redirect *url.URL, providers []string, consentID string) {
-	device := displayText(info.DeviceName, maxDisplayedDeviceRunes)
-	if device == "" {
-		device = displayText(info.Hostname, maxDisplayedDeviceRunes)
-	}
-	data := consentPageData{
-		Device:    device,
-		Details:   displayText(strings.TrimSpace(info.OS+" "+info.Arch), maxDisplayedDeviceRunes),
-		ReturnTo:  redirect.Host,
-		Providers: providers,
-		Consent:   consentID,
-	}
-	var buf bytes.Buffer
-	if err := consentPage.Execute(&buf, data); err != nil {
-		h.logger.Error("render consent page", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	hdr := w.Header()
-	hdr.Set("Content-Type", "text/html; charset=utf-8")
-	hdr.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
-	hdr.Set("X-Frame-Options", "DENY")
-	hdr.Set("X-Content-Type-Options", "nosniff")
-	hdr.Set("Referrer-Policy", "no-referrer")
-	hdr.Set("Cache-Control", "no-store")
-	w.Write(buf.Bytes())
-}
-
 // maxDisplayedDeviceRunes caps how much of the device's own description the
 // consent page shows. Whoever sent the link chose that text, so it is kept
 // to a label rather than room for a message.
@@ -1329,37 +1290,3 @@ func printsBlank(r rune) bool {
 	}
 	return false
 }
-
-// consentPage is the page renderConsent shows. The form has no action, so
-// it posts to the page's own URL, wherever ZDAS is mounted. The device's
-// description is shown as code, apart from ZDAS's own text, and the warning
-// comes before the buttons.
-var consentPage = template.Must(template.New("consent").Parse(`<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in to OpenZiti</title>
-<style>
-  body { font-family: -apple-system, system-ui, sans-serif; max-width: 420px; margin: 80px auto; padding: 0 20px; color: #333; }
-  h1 { font-size: 1.4em; font-weight: 600; margin-bottom: 16px; }
-  p { line-height: 1.4; }
-  .note { font-size: 0.9em; color: #666; }
-  code { background: #f5f5f5; padding: 1px 4px; border-radius: 4px; }
-  button { display: block; width: 100%; padding: 14px 20px; margin: 8px 0; background: #f5f5f5; border: 1px solid #ddd; border-radius: 8px; color: #333; font-size: 1em; text-align: left; cursor: pointer; }
-  button:hover { background: #e8e8e8; border-color: #ccc; }
-</style>
-</head>
-<body>
-<h1>Sign in to OpenZiti</h1>
-<p>An app asked to sign you in to an OpenZiti network.</p>
-{{with .Device}}<p class="note">The app describes the device as <code>{{.}}</code>{{with $.Details}} (<code>{{.}}</code>){{end}}. Whoever started this sign-in supplied that description, and this site can't check it.</p>
-{{end}}<p><strong>Continue only if you started this yourself, just now, on your own device.</strong> If someone sent you this link, or later asks for the address your browser shows, stop: they are trying to enroll a device as you.</p>
-<form method="post">
-<input type="hidden" name="consent" value="{{.Consent}}">
-{{range .Providers}}<button type="submit" name="idp" value="{{.}}">Continue with {{.}}</button>
-{{end}}</form>
-<p class="note">After you sign in, your browser returns to the app at {{.ReturnTo}}. Don't copy that address or send it to anyone: it carries your sign-in.</p>
-</body>
-</html>
-`))

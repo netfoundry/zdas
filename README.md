@@ -28,7 +28,7 @@ Tunneler          ZDAS              Upstream IdP       OpenZiti Controller
 
 ZDAS discovers upstream IdPs automatically by polling the controller's public `external-jwt-signers` endpoint - no parallel IdP configuration needed. Non-OIDC providers like GitHub (which issues opaque tokens, not JWTs) can be configured directly.
 
-Before sending the browser to an IdP, ZDAS shows a page where the user continues: a button for each available identity provider, or one when there is only one. This click is the user's consent. Without it, a link someone else built could sign in a user whose IdP session is still live, with no prompt at all. The page shows the device as the device describes itself. It also warns, before its buttons, against continuing from a link someone sent, and against sending anyone the address the browser returns to. An embedding application can show its own picker instead (`idp_selector_url`); see `Config.IDPSelectorURL` for what that page must do.
+Before sending the browser to an IdP, ZDAS shows a page where the user continues: a button for each available identity provider, or one when there is only one. This click is the user's consent. Without it, a link someone else built could sign in a user whose IdP session is still live, with no prompt at all. The page shows the device as the device describes itself. It also warns, before its buttons, against continuing from a link someone sent, and against sending anyone the address the browser returns to. An embedding application can show its own picker instead (`idp_selector_url`), with several providers, or for every sign-in that names none with `idp_selector_always`; see `Config.IDPSelectorURL` for what that page must do.
 
 See [docs/security.md](docs/security.md) for the security model: what ZDAS enforces, what a deployment must do, and the reasoning behind its design decisions.
 
@@ -138,6 +138,8 @@ handler, err := zdas.NewHandler(cfg, logger,
 
 `WithKeySet` documents how to rotate keys across replicas, and `zdastest.TestStore` is a conformance suite for your `Store` implementation.
 
+To make ZDAS's own pages match your application, pass `zdas.WithPageBranding(f)`. ZDAS calls `f` with each request it answers with a page, so you can brand each tenant its own way. The `PageBranding` it returns sets the title and heading, the intro line, a label for each provider's button, a logo with an optional dark-mode version, and the button colors. The pages are the consent page and the errors a browser sees from `/authorize`, `/callback` and `CompleteProvision`; an error comes as a page only to a request that accepts `text/html`, and as plain text otherwise. A rate-limit refusal is always plain text. The consent page's warning, and its place before the buttons, stay as they are. `f` runs for anyone's requests, many at once: keep it quick, choose the tenant from `r.Host` rather than the query, and don't log `r`; see `WithPageBranding`.
+
 A provisioner (`zdas.WithProvisioner`) can send the browser to a page of yours, such as a network picker, by returning `ProvisionResult.RedirectURL`. ZDAS passes the enrollment's pending ID to your provisioner as `ProvisionRequest.PendingID`; record it with your own state for the user you authenticated. Your handler for the page finishes the flow with `handler.CompleteProvision(w, r, pendingID, claims, err)`, passing the pending ID you recorded. Take both the pending ID and the claims from your own server-side state, never from the request: the user enrolling can change the URL. ZDAS also adds the ID to the redirect as `pending_id`, for compatibility.
 
 An embedder that serves several OpenZiti networks registers ZDAS's signer on each with its own audience, lists them in `Token.ProvisionerAudiences`, and sets the `aud` claim of each enrollment, in `ProvisionResult.Claims` or `CompleteProvision`, to the network it chose. Otherwise a token minted for one network is accepted by the others until it expires. An `aud` that isn't configured fails the enrollment.
@@ -174,6 +176,7 @@ pkg/zdas/
   discovery.go     controller-driven IdP discovery
   claims.go        claim composition and JWT minting
   handlers.go      HTTP endpoints (/authorize, /callback, /token, OIDC discovery, JWKS)
+  pages.go         consent and error pages, and their branding
   redirect.go      redirect_uri validation (loopback by default)
   binding.go       cookie binding /callback to the browser that started /authorize
   store.go         Store interface for in-flight enrollment state

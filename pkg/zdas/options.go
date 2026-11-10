@@ -11,11 +11,12 @@ type Option func(*serverOptions)
 
 type serverOptions struct {
 	provisioner EnrollmentProvisioner
-	keys        *KeySet      // nil generates a key at startup
-	verifyKeys  []*KeySet    // published in the JWKS alongside keys
-	store       Store        // nil uses the in-memory memStore
-	upstream    *http.Client // nil uses each provider's default clients
-	err         error        // misuse of an option, reported by NewServer
+	keys        *KeySet                          // nil generates a key at startup
+	verifyKeys  []*KeySet                        // published in the JWKS alongside keys
+	store       Store                            // nil uses the in-memory memStore
+	upstream    *http.Client                     // nil uses each provider's default clients
+	branding    func(*http.Request) PageBranding // nil keeps ZDAS's own look
+	err         error                            // misuse of an option, reported by NewServer
 }
 
 // WithProvisioner sets an EnrollmentProvisioner hook. When set, ZDAS calls
@@ -105,5 +106,33 @@ func WithStore(s Store) Option {
 			return
 		}
 		o.store = s
+	}
+}
+
+// WithPageBranding makes the pages ZDAS shows a browser use the branding f
+// returns for the request it answers: f(r) is called for each page, so an
+// embedder serving several tenants can brand each its own way. See
+// PageBranding for what can change. NewServer fails if f is nil.
+//
+// ZDAS calls f for requests from anyone, signed in or not, and from many
+// requests at once, so f must be quick and safe for concurrent use, and must
+// not change a PageBranding, or its ProviderLabels, after returning it. f
+// must not read r's body or change r. r can carry secrets, such as the IdP's
+// code on /callback and the cookie that binds a sign-in to its browser, so
+// f must not log or keep it. A panic in f is recovered, and the page keeps
+// ZDAS's own look.
+//
+// Choose the tenant from something whoever sends a sign-in link can't pick,
+// such as r.Host, never from the query or path: otherwise a phisher can
+// show a trusted tenant's name and logo on their own sign-in. Every
+// provider's IdP returns to <ExternalURL>/callback/<provider name>, so on
+// the error pages of /callback, r.Host is all f has to go on.
+func WithPageBranding(f func(r *http.Request) PageBranding) Option {
+	return func(o *serverOptions) {
+		if f == nil {
+			o.err = errors.Join(o.err, errors.New("WithPageBranding: nil function"))
+			return
+		}
+		o.branding = f
 	}
 }
