@@ -88,7 +88,7 @@ Key settings:
 | `rate_limit` | Limits on `/authorize`, per client, and optionally for everyone together. Behind a reverse proxy, also set `rate_limit.trusted_proxies`, or the per-client limit applies to everyone at once, and every client is logged as the proxy. | 2/s (burst 10) per client; no global limit |
 | `claims.name_template` | Template for identity names. Placeholders: `{username}`, `{device_name}`, `{hostname}`, `{os}`, `{arch}` | `{username}-{device_name}` |
 | `token.expiry` | How long enrollment tokens are valid | `5m` |
-| `tls.mode` | `none`, `static`, or `acme` | `none` |
+| `tls.mode` | `none`, `static`, or `acme`. With `acme`, Let's Encrypt checks each domain on port 443, which must reach ZDAS, directly or forwarded to the `listen` address. | `none` |
 | `allowed_redirect_uris` | URLs `/authorize` may redirect back to. Entries for hosts other than loopback need the full callback path and match exactly. | loopback only |
 
 Environment variable overrides follow the pattern `ZDAS_SECTION_FIELD`, e.g. `ZDAS_CONTROLLER_API_URL`, `ZDAS_FALLBACK_ENABLED`, `ZDAS_PROVIDER_GITHUB_CLIENT_SECRET`.

@@ -143,7 +143,10 @@ type TLSConfig struct {
 	ACME     ACMEConfig `yaml:"acme"`
 }
 
-// ACMEConfig configures autocert / Let's Encrypt.
+// ACMEConfig configures autocert / Let's Encrypt. Let's Encrypt checks each
+// domain on port 443, which must reach ZDAS, directly or forwarded to the
+// listen address. With Listen on another port, ZDAS also listens on :443 for
+// the check, and logs a warning if it can't.
 type ACMEConfig struct {
 	Domains  []string `yaml:"domains"`
 	CacheDir string   `yaml:"cache_dir"`

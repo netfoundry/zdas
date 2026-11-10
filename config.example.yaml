@@ -27,7 +27,10 @@ tls:
   # static mode
   # cert_file: "/path/to/cert.pem"
   # key_file: "/path/to/key.pem"
-  # acme mode
+  # acme mode. Let's Encrypt checks the domain on port 443, which must reach
+  # ZDAS. With listen on port 443, nothing extra is needed. With listen on
+  # another port, ZDAS also listens on :443 for the check; if it can't, it
+  # logs a warning, and port 443 must be forwarded to the listen address.
   # acme:
   #   domains:
   #     - "das.example.com"
