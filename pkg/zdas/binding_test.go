@@ -1172,3 +1172,45 @@ func TestBindingWithBrowserCookies(t *testing.T) {
 		t.Errorf("the browser that started the sign-in, after another browser cancelled it: %d %s, want 400 and the warning", w.Code, w.Body)
 	}
 }
+
+// TestConsentPostedAgain verifies that a browser posting the consent form
+// again after its sign-in finished, as one resubmitting the page it went
+// back to does, is told the sign-in was used, and is not sent to the IdP a
+// second time.
+func TestConsentPostedAgain(t *testing.T) {
+	const base = "https://zdas.example.com"
+	b := newJarBrowser(t, bindingHandlers(t, base))
+	page := b.get(base + authorizeURL(t, nil))
+	field := consentFieldRe.FindStringSubmatch(page.Body.String())
+	if page.Code != http.StatusOK || field == nil {
+		t.Fatalf("authorize: %d %s", page.Code, page.Body)
+	}
+	form := url.Values{"consent": {field[1]}, "idp": {"mock-idp"}}
+	w := b.post(base+"/authorize", form)
+	loc, err := url.Parse(w.Header().Get("Location"))
+	if w.Code != http.StatusSeeOther || err != nil {
+		t.Fatalf("consent: %d %s", w.Code, w.Body)
+	}
+	if w := b.get(base + "/callback/mock-idp?code=c&state=" + loc.Query().Get("state")); !redirectsWithCode(t, w) {
+		t.Fatalf("callback: %d %s", w.Code, w.Header().Get("Location"))
+	}
+
+	w = b.post(base+"/authorize", form)
+	if w.Code != http.StatusBadRequest || w.Header().Get("Location") != "" || w.Body.String() != consentMissing+"\n" {
+		t.Errorf("consent posted again: %d %q %s, want 400 and consentMissing", w.Code, w.Header().Get("Location"), w.Body)
+	}
+	if c := w.Result().Cookies(); len(c) != 0 {
+		t.Errorf("consent posted again set cookies %v, want none", c)
+	}
+}
+
+// TestConsentMissingText pins what the answer to a used or expired consent
+// form must say, since every other test compares responses with the
+// constant itself.
+func TestConsentMissingText(t *testing.T) {
+	for _, phrase := range []string{"already used or has expired", "If the app shows you're signed in, you can close this page", "start again from the app"} {
+		if !strings.Contains(consentMissing, phrase) {
+			t.Errorf("consentMissing lacks %q: %s", phrase, consentMissing)
+		}
+	}
+}

@@ -431,8 +431,13 @@ func (h *endpoints) callbackURL(provider string) string {
 const maxConsentRequestBytes = 4 << 10
 
 // consentMissing is the response to a consent form without a matching
-// session.
-const consentMissing = "sign-in request not found or expired; start again from the app"
+// session. A browser can post the form again after the sign-in worked, as
+// when it resubmits the page it went back to, so the text says what to do
+// then. The first post expired the binding cookie, so a repeat can't be
+// told from an expired sign-in or another browser's post.
+const consentMissing = "This sign-in was already used or has expired. " +
+	"If the app shows you're signed in, you can close this page. " +
+	"If not, start again from the app."
 
 // handleConsent takes the form posted from the page /authorize shows, and
 // sends the browser to the chosen provider. The session /authorize stored
