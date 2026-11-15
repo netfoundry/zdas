@@ -384,8 +384,8 @@ func TestConsentRequiresBindingCookie(t *testing.T) {
 	if w.Code != http.StatusSeeOther {
 		t.Fatalf("with cookie: %d %s", w.Code, w.Body)
 	}
-	if w := post(form, cookie); w.Code != http.StatusBadRequest {
-		t.Errorf("second post: %d, want 400", w.Code)
+	if w := post(form, cookie); w.Code != http.StatusBadRequest || w.Header().Get("Location") != "" || w.Body.String() != consentMissing+"\n" {
+		t.Errorf("second post: %d %q %s, want 400 and consentMissing", w.Code, w.Header().Get("Location"), w.Body)
 	}
 
 	// A cross-site form post carries no SameSite=Lax cookie. It is refused,
